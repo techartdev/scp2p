@@ -12,6 +12,7 @@ This plan defines a practical GUI target so SCP2P can be exercised across real m
 - `2026-02-26`: Added persisted desktop client config load/save flow and core `NodeConfig` retention so the desktop layer can inspect applied bind/bootstrap settings.
 - `2026-02-26`: Added a Windows-native desktop shell for immediate local testing with config editing, load/save, and runtime status/start-stop controls.
 - `2026-02-26`: Added Windows controls for subscription add/remove, manual sync, peer inspection, and local search over synced subscriptions.
+- `2026-02-26`: Added UDP LAN discovery in the desktop runtime so Windows peers on the same LAN can automatically find each other and sync via discovered TCP endpoints.
 
 ## Goal
 Deliver a simple but working desktop app that supports regular user operations end-to-end:

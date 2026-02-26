@@ -1,2 +1,4 @@
 /target
 Cargo.lock
+*.db
+scp2p-desktop-config.cbor

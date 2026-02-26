@@ -9,8 +9,11 @@ use scp2p_core::{
     NodeConfig, NodeHandle, PeerAddr, PeerConnector, PeerRecord, PersistedSubscription,
     SearchPageQuery, SqliteStore, Store, TransportProtocol,
 };
+use serde::{Deserialize, Serialize};
+use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio::time::{self, Duration};
 
 use crate::dto::{
     DesktopClientConfig, PeerView, RuntimeStatus, SearchResultView, SearchResultsView,
@@ -27,6 +30,17 @@ struct RuntimeState {
     node: Option<NodeHandle>,
     state_db_path: Option<PathBuf>,
     tcp_service_task: Option<JoinHandle<anyhow::Result<()>>>,
+    lan_discovery_task: Option<JoinHandle<anyhow::Result<()>>>,
+}
+
+const LAN_DISCOVERY_PORT: u16 = 46123;
+const LAN_DISCOVERY_INTERVAL_SECS: u64 = 3;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LanDiscoveryAnnouncement {
+    version: u8,
+    instance_id: [u8; 16],
+    tcp_port: u16,
 }
 
 struct DesktopSessionConnector {
@@ -89,6 +103,13 @@ impl DesktopAppState {
                 service_key,
                 Capabilities::default(),
             ));
+            let mut instance_id = [0u8; 16];
+            OsRng.fill_bytes(&mut instance_id);
+            state.lan_discovery_task = Some(tokio::spawn(start_lan_discovery(
+                handle.clone(),
+                bind_tcp.port(),
+                instance_id,
+            )));
         }
         state.node = Some(handle);
         state.state_db_path = Some(db_path);
@@ -99,6 +120,9 @@ impl DesktopAppState {
     pub async fn stop_node(&self) -> RuntimeStatus {
         let mut state = self.inner.write().await;
         if let Some(task) = state.tcp_service_task.take() {
+            task.abort();
+        }
+        if let Some(task) = state.lan_discovery_task.take() {
             task.abort();
         }
         state.node = None;
@@ -187,7 +211,12 @@ impl DesktopAppState {
 
     pub async fn sync_now(&self) -> anyhow::Result<Vec<SubscriptionView>> {
         let node = self.node_handle().await?;
-        let peers = node.configured_bootstrap_peers().await?;
+        let mut peers = node.configured_bootstrap_peers().await?;
+        for record in node.peer_records().await {
+            if !peers.iter().any(|peer| peer == &record.addr) {
+                peers.push(record.addr);
+            }
+        }
         let mut rng = OsRng;
         let transport = DirectRequestTransport::new(DesktopSessionConnector {
             signing_key: SigningKey::generate(&mut rng),
@@ -287,6 +316,49 @@ fn parse_hex_32(input: &str, label: &str) -> anyhow::Result<[u8; 32]> {
     Ok(out)
 }
 
+async fn start_lan_discovery(
+    node: NodeHandle,
+    tcp_port: u16,
+    instance_id: [u8; 16],
+) -> anyhow::Result<()> {
+    let socket = UdpSocket::bind(("0.0.0.0", LAN_DISCOVERY_PORT)).await?;
+    socket.set_broadcast(true)?;
+    let broadcast = std::net::SocketAddr::from(([255, 255, 255, 255], LAN_DISCOVERY_PORT));
+    let announcement = serde_cbor::to_vec(&LanDiscoveryAnnouncement {
+        version: 1,
+        instance_id,
+        tcp_port,
+    })?;
+    let mut interval = time::interval(Duration::from_secs(LAN_DISCOVERY_INTERVAL_SECS));
+    let mut buf = [0u8; 1024];
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let _ = socket.send_to(&announcement, broadcast).await;
+            }
+            recv = socket.recv_from(&mut buf) => {
+                let Ok((len, from)) = recv else {
+                    continue;
+                };
+                let Ok(packet) = serde_cbor::from_slice::<LanDiscoveryAnnouncement>(&buf[..len]) else {
+                    continue;
+                };
+                if packet.version != 1 || packet.instance_id == instance_id {
+                    continue;
+                }
+                let peer = PeerAddr {
+                    ip: from.ip(),
+                    port: packet.tcp_port,
+                    transport: TransportProtocol::Tcp,
+                    pubkey_hint: None,
+                };
+                let _ = node.record_peer_seen(peer).await;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +415,17 @@ mod tests {
         assert_eq!(loaded, config);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn lan_discovery_announcement_roundtrip() {
+        let packet = LanDiscoveryAnnouncement {
+            version: 1,
+            instance_id: [7u8; 16],
+            tcp_port: 7001,
+        };
+        let bytes = serde_cbor::to_vec(&packet).expect("encode");
+        let decoded: LanDiscoveryAnnouncement = serde_cbor::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, packet);
     }
 }

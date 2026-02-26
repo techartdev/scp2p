@@ -32,9 +32,13 @@ Windows desktop shell notes:
   - runtime config: state DB path, QUIC bind, TCP bind, bootstrap peer list
   - lifecycle: load/save config, start/stop, refresh
   - subscriptions: add/remove by share id
-  - sync: manual sync over configured bootstrap TCP peers
+  - sync: manual sync over configured bootstrap TCP peers plus LAN-discovered peers
   - search: local subscription-scoped search
   - inspection: peer list, subscription list, search results
+- LAN discovery:
+  - when TCP bind is enabled, the desktop shell broadcasts its TCP port over UDP on the local network and listens for the same from other SCP2P desktop nodes
+  - use `Refresh` to confirm peers appear, then `Sync Now` to use both configured bootstrap peers and discovered LAN peers
+  - Windows firewall may need to allow the desktop binary for both TCP and UDP traffic
 
 ## 3. CLI usage
 
