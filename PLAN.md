@@ -93,13 +93,20 @@ Add:
 
 ## 3. Relay expansion plan
 
+Status: **In progress**
+- relay message handling now wired in live TCP runtime dispatcher (RELAY_REGISTER/RELAY_CONNECT/RELAY_STREAM)
+- simulated NAT-style relay integration coverage added (owner/requester operate only via relay)
+- relay slot keepalive renewal baseline implemented via RELAY_REGISTER with optional relay_slot_id refresh
+- relay selection/rotation baseline implemented with health-scored peer selection and anti-sticky rotation
+- relay quota baseline implemented (control-byte cap, content-byte cap, stream-count cap) with control-only default and explicit content opt-in
+
 Current relay support is foundational only. Extend to:
 - stream routing tables between requester/owner
-- keepalive + expiry renewal
-- relay selection/rotation (avoid sticky dependence on one relay)
-- optional relay throughput caps
+- keepalive + expiry renewal (advanced policies beyond baseline)
+- relay selection/rotation hardening under larger dynamic networks
+- optional relay throughput caps (adaptive/policy-tiered)
 - control-only mode default
-- optional limited content relay mode with strict quotas
+- optional limited content relay mode with stricter dynamic quotas/reputation coupling
 
 **Clarify relay multiplexing**
 - If QUIC is used end-to-end, multiplexing is handled by QUIC streams.
@@ -133,7 +140,7 @@ Status: **Done (foundational implementation complete)**
 Remaining hardening (future increments):
 - stronger anti-abuse/rate-limit controls at network boundary
 - richer stale-data rejection policies and quotas
-- full multi-node soak and churn validation in integration harness
+- broader long-run multi-node soak and churn validation in integration harness
 
 ---
 
@@ -201,6 +208,9 @@ Add integration/e2e tests:
 - NAT/relay scenarios (at least simulated)
 - manifest update propagation latency
 - large manifest/index performance smoke test
+- baseline churn harness progress: 3-node TCP integration test now covers publisher restart recovery for subscription sync, search, and verified network download
+- baseline soak progress: configurable multi-node churn test added (`SCP2P_CHURN_NODE_COUNT=5..50`, `SCP2P_CHURN_ROUNDS=1..10`) with subscriber restart churn and per-round sync/search/download assertions
+- baseline NAT/relay progress: TCP runtime now serves relay register/connect/stream over authenticated sessions with integration coverage for simulated NAT peers via relay-only control path
 
 ---
 
@@ -227,3 +237,5 @@ A practical v0.1 should include:
 - relay fallback for control traffic (content relay optional and capped)
 - persistent local state (peers, subscriptions, manifests, index, partial downloads)
 - conformance pack + multi-node integration tests
+
+

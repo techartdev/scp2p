@@ -44,7 +44,8 @@ pub use store::{
 pub use transfer::{download_swarm, ChunkProvider};
 
 pub use relay::{
-    RelayLink, RelayManager, RelaySlot, RelayStream as RelayInternalStream, RELAY_SLOT_TTL_SECS,
+    RelayLimits, RelayLink, RelayManager, RelayPayloadKind as RelayInternalPayloadKind, RelaySlot,
+    RelayStream as RelayInternalStream, RELAY_SLOT_TTL_SECS,
 };
 pub use transport::{
     dispatch_envelope, handshake_initiator, handshake_responder, read_envelope, run_message_loop,

@@ -88,8 +88,13 @@ The API is currently centered around `Node` and `NodeHandle`.
 
 ### Relay (Milestone 7 foundations)
 - `NodeHandle::relay_register(peer_addr)`
+- `NodeHandle::relay_register_with_slot(peer_addr, relay_slot_id)`
 - `NodeHandle::relay_connect(peer_addr, RelayConnect)`
 - `NodeHandle::relay_stream(peer_addr, RelayStream)`
+- `NodeHandle::set_relay_limits(limits)`
+- `NodeHandle::select_relay_peer()`
+- `NodeHandle::select_relay_peers(max_peers)`
+- `NodeHandle::note_relay_result(peer, success)`
 
 ### Transport/session primitives (spec section 3 foundations)
 - `handshake_initiator(...)`
@@ -166,6 +171,10 @@ The API is currently centered around `Node` and `NodeHandle`.
 ### Relay
 - In-memory relay slot manager with expiry
 - Register + connect + stream forwarding primitives
+- Keepalive renewal baseline (slot refresh via register-with-slot)
+- Control-only default relay policy with configurable content opt-in
+- Quota enforcement baseline (control bytes/day, content bytes/day, stream count/day)
+- Health-scored relay selection/rotation helpers to avoid sticky single-relay usage
 
 ### Persistence
 - Durable state snapshot load/save via store backends
@@ -185,7 +194,7 @@ This is an in-memory prototype baseline.
 
 Not yet implemented as production-ready behavior:
 - End-to-end relay tunnel transport integration
-- Multi-node integration/churn/NAT test harness coverage
+- Extended multi-node integration/churn/NAT soak depth and metrics-driven analysis
 - Robust peer reputation, abuse controls, quotas
 - Full mobile/desktop profile split behavior
 

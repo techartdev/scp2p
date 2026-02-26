@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     sync::atomic::{AtomicU32, Ordering},
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use ed25519_dalek::SigningKey;
@@ -26,7 +26,7 @@ use crate::{
     },
     peer::PeerAddr,
     peer_db::PeerDb,
-    relay::RelayManager,
+    relay::{RelayLimits, RelayManager, RelayPayloadKind as RelayInternalPayloadKind},
     search::SearchIndex,
     store::{
         decrypt_secret, encrypt_secret, EncryptedSecret, MemoryStore, PersistedPartialDownload,
@@ -36,9 +36,10 @@ use crate::{
     transport::{read_envelope, write_envelope},
     transport_net::tcp_accept_session,
     wire::{
-        Envelope, FindNode, FindNodeResult, FindValue, FindValueResult, MsgType, PexOffer,
-        PexRequest, Providers, RelayConnect, RelayRegistered, RelayStream, Store as WireStore,
-        WirePayload, FLAG_ERROR, FLAG_RESPONSE,
+        ChunkData, Envelope, FindNode, FindNodeResult, FindValue, FindValueResult, MsgType,
+        PexOffer, PexRequest, Providers, RelayConnect, RelayPayloadKind as WireRelayPayloadKind,
+        RelayRegister, RelayRegistered, RelayStream, Store as WireStore, WirePayload, FLAG_ERROR,
+        FLAG_RESPONSE,
     },
 };
 
@@ -71,6 +72,10 @@ struct NodeState {
     content_catalog: HashMap<[u8; 32], ChunkedContent>,
     provider_payloads: HashMap<(String, [u8; 32]), Vec<u8>>,
     relay: RelayManager,
+    relay_scores: HashMap<String, i32>,
+    relay_rotation_cursor: usize,
+    abuse_counters: HashMap<String, AbuseCounter>,
+    abuse_limits: AbuseLimits,
     partial_downloads: HashMap<[u8; 32], PersistedPartialDownload>,
     encrypted_node_key: Option<EncryptedSecret>,
     store: Arc<dyn Store>,
@@ -81,6 +86,44 @@ struct SubscriptionState {
     share_pubkey: Option<[u8; 32]>,
     latest_seq: u64,
     latest_manifest_id: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AbuseLimits {
+    pub window_secs: u64,
+    pub max_total_requests_per_window: u32,
+    pub max_dht_requests_per_window: u32,
+    pub max_fetch_requests_per_window: u32,
+    pub max_relay_requests_per_window: u32,
+}
+
+impl Default for AbuseLimits {
+    fn default() -> Self {
+        Self {
+            window_secs: 60,
+            max_total_requests_per_window: 360,
+            max_dht_requests_per_window: 180,
+            max_fetch_requests_per_window: 240,
+            max_relay_requests_per_window: 180,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RequestClass {
+    Dht,
+    Fetch,
+    Relay,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+struct AbuseCounter {
+    window_start_unix: u64,
+    total: u32,
+    dht: u32,
+    fetch: u32,
+    relay: u32,
 }
 
 pub struct Node;
@@ -175,6 +218,10 @@ impl NodeState {
             content_catalog,
             provider_payloads: HashMap::new(),
             relay: RelayManager::default(),
+            relay_scores: HashMap::new(),
+            relay_rotation_cursor: 0,
+            abuse_counters: HashMap::new(),
+            abuse_limits: AbuseLimits::default(),
             partial_downloads,
             encrypted_node_key,
             store,
@@ -202,6 +249,58 @@ impl NodeState {
             partial_downloads: self.partial_downloads.clone(),
             encrypted_node_key: self.encrypted_node_key.clone(),
         }
+    }
+
+    fn enforce_request_limits(
+        &mut self,
+        remote_peer: &PeerAddr,
+        class: RequestClass,
+        now_unix: u64,
+    ) -> anyhow::Result<()> {
+        let key = relay_peer_key(remote_peer);
+        let window = self.abuse_limits.window_secs.max(1);
+        let counter = self
+            .abuse_counters
+            .entry(key)
+            .or_insert_with(|| AbuseCounter {
+                window_start_unix: now_unix,
+                total: 0,
+                dht: 0,
+                fetch: 0,
+                relay: 0,
+            });
+
+        if now_unix.saturating_sub(counter.window_start_unix) >= window {
+            *counter = AbuseCounter {
+                window_start_unix: now_unix,
+                total: 0,
+                dht: 0,
+                fetch: 0,
+                relay: 0,
+            };
+        }
+
+        counter.total = counter.total.saturating_add(1);
+        match class {
+            RequestClass::Dht => counter.dht = counter.dht.saturating_add(1),
+            RequestClass::Fetch => counter.fetch = counter.fetch.saturating_add(1),
+            RequestClass::Relay => counter.relay = counter.relay.saturating_add(1),
+            RequestClass::Other => {}
+        }
+
+        if counter.total > self.abuse_limits.max_total_requests_per_window {
+            anyhow::bail!("request rate limit exceeded");
+        }
+        if counter.dht > self.abuse_limits.max_dht_requests_per_window {
+            anyhow::bail!("dht request rate limit exceeded");
+        }
+        if counter.fetch > self.abuse_limits.max_fetch_requests_per_window {
+            anyhow::bail!("fetch request rate limit exceeded");
+        }
+        if counter.relay > self.abuse_limits.max_relay_requests_per_window {
+            anyhow::bail!("relay request rate limit exceeded");
+        }
+        Ok(())
     }
 }
 
@@ -414,20 +513,79 @@ impl NodeHandle {
         seed_peers: &[PeerAddr],
     ) -> anyhow::Result<Option<ShareHead>> {
         let key = share_head_key(&share_id);
-        let Some(value) = self
-            .dht_find_value_iterative(transport, key, seed_peers)
+        let local_best = self
+            .dht_find_value(key)
             .await?
-        else {
-            return Ok(None);
-        };
-        let head: ShareHead = serde_cbor::from_slice(&value.value)?;
-        if head.share_id != share_id.0 {
-            anyhow::bail!("share head value share_id mismatch");
+            .and_then(|value| serde_cbor::from_slice::<ShareHead>(&value.value).ok())
+            .filter(|head| head.share_id == share_id.0);
+
+        let mut target = [0u8; 20];
+        target.copy_from_slice(&key[..20]);
+        let mut peers = self
+            .collect_seed_and_known_node_peers(target, seed_peers)
+            .await;
+        let mut queried = HashSet::new();
+        let mut best = local_best;
+
+        loop {
+            sort_peers_for_target(&mut peers, target);
+            let to_query = peers
+                .iter()
+                .filter(|peer| !queried.contains(&peer_key(peer)))
+                .take(ALPHA)
+                .cloned()
+                .collect::<Vec<_>>();
+            if to_query.is_empty() {
+                break;
+            }
+
+            let mut discovered = false;
+            for peer in to_query {
+                queried.insert(peer_key(&peer));
+                let Ok(result) = query_find_value(transport, &peer, key).await else {
+                    continue;
+                };
+
+                if let Some(remote) = result.value {
+                    if remote.key == key
+                        && remote.value.len() <= MAX_VALUE_SIZE
+                        && validate_dht_value_for_known_keyspaces(remote.key, &remote.value).is_ok()
+                    {
+                        let head: ShareHead = serde_cbor::from_slice(&remote.value)?;
+                        if head.share_id != share_id.0 {
+                            continue;
+                        }
+                        if let Some(pubkey) = share_pubkey {
+                            head.verify_with_pubkey(pubkey)?;
+                        }
+                        if best
+                            .as_ref()
+                            .map(|current| {
+                                head.latest_seq > current.latest_seq
+                                    || (head.latest_seq == current.latest_seq
+                                        && head.updated_at > current.updated_at)
+                            })
+                            .unwrap_or(true)
+                        {
+                            best = Some(head.clone());
+                            let now = now_unix_secs()?;
+                            let mut state = self.state.write().await;
+                            state.dht.store(
+                                key,
+                                serde_cbor::to_vec(&head)?,
+                                remote.ttl_secs.max(DEFAULT_TTL_SECS),
+                                now,
+                            )?;
+                        }
+                    }
+                }
+                discovered |= merge_peer_list(&mut peers, result.closer_peers);
+            }
+            if !discovered {
+                break;
+            }
         }
-        if let Some(pubkey) = share_pubkey {
-            head.verify_with_pubkey(pubkey)?;
-        }
-        Ok(Some(head))
+        Ok(best)
     }
 
     pub async fn dht_republish_once<T: RequestTransport + ?Sized>(
@@ -520,21 +678,37 @@ impl NodeHandle {
                     None,
                 )
                 .await;
-                let Ok((stream, _session, _remote_addr)) = accepted else {
+                let Ok((stream, session, remote_addr)) = accepted else {
                     continue;
+                };
+                let remote_peer = PeerAddr {
+                    ip: remote_addr.ip(),
+                    port: remote_addr.port(),
+                    transport: crate::peer::TransportProtocol::Tcp,
+                    pubkey_hint: Some(session.remote_node_pubkey),
                 };
                 let node = self.clone();
                 tokio::spawn(async move {
-                    let _ = node.serve_wire_stream(stream).await;
+                    let _ = node.serve_wire_stream(stream, Some(remote_peer)).await;
                 });
             }
         })
     }
 
     pub async fn relay_register(&self, peer_addr: PeerAddr) -> anyhow::Result<RelayRegistered> {
+        self.relay_register_with_slot(peer_addr, None).await
+    }
+
+    pub async fn relay_register_with_slot(
+        &self,
+        peer_addr: PeerAddr,
+        relay_slot_id: Option<u64>,
+    ) -> anyhow::Result<RelayRegistered> {
         let mut state = self.state.write().await;
         let now = now_unix_secs()?;
-        let slot = state.relay.register(peer_key(&peer_addr), now);
+        let slot = state
+            .relay
+            .register_or_renew(relay_peer_key(&peer_addr), relay_slot_id, now)?;
         Ok(RelayRegistered {
             relay_slot_id: slot.relay_slot_id,
             expires_at: slot.expires_at,
@@ -547,9 +721,11 @@ impl NodeHandle {
         req: RelayConnect,
     ) -> anyhow::Result<()> {
         let mut state = self.state.write().await;
-        state
-            .relay
-            .connect(peer_key(&peer_addr), req.relay_slot_id, now_unix_secs()?)?;
+        state.relay.connect(
+            relay_peer_key(&peer_addr),
+            req.relay_slot_id,
+            now_unix_secs()?,
+        )?;
         Ok(())
     }
 
@@ -559,19 +735,119 @@ impl NodeHandle {
         req: RelayStream,
     ) -> anyhow::Result<RelayStream> {
         let mut state = self.state.write().await;
+        let peer_key = relay_peer_key(&peer_addr);
+        let score = *state.relay_scores.get(&peer_key).unwrap_or(&0);
+        if req.kind == WireRelayPayloadKind::Content && score < 2 {
+            let score_mut = state.relay_scores.entry(peer_key).or_insert(0);
+            *score_mut = (*score_mut - 1).clamp(-10, 10);
+            anyhow::bail!("content relay requires positive trust score");
+        }
+        let max_payload_bytes = if score >= 5 {
+            512 * 1024
+        } else if score >= 0 {
+            128 * 1024
+        } else {
+            32 * 1024
+        };
+        if req.payload.len() > max_payload_bytes {
+            let score_mut = state
+                .relay_scores
+                .entry(relay_peer_key(&peer_addr))
+                .or_insert(0);
+            *score_mut = (*score_mut - 1).clamp(-10, 10);
+            anyhow::bail!("relay payload exceeds adaptive limit for peer score");
+        }
         let relayed = state.relay.relay_stream(
             req.relay_slot_id,
             req.stream_id,
-            peer_key(&peer_addr),
+            relay_payload_kind_to_internal(req.kind),
+            relay_peer_key(&peer_addr),
             req.payload,
             now_unix_secs()?,
         )?;
+        let score_mut = state.relay_scores.entry(relay_peer_key(&peer_addr)).or_insert(0);
+        *score_mut = (*score_mut + 1).clamp(-10, 10);
 
         Ok(RelayStream {
             relay_slot_id: relayed.relay_slot_id,
             stream_id: relayed.stream_id,
+            kind: relay_payload_kind_to_wire(relayed.kind),
             payload: relayed.payload,
         })
+    }
+
+    pub async fn set_relay_limits(&self, limits: RelayLimits) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        state.relay.set_limits(limits);
+        Ok(())
+    }
+
+    pub async fn set_abuse_limits(&self, limits: AbuseLimits) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        state.abuse_limits = limits;
+        state.abuse_counters.clear();
+        Ok(())
+    }
+
+    pub async fn note_relay_result(&self, peer: &PeerAddr, success: bool) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        let key = relay_peer_key(peer);
+        let delta = if success { 1 } else { -3 };
+        let score = state.relay_scores.entry(key).or_insert(0);
+        *score = (*score + delta).clamp(-10, 10);
+        Ok(())
+    }
+
+    pub async fn select_relay_peer(&self) -> anyhow::Result<Option<PeerAddr>> {
+        Ok(self.select_relay_peers(1).await?.into_iter().next())
+    }
+
+    pub async fn select_relay_peers(&self, max_peers: usize) -> anyhow::Result<Vec<PeerAddr>> {
+        let now = now_unix_secs()?;
+        let mut state = self.state.write().await;
+        let mut candidates = state
+            .peer_db
+            .all_records()
+            .into_iter()
+            .filter(|record| {
+                now.saturating_sub(record.last_seen_unix)
+                    <= crate::peer_db::PEX_FRESHNESS_WINDOW_SECS
+            })
+            .map(|record| record.addr)
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(relay_peer_key);
+        if candidates.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let best_score = candidates
+            .iter()
+            .map(|peer| *state.relay_scores.get(&relay_peer_key(peer)).unwrap_or(&0))
+            .max()
+            .unwrap_or(0);
+        let preferred = candidates
+            .into_iter()
+            .filter(|peer| {
+                *state.relay_scores.get(&relay_peer_key(peer)).unwrap_or(&0) == best_score
+            })
+            .collect::<Vec<_>>();
+        let source = if preferred.is_empty() {
+            vec![]
+        } else {
+            preferred
+        };
+        if source.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cap = max_peers.max(1).min(source.len());
+        let start = state.relay_rotation_cursor % source.len();
+        state.relay_rotation_cursor = state.relay_rotation_cursor.saturating_add(1);
+        let mut selected = Vec::with_capacity(cap);
+        for idx in 0..cap {
+            selected.push(source[(start + idx) % source.len()].clone());
+        }
+        Ok(selected)
     }
 
     pub async fn set_share_weight(&self, share_id: ShareId, weight: f32) -> anyhow::Result<()> {
@@ -1003,20 +1279,30 @@ impl NodeHandle {
         Ok(())
     }
 
-    async fn serve_wire_stream<S>(&self, mut stream: S) -> anyhow::Result<()>
+    async fn serve_wire_stream<S>(
+        &self,
+        mut stream: S,
+        remote_peer: Option<PeerAddr>,
+    ) -> anyhow::Result<()>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         loop {
             let incoming = read_envelope(&mut stream).await?;
-            let response = self.handle_incoming_envelope(incoming).await;
+            let response = self
+                .handle_incoming_envelope(incoming, remote_peer.as_ref())
+                .await;
             if let Some(envelope) = response {
                 write_envelope(&mut stream, &envelope).await?;
             }
         }
     }
 
-    async fn handle_incoming_envelope(&self, envelope: Envelope) -> Option<Envelope> {
+    async fn handle_incoming_envelope(
+        &self,
+        envelope: Envelope,
+        remote_peer: Option<&PeerAddr>,
+    ) -> Option<Envelope> {
         let req_id = envelope.req_id;
         let req_type = envelope.r#type;
         let typed = match envelope.decode_typed() {
@@ -1025,6 +1311,13 @@ impl NodeHandle {
                 return Some(error_envelope(req_type, req_id, &err.to_string()));
             }
         };
+        if let Some(peer) = remote_peer {
+            let now = now_unix_secs().unwrap_or(0);
+            let mut state = self.state.write().await;
+            if let Err(err) = state.enforce_request_limits(peer, request_class(&typed), now) {
+                return Some(error_envelope(req_type, req_id, &err.to_string()));
+            }
+        }
         let result = match typed {
             WirePayload::FindNode(msg) => self
                 .dht_find_node(msg)
@@ -1104,6 +1397,80 @@ impl NodeHandle {
                     flags: FLAG_RESPONSE,
                     payload,
                 }),
+            WirePayload::GetChunk(msg) => self
+                .chunk_bytes(msg.content_id, msg.chunk_index)
+                .await
+                .and_then(|maybe| {
+                    maybe
+                        .ok_or_else(|| anyhow::anyhow!("chunk not found"))
+                        .and_then(|bytes| {
+                            serde_cbor::to_vec(&ChunkData {
+                                content_id: msg.content_id,
+                                chunk_index: msg.chunk_index,
+                                bytes,
+                            })
+                            .map_err(Into::into)
+                        })
+                })
+                .map(|payload| Envelope {
+                    r#type: MsgType::ChunkData as u16,
+                    req_id,
+                    flags: FLAG_RESPONSE,
+                    payload,
+                }),
+            WirePayload::RelayRegister(RelayRegister { relay_slot_id }) => {
+                let Some(peer) = remote_peer else {
+                    return Some(error_envelope(
+                        req_type,
+                        req_id,
+                        "missing remote peer identity",
+                    ));
+                };
+                self.relay_register_with_slot(peer.clone(), relay_slot_id)
+                    .await
+                    .and_then(|registered| serde_cbor::to_vec(&registered).map_err(Into::into))
+                    .map(|payload| Envelope {
+                        r#type: MsgType::RelayRegistered as u16,
+                        req_id,
+                        flags: FLAG_RESPONSE,
+                        payload,
+                    })
+            }
+            WirePayload::RelayConnect(msg) => {
+                let Some(peer) = remote_peer else {
+                    return Some(error_envelope(
+                        req_type,
+                        req_id,
+                        "missing remote peer identity",
+                    ));
+                };
+                self.relay_connect(peer.clone(), msg)
+                    .await
+                    .map(|_| Envelope {
+                        r#type: MsgType::RelayConnect as u16,
+                        req_id,
+                        flags: FLAG_RESPONSE,
+                        payload: vec![],
+                    })
+            }
+            WirePayload::RelayStream(msg) => {
+                let Some(peer) = remote_peer else {
+                    return Some(error_envelope(
+                        req_type,
+                        req_id,
+                        "missing remote peer identity",
+                    ));
+                };
+                self.relay_stream(peer.clone(), msg)
+                    .await
+                    .and_then(|relayed| serde_cbor::to_vec(&relayed).map_err(Into::into))
+                    .map(|payload| Envelope {
+                        r#type: MsgType::RelayStream as u16,
+                        req_id,
+                        flags: FLAG_RESPONSE,
+                        payload,
+                    })
+            }
             _ => Err(anyhow::anyhow!("unsupported message type")),
         };
         Some(match result {
@@ -1119,6 +1486,29 @@ impl NodeHandle {
             .get(&manifest_id)
             .map(serde_cbor::to_vec)
             .transpose()?)
+    }
+
+    async fn chunk_bytes(
+        &self,
+        content_id: [u8; 32],
+        chunk_index: u32,
+    ) -> anyhow::Result<Option<Vec<u8>>> {
+        let state = self.state.read().await;
+        let source = state
+            .provider_payloads
+            .iter()
+            .find(|((_, cid), _)| *cid == content_id)
+            .map(|(_, bytes)| bytes.clone());
+        let Some(bytes) = source else {
+            return Ok(None);
+        };
+        let idx = chunk_index as usize;
+        let start = idx.saturating_mul(crate::content::CHUNK_SIZE);
+        if start >= bytes.len() {
+            return Ok(None);
+        }
+        let end = ((idx + 1) * crate::content::CHUNK_SIZE).min(bytes.len());
+        Ok(Some(bytes[start..end].to_vec()))
     }
 
     async fn collect_seed_and_known_node_peers(
@@ -1147,6 +1537,39 @@ fn now_unix_secs() -> anyhow::Result<u64> {
 
 fn peer_key(peer: &PeerAddr) -> String {
     format!("{}:{}:{:?}", peer.ip, peer.port, peer.transport)
+}
+
+fn relay_peer_key(peer: &PeerAddr) -> String {
+    peer.pubkey_hint
+        .map(|pubkey| format!("pubkey:{}", hex::encode(pubkey)))
+        .unwrap_or_else(|| peer_key(peer))
+}
+
+fn relay_payload_kind_to_internal(kind: WireRelayPayloadKind) -> RelayInternalPayloadKind {
+    match kind {
+        WireRelayPayloadKind::Control => RelayInternalPayloadKind::Control,
+        WireRelayPayloadKind::Content => RelayInternalPayloadKind::Content,
+    }
+}
+
+fn relay_payload_kind_to_wire(kind: RelayInternalPayloadKind) -> WireRelayPayloadKind {
+    match kind {
+        RelayInternalPayloadKind::Control => WireRelayPayloadKind::Control,
+        RelayInternalPayloadKind::Content => WireRelayPayloadKind::Content,
+    }
+}
+
+fn request_class(payload: &WirePayload) -> RequestClass {
+    match payload {
+        WirePayload::FindNode(_) | WirePayload::FindValue(_) | WirePayload::Store(_) => {
+            RequestClass::Dht
+        }
+        WirePayload::GetManifest(_) | WirePayload::GetChunk(_) => RequestClass::Fetch,
+        WirePayload::RelayRegister(_) | WirePayload::RelayConnect(_) | WirePayload::RelayStream(_) => {
+            RequestClass::Relay
+        }
+        _ => RequestClass::Other,
+    }
 }
 
 fn peer_distance_key(peer: &PeerAddr, target_node_id: [u8; 20]) -> [u8; 20] {
@@ -1324,10 +1747,9 @@ mod tests {
     use crate::{
         capabilities::Capabilities,
         manifest::ItemV1,
-        net_fetch::RequestTransport,
+        net_fetch::{BoxedStream, PeerConnector, RequestTransport},
         peer::TransportProtocol,
         store::MemoryStore,
-        transport::{read_envelope as read_wire_envelope, write_envelope as write_wire_envelope},
         transport_net::tcp_connect_session,
         wire::{FindNodeResult, FindValueResult, MsgType},
     };
@@ -1384,18 +1806,13 @@ mod tests {
     }
 
     #[async_trait]
-    impl RequestTransport for TcpSessionTransport {
-        async fn request(
-            &self,
-            peer: &PeerAddr,
-            request: Envelope,
-            timeout_dur: Duration,
-        ) -> anyhow::Result<Envelope> {
+    impl PeerConnector for TcpSessionTransport {
+        async fn connect(&self, peer: &PeerAddr) -> anyhow::Result<BoxedStream> {
             let mut nonce = [0u8; 32];
             rand::rngs::OsRng.fill_bytes(&mut nonce);
             let remote = std::net::SocketAddr::new(peer.ip, peer.port);
             let expected = peer.pubkey_hint;
-            let (mut stream, _session) = tcp_connect_session(
+            let (stream, _session) = tcp_connect_session(
                 remote,
                 &self.signing_key,
                 self.capabilities.clone(),
@@ -1403,15 +1820,11 @@ mod tests {
                 expected,
             )
             .await?;
-            tokio::time::timeout(timeout_dur, write_wire_envelope(&mut stream, &request))
-                .await
-                .map_err(|_| anyhow::anyhow!("request write timed out"))??;
-            let response = tokio::time::timeout(timeout_dur, read_wire_envelope(&mut stream))
-                .await
-                .map_err(|_| anyhow::anyhow!("response read timed out"))??;
-            Ok(response)
+            Ok(Box::new(stream) as BoxedStream)
         }
     }
+
+    // RequestTransport is provided by blanket impl for all PeerConnector types.
 
     #[tokio::test]
     async fn subscribe_roundtrip() {
@@ -1892,6 +2305,555 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tcp_runtime_serves_chunk_data_for_network_download() {
+        let server_handle = Node::start(NodeConfig::default())
+            .await
+            .expect("start server");
+        let client_handle = Node::start(NodeConfig::default())
+            .await
+            .expect("start client");
+
+        let mut rng = OsRng;
+        let server_node_key = SigningKey::generate(&mut rng);
+        let client_node_key = SigningKey::generate(&mut rng);
+
+        let port_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe");
+        let bind_addr = port_probe.local_addr().expect("probe addr");
+        drop(port_probe);
+
+        let server_task = server_handle.clone().start_tcp_dht_service(
+            bind_addr,
+            server_node_key.clone(),
+            Capabilities::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let payload = vec![7u8; crate::content::CHUNK_SIZE + 42];
+        let desc = crate::content::describe_content(&payload);
+        let provider_peer = PeerAddr {
+            ip: "127.0.0.1".parse().expect("ip"),
+            port: bind_addr.port(),
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: Some(server_node_key.verifying_key().to_bytes()),
+        };
+        server_handle
+            .register_local_provider_content(provider_peer.clone(), payload.clone())
+            .await
+            .expect("register provider content");
+
+        let share = ShareKeypair::new(SigningKey::generate(&mut rng));
+        let manifest = ManifestV1 {
+            version: 1,
+            share_pubkey: share.verifying_key().to_bytes(),
+            share_id: share.share_id().0,
+            seq: 1,
+            created_at: 1_700_000_100,
+            expires_at: None,
+            title: Some("runtime-content".into()),
+            description: Some("integration".into()),
+            items: vec![ItemV1 {
+                content_id: desc.content_id.0,
+                size: payload.len() as u64,
+                name: "runtime-content.bin".into(),
+                mime: None,
+                tags: vec!["runtime".into(), "content".into()],
+                chunks: desc.chunks.clone(),
+            }],
+            recommended_shares: vec![],
+            signature: None,
+        };
+        server_handle
+            .publish_share(manifest, &share)
+            .await
+            .expect("publish");
+
+        client_handle
+            .subscribe_with_pubkey(share.share_id(), Some(share.verifying_key().to_bytes()))
+            .await
+            .expect("subscribe");
+
+        let transport = TcpSessionTransport {
+            signing_key: client_node_key,
+            capabilities: Capabilities::default(),
+        };
+        client_handle
+            .sync_subscriptions_over_dht(&transport, std::slice::from_ref(&provider_peer))
+            .await
+            .expect("sync");
+
+        let target = std::env::temp_dir().join(format!(
+            "scp2p_net_download_{}.bin",
+            now_unix_secs().expect("now")
+        ));
+        client_handle
+            .download_from_peers(
+                &transport,
+                std::slice::from_ref(&provider_peer),
+                desc.content_id.0,
+                target.to_str().expect("utf8 path"),
+                &FetchPolicy::default(),
+            )
+            .await
+            .expect("download over network");
+
+        let read_back = std::fs::read(&target).expect("read target");
+        assert_eq!(read_back, payload);
+        let _ = std::fs::remove_file(target);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn multi_node_churn_recovers_sync_search_and_download() {
+        let bootstrap_handle = Node::start(NodeConfig::default())
+            .await
+            .expect("start bootstrap");
+        let publisher_store = MemoryStore::new();
+        let publisher_handle = Node::start_with_store(NodeConfig::default(), publisher_store)
+            .await
+            .expect("start publisher");
+        let subscriber_handle = Node::start(NodeConfig::default())
+            .await
+            .expect("start subscriber");
+
+        let mut rng = OsRng;
+        let bootstrap_node_key = SigningKey::generate(&mut rng);
+        let publisher_node_key = SigningKey::generate(&mut rng);
+        let subscriber_node_key = SigningKey::generate(&mut rng);
+
+        let bootstrap_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bootstrap probe");
+        let bootstrap_addr = bootstrap_probe.local_addr().expect("bootstrap probe addr");
+        drop(bootstrap_probe);
+
+        let publisher_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind publisher probe");
+        let publisher_addr = publisher_probe.local_addr().expect("publisher probe addr");
+        drop(publisher_probe);
+
+        let bootstrap_task = bootstrap_handle.clone().start_tcp_dht_service(
+            bootstrap_addr,
+            bootstrap_node_key,
+            Capabilities::default(),
+        );
+        let mut publisher_task = publisher_handle.clone().start_tcp_dht_service(
+            publisher_addr,
+            publisher_node_key.clone(),
+            Capabilities::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let bootstrap_peer = PeerAddr {
+            ip: "127.0.0.1".parse().expect("ip"),
+            port: bootstrap_addr.port(),
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: None,
+        };
+        let publisher_peer = PeerAddr {
+            ip: "127.0.0.1".parse().expect("ip"),
+            port: publisher_addr.port(),
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: Some(publisher_node_key.verifying_key().to_bytes()),
+        };
+        bootstrap_handle
+            .dht_upsert_peer(
+                NodeId([0u8; 20]),
+                NodeId::from_pubkey_bytes(&publisher_node_key.verifying_key().to_bytes()),
+                publisher_peer.clone(),
+            )
+            .await
+            .expect("bootstrap learns publisher");
+
+        let share = ShareKeypair::new(SigningKey::generate(&mut rng));
+        let payload_v1 = vec![11u8; crate::content::CHUNK_SIZE + 33];
+        let desc_v1 = crate::content::describe_content(&payload_v1);
+        publisher_handle
+            .register_local_provider_content(publisher_peer.clone(), payload_v1.clone())
+            .await
+            .expect("register v1 provider content");
+        let manifest_v1 = ManifestV1 {
+            version: 1,
+            share_pubkey: share.verifying_key().to_bytes(),
+            share_id: share.share_id().0,
+            seq: 1,
+            created_at: 1_700_000_200,
+            expires_at: None,
+            title: Some("churn-seq1".into()),
+            description: Some("initial publish".into()),
+            items: vec![ItemV1 {
+                content_id: desc_v1.content_id.0,
+                size: payload_v1.len() as u64,
+                name: "churn-v1.bin".into(),
+                mime: None,
+                tags: vec!["churn".into(), "v1".into()],
+                chunks: desc_v1.chunks.clone(),
+            }],
+            recommended_shares: vec![],
+            signature: None,
+        };
+        publisher_handle
+            .publish_share(manifest_v1, &share)
+            .await
+            .expect("publish v1");
+
+        subscriber_handle
+            .subscribe_with_pubkey(share.share_id(), Some(share.verifying_key().to_bytes()))
+            .await
+            .expect("subscribe");
+        let seed_peers = vec![bootstrap_peer.clone(), publisher_peer.clone()];
+        let transport = TcpSessionTransport {
+            signing_key: subscriber_node_key,
+            capabilities: Capabilities::default(),
+        };
+        subscriber_handle
+            .sync_subscriptions_over_dht(&transport, &seed_peers)
+            .await
+            .expect("sync v1");
+
+        let seq_after_v1 = {
+            let state = subscriber_handle.state.read().await;
+            state
+                .subscriptions
+                .get(&share.share_id().0)
+                .expect("subscription exists")
+                .latest_seq
+        };
+        assert_eq!(seq_after_v1, 1);
+
+        let hits_v1 = subscriber_handle
+            .search(SearchQuery {
+                text: "churn-v1".into(),
+            })
+            .await
+            .expect("search v1");
+        assert!(hits_v1
+            .iter()
+            .any(|hit| hit.content_id == desc_v1.content_id.0));
+
+        let target_v1 = std::env::temp_dir().join(format!(
+            "scp2p_churn_v1_{}.bin",
+            now_unix_secs().expect("now")
+        ));
+        subscriber_handle
+            .download_from_peers(
+                &transport,
+                &seed_peers,
+                desc_v1.content_id.0,
+                target_v1.to_str().expect("utf8 path"),
+                &FetchPolicy::default(),
+            )
+            .await
+            .expect("download v1");
+        let read_v1 = std::fs::read(&target_v1).expect("read v1");
+        assert_eq!(read_v1, payload_v1);
+
+        publisher_task.abort();
+        let _ = publisher_task.await;
+
+        let payload_v2 = vec![22u8; crate::content::CHUNK_SIZE * 2 + 17];
+        let desc_v2 = crate::content::describe_content(&payload_v2);
+        publisher_handle
+            .register_local_provider_content(publisher_peer.clone(), payload_v2.clone())
+            .await
+            .expect("register v2 provider content");
+        let manifest_v2 = ManifestV1 {
+            version: 1,
+            share_pubkey: share.verifying_key().to_bytes(),
+            share_id: share.share_id().0,
+            seq: 2,
+            created_at: 1_700_000_201,
+            expires_at: None,
+            title: Some("churn-seq2".into()),
+            description: Some("publisher restarted".into()),
+            items: vec![ItemV1 {
+                content_id: desc_v2.content_id.0,
+                size: payload_v2.len() as u64,
+                name: "churn-v2.bin".into(),
+                mime: None,
+                tags: vec!["churn".into(), "v2".into()],
+                chunks: desc_v2.chunks.clone(),
+            }],
+            recommended_shares: vec![],
+            signature: None,
+        };
+        publisher_handle
+            .publish_share(manifest_v2, &share)
+            .await
+            .expect("publish v2 while offline");
+
+        subscriber_handle
+            .sync_subscriptions_over_dht(&transport, &seed_peers)
+            .await
+            .expect("sync while publisher offline");
+        let seq_while_offline = {
+            let state = subscriber_handle.state.read().await;
+            state
+                .subscriptions
+                .get(&share.share_id().0)
+                .expect("subscription exists")
+                .latest_seq
+        };
+        assert_eq!(seq_while_offline, 1);
+
+        publisher_task = publisher_handle.clone().start_tcp_dht_service(
+            publisher_addr,
+            publisher_node_key,
+            Capabilities::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        subscriber_handle
+            .sync_subscriptions_over_dht(&transport, &seed_peers)
+            .await
+            .expect("sync v2 after restart");
+        let seq_after_restart = {
+            let state = subscriber_handle.state.read().await;
+            state
+                .subscriptions
+                .get(&share.share_id().0)
+                .expect("subscription exists")
+                .latest_seq
+        };
+        assert_eq!(seq_after_restart, 2);
+
+        let hits_v2 = subscriber_handle
+            .search(SearchQuery {
+                text: "churn-v2".into(),
+            })
+            .await
+            .expect("search v2");
+        assert!(hits_v2
+            .iter()
+            .any(|hit| hit.content_id == desc_v2.content_id.0));
+
+        let target_v2 = std::env::temp_dir().join(format!(
+            "scp2p_churn_v2_{}.bin",
+            now_unix_secs().expect("now")
+        ));
+        subscriber_handle
+            .download_from_peers(
+                &transport,
+                &seed_peers,
+                desc_v2.content_id.0,
+                target_v2.to_str().expect("utf8 path"),
+                &FetchPolicy::default(),
+            )
+            .await
+            .expect("download v2");
+        let read_v2 = std::fs::read(&target_v2).expect("read v2");
+        assert_eq!(read_v2, payload_v2);
+
+        let _ = std::fs::remove_file(target_v1);
+        let _ = std::fs::remove_file(target_v2);
+        bootstrap_task.abort();
+        publisher_task.abort();
+    }
+
+    fn read_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(|value| value.clamp(min, max))
+            .unwrap_or(default)
+    }
+
+    #[tokio::test]
+    async fn multi_node_churn_soak_is_configurable() {
+        let node_count = read_env_usize("SCP2P_CHURN_NODE_COUNT", 5, 5, 50);
+        let rounds = read_env_usize("SCP2P_CHURN_ROUNDS", 2, 1, 10);
+
+        let bootstrap_handle = Node::start(NodeConfig::default())
+            .await
+            .expect("start bootstrap");
+        let publisher_store = MemoryStore::new();
+        let publisher_handle = Node::start_with_store(NodeConfig::default(), publisher_store)
+            .await
+            .expect("start publisher");
+
+        let mut rng = OsRng;
+        let bootstrap_node_key = SigningKey::generate(&mut rng);
+        let publisher_node_key = SigningKey::generate(&mut rng);
+
+        let bootstrap_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind bootstrap probe");
+        let bootstrap_addr = bootstrap_probe.local_addr().expect("bootstrap probe addr");
+        drop(bootstrap_probe);
+
+        let publisher_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind publisher probe");
+        let publisher_addr = publisher_probe.local_addr().expect("publisher probe addr");
+        drop(publisher_probe);
+
+        let bootstrap_task = bootstrap_handle.clone().start_tcp_dht_service(
+            bootstrap_addr,
+            bootstrap_node_key,
+            Capabilities::default(),
+        );
+        let mut publisher_task = publisher_handle.clone().start_tcp_dht_service(
+            publisher_addr,
+            publisher_node_key.clone(),
+            Capabilities::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        let bootstrap_peer = PeerAddr {
+            ip: "127.0.0.1".parse().expect("ip"),
+            port: bootstrap_addr.port(),
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: None,
+        };
+        let publisher_peer = PeerAddr {
+            ip: "127.0.0.1".parse().expect("ip"),
+            port: publisher_addr.port(),
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: Some(publisher_node_key.verifying_key().to_bytes()),
+        };
+        bootstrap_handle
+            .dht_upsert_peer(
+                NodeId([0u8; 20]),
+                NodeId::from_pubkey_bytes(&publisher_node_key.verifying_key().to_bytes()),
+                publisher_peer.clone(),
+            )
+            .await
+            .expect("bootstrap learns publisher");
+        let seed_peers = vec![bootstrap_peer.clone(), publisher_peer.clone()];
+
+        struct SubscriberHarness {
+            store: Arc<MemoryStore>,
+            handle: NodeHandle,
+        }
+
+        let share = ShareKeypair::new(SigningKey::generate(&mut rng));
+        let mut subscribers = Vec::with_capacity(node_count);
+        for _ in 0..node_count {
+            let store = MemoryStore::new();
+            let handle = Node::start_with_store(NodeConfig::default(), store.clone())
+                .await
+                .expect("start subscriber");
+            handle
+                .subscribe_with_pubkey(share.share_id(), Some(share.verifying_key().to_bytes()))
+                .await
+                .expect("subscribe");
+            subscribers.push(SubscriberHarness { store, handle });
+        }
+
+        for seq in 1..=(rounds as u64 + 1) {
+            publisher_task.abort();
+            let _ = publisher_task.await;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+
+            let payload = vec![seq as u8; crate::content::CHUNK_SIZE + 16 + seq as usize];
+            let desc = crate::content::describe_content(&payload);
+            publisher_handle
+                .register_local_provider_content(publisher_peer.clone(), payload.clone())
+                .await
+                .expect("register provider content");
+            let manifest = ManifestV1 {
+                version: 1,
+                share_pubkey: share.verifying_key().to_bytes(),
+                share_id: share.share_id().0,
+                seq,
+                created_at: 1_700_000_500 + seq,
+                expires_at: None,
+                title: Some(format!("soak-seq-{seq}")),
+                description: Some("multi-node churn soak".into()),
+                items: vec![ItemV1 {
+                    content_id: desc.content_id.0,
+                    size: payload.len() as u64,
+                    name: format!("soak-item-{seq}.bin"),
+                    mime: None,
+                    tags: vec!["soak".into(), format!("seq-{seq}")],
+                    chunks: desc.chunks.clone(),
+                }],
+                recommended_shares: vec![],
+                signature: None,
+            };
+            publisher_handle
+                .publish_share(manifest, &share)
+                .await
+                .expect("publish");
+
+            publisher_task = publisher_handle.clone().start_tcp_dht_service(
+                publisher_addr,
+                publisher_node_key.clone(),
+                Capabilities::default(),
+            );
+            tokio::time::sleep(Duration::from_millis(75)).await;
+
+            for (idx, subscriber) in subscribers.iter_mut().enumerate() {
+                if seq > 1 && idx % 3 == (seq as usize % 3) {
+                    subscriber.handle =
+                        Node::start_with_store(NodeConfig::default(), subscriber.store.clone())
+                            .await
+                            .expect("restart subscriber");
+                }
+
+                let requester_key = SigningKey::generate(&mut rng);
+                let transport = TcpSessionTransport {
+                    signing_key: requester_key,
+                    capabilities: Capabilities::default(),
+                };
+                subscriber
+                    .handle
+                    .sync_subscriptions_over_dht(&transport, &seed_peers)
+                    .await
+                    .expect("sync");
+
+                let latest_seq = {
+                    let state = subscriber.handle.state.read().await;
+                    state
+                        .subscriptions
+                        .get(&share.share_id().0)
+                        .expect("subscription exists")
+                        .latest_seq
+                };
+                assert_eq!(latest_seq, seq);
+
+                let hits = subscriber
+                    .handle
+                    .search(SearchQuery {
+                        text: format!("soak-item-{seq}"),
+                    })
+                    .await
+                    .expect("search");
+                assert!(hits.iter().any(|hit| hit.content_id == desc.content_id.0));
+
+                if idx == 0 {
+                    let target = std::env::temp_dir().join(format!(
+                        "scp2p_soak_{}_{}_{}.bin",
+                        node_count,
+                        seq,
+                        now_unix_secs().expect("now")
+                    ));
+                    subscriber
+                        .handle
+                        .download_from_peers(
+                            &transport,
+                            &seed_peers,
+                            desc.content_id.0,
+                            target.to_str().expect("utf8 path"),
+                            &FetchPolicy::default(),
+                        )
+                        .await
+                        .expect("download");
+                    let read_back = std::fs::read(&target).expect("read target");
+                    assert_eq!(read_back, payload);
+                    let _ = std::fs::remove_file(target);
+                }
+            }
+        }
+
+        bootstrap_task.abort();
+        publisher_task.abort();
+    }
+
+    #[tokio::test]
     async fn dht_store_replicated_stores_locally_and_on_closest_peers() {
         let handle = Node::start(NodeConfig::default()).await.expect("start");
         let transport = MockDhtTransport::default();
@@ -2209,6 +3171,7 @@ mod tests {
                 RelayStream {
                     relay_slot_id: registered.relay_slot_id,
                     stream_id: 1,
+                    kind: WireRelayPayloadKind::Control,
                     payload: vec![1, 2, 3],
                 },
             )
@@ -2216,6 +3179,221 @@ mod tests {
             .expect("stream");
 
         assert_eq!(stream.payload, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn relay_selection_rotates_across_best_peers() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        let peers = vec![
+            PeerAddr {
+                ip: "10.0.2.1".parse().expect("ip"),
+                port: 7101,
+                transport: TransportProtocol::Tcp,
+                pubkey_hint: Some([1u8; 32]),
+            },
+            PeerAddr {
+                ip: "10.0.2.2".parse().expect("ip"),
+                port: 7102,
+                transport: TransportProtocol::Tcp,
+                pubkey_hint: Some([2u8; 32]),
+            },
+            PeerAddr {
+                ip: "10.0.2.3".parse().expect("ip"),
+                port: 7103,
+                transport: TransportProtocol::Tcp,
+                pubkey_hint: Some([3u8; 32]),
+            },
+        ];
+        for peer in &peers {
+            handle.record_peer_seen(peer.clone()).await.expect("record");
+        }
+
+        let a = handle
+            .select_relay_peer()
+            .await
+            .expect("select")
+            .expect("peer");
+        let b = handle
+            .select_relay_peer()
+            .await
+            .expect("select")
+            .expect("peer");
+        let c = handle
+            .select_relay_peer()
+            .await
+            .expect("select")
+            .expect("peer");
+        let mut seen = HashSet::new();
+        seen.insert(relay_peer_key(&a));
+        seen.insert(relay_peer_key(&b));
+        seen.insert(relay_peer_key(&c));
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn relay_selection_prefers_healthier_peers() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        let bad_peer = PeerAddr {
+            ip: "10.0.3.1".parse().expect("ip"),
+            port: 7201,
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: Some([9u8; 32]),
+        };
+        let good_peer = PeerAddr {
+            ip: "10.0.3.2".parse().expect("ip"),
+            port: 7202,
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: Some([10u8; 32]),
+        };
+        handle
+            .record_peer_seen(bad_peer.clone())
+            .await
+            .expect("record bad");
+        handle
+            .record_peer_seen(good_peer.clone())
+            .await
+            .expect("record good");
+        for _ in 0..3 {
+            handle
+                .note_relay_result(&bad_peer, false)
+                .await
+                .expect("penalize bad");
+        }
+        handle
+            .note_relay_result(&good_peer, true)
+            .await
+            .expect("reward good");
+
+        let selected = handle.select_relay_peers(2).await.expect("select list");
+        assert!(!selected.is_empty());
+        assert!(selected
+            .iter()
+            .all(|peer| relay_peer_key(peer) != relay_peer_key(&bad_peer)));
+    }
+
+    #[tokio::test]
+    async fn tcp_runtime_supports_relay_for_simulated_nat_peers() {
+        let relay_handle = Node::start(NodeConfig::default())
+            .await
+            .expect("start relay");
+        let mut rng = OsRng;
+        let relay_node_key = SigningKey::generate(&mut rng);
+        let owner_key = SigningKey::generate(&mut rng);
+        let requester_key = SigningKey::generate(&mut rng);
+
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind probe");
+        let bind_addr = probe.local_addr().expect("probe addr");
+        drop(probe);
+
+        let relay_task = relay_handle.clone().start_tcp_dht_service(
+            bind_addr,
+            relay_node_key.clone(),
+            Capabilities::default(),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let relay_peer = PeerAddr {
+            ip: "127.0.0.1".parse().expect("ip"),
+            port: bind_addr.port(),
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: Some(relay_node_key.verifying_key().to_bytes()),
+        };
+
+        let owner_transport = TcpSessionTransport {
+            signing_key: owner_key,
+            capabilities: Capabilities::default(),
+        };
+        let requester_transport = TcpSessionTransport {
+            signing_key: requester_key,
+            capabilities: Capabilities::default(),
+        };
+
+        let register_req_id = next_req_id();
+        let register_request = Envelope::from_typed(
+            register_req_id,
+            0,
+            &WirePayload::RelayRegister(RelayRegister {
+                relay_slot_id: None,
+            }),
+        )
+        .expect("encode register");
+        let register_response = owner_transport
+            .request(&relay_peer, register_request, Duration::from_secs(3))
+            .await
+            .expect("relay register");
+        assert_eq!(register_response.r#type, MsgType::RelayRegistered as u16);
+        assert_eq!(register_response.req_id, register_req_id);
+        assert_ne!(register_response.flags & FLAG_RESPONSE, 0);
+        let registered: RelayRegistered =
+            serde_cbor::from_slice(&register_response.payload).expect("decode registered");
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let renew_req_id = next_req_id();
+        let renew_request = Envelope::from_typed(
+            renew_req_id,
+            0,
+            &WirePayload::RelayRegister(RelayRegister {
+                relay_slot_id: Some(registered.relay_slot_id),
+            }),
+        )
+        .expect("encode renew");
+        let renew_response = owner_transport
+            .request(&relay_peer, renew_request, Duration::from_secs(3))
+            .await
+            .expect("relay renew");
+        assert_eq!(renew_response.r#type, MsgType::RelayRegistered as u16);
+        assert_eq!(renew_response.req_id, renew_req_id);
+        assert_ne!(renew_response.flags & FLAG_RESPONSE, 0);
+        let renewed: RelayRegistered =
+            serde_cbor::from_slice(&renew_response.payload).expect("decode renewed");
+        assert_eq!(renewed.relay_slot_id, registered.relay_slot_id);
+        assert!(renewed.expires_at > registered.expires_at);
+
+        let connect_req_id = next_req_id();
+        let connect_request = Envelope::from_typed(
+            connect_req_id,
+            0,
+            &WirePayload::RelayConnect(RelayConnect {
+                relay_slot_id: renewed.relay_slot_id,
+            }),
+        )
+        .expect("encode connect");
+        let connect_response = requester_transport
+            .request(&relay_peer, connect_request, Duration::from_secs(3))
+            .await
+            .expect("relay connect");
+        assert_eq!(connect_response.r#type, MsgType::RelayConnect as u16);
+        assert_eq!(connect_response.req_id, connect_req_id);
+        assert_ne!(connect_response.flags & FLAG_RESPONSE, 0);
+
+        let stream_req_id = next_req_id();
+        let stream_request = Envelope::from_typed(
+            stream_req_id,
+            0,
+            &WirePayload::RelayStream(RelayStream {
+                relay_slot_id: renewed.relay_slot_id,
+                stream_id: 42,
+                kind: WireRelayPayloadKind::Control,
+                payload: b"nat-bridge".to_vec(),
+            }),
+        )
+        .expect("encode stream");
+        let stream_response = requester_transport
+            .request(&relay_peer, stream_request, Duration::from_secs(3))
+            .await
+            .expect("relay stream");
+        assert_eq!(stream_response.r#type, MsgType::RelayStream as u16);
+        assert_eq!(stream_response.req_id, stream_req_id);
+        assert_ne!(stream_response.flags & FLAG_RESPONSE, 0);
+        let relayed: RelayStream =
+            serde_cbor::from_slice(&stream_response.payload).expect("decode stream");
+        assert_eq!(relayed.stream_id, 42);
+        assert_eq!(relayed.kind, WireRelayPayloadKind::Control);
+        assert_eq!(relayed.payload, b"nat-bridge".to_vec());
+
+        relay_task.abort();
     }
 
     #[tokio::test]

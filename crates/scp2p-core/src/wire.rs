@@ -208,7 +208,10 @@ pub struct ManifestData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RelayRegister {}
+pub struct RelayRegister {
+    #[serde(default)]
+    pub relay_slot_id: Option<u64>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayRegistered {
@@ -221,10 +224,20 @@ pub struct RelayConnect {
     pub relay_slot_id: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RelayPayloadKind {
+    #[default]
+    Control,
+    Content,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayStream {
     pub relay_slot_id: u64,
     pub stream_id: u32,
+    #[serde(default)]
+    pub kind: RelayPayloadKind,
     #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
 }
@@ -411,11 +424,22 @@ mod tests {
 
     #[test]
     fn relay_messages_roundtrip() {
-        let reg = RelayRegister {};
+        let reg = RelayRegister {
+            relay_slot_id: Some(42),
+        };
         let reg_rt: RelayRegister =
             serde_cbor::from_slice(&serde_cbor::to_vec(&reg).expect("encode relay register"))
                 .expect("decode relay register");
         assert_eq!(reg_rt, reg);
+
+        let reg_empty: RelayRegister = serde_cbor::from_slice(
+            &serde_cbor::to_vec(&serde_cbor::value::Value::Map(
+                std::collections::BTreeMap::new(),
+            ))
+            .expect("encode legacy empty register map"),
+        )
+        .expect("decode legacy empty register map");
+        assert_eq!(reg_empty.relay_slot_id, None);
 
         let registered = RelayRegistered {
             relay_slot_id: 7,
@@ -430,12 +454,22 @@ mod tests {
         let stream = RelayStream {
             relay_slot_id: 7,
             stream_id: 1,
+            kind: RelayPayloadKind::Control,
             payload: vec![1, 2, 3],
         };
         let stream_rt: RelayStream =
             serde_cbor::from_slice(&serde_cbor::to_vec(&stream).expect("encode relay stream"))
                 .expect("decode relay stream");
         assert_eq!(stream_rt, stream);
+
+        assert!(
+            serde_cbor::from_slice::<RelayStream>(
+                &serde_cbor::to_vec(&(7u64, 9u32, serde_bytes::ByteBuf::from(vec![8u8, 7])))
+                    .expect("encode legacy stream tuple"),
+            )
+            .is_err(),
+            "legacy tuple encoding should not decode as struct"
+        );
     }
 
     #[test]
@@ -563,7 +597,9 @@ mod tests {
                 manifest_id: [5u8; 32],
                 bytes: vec![9, 8, 7],
             }),
-            WirePayload::RelayRegister(RelayRegister {}),
+            WirePayload::RelayRegister(RelayRegister {
+                relay_slot_id: Some(77),
+            }),
             WirePayload::RelayRegistered(RelayRegistered {
                 relay_slot_id: 77,
                 expires_at: 88,
@@ -572,6 +608,7 @@ mod tests {
             WirePayload::RelayStream(RelayStream {
                 relay_slot_id: 11,
                 stream_id: 3,
+                kind: RelayPayloadKind::Control,
                 payload: vec![5, 4, 3],
             }),
             WirePayload::Providers(Providers {

@@ -10,9 +10,9 @@ use ed25519_dalek::SigningKey;
 use rand::{rngs::OsRng, RngCore};
 use scp2p_core::transport_net::tcp_connect_session;
 use scp2p_core::{
-    describe_content, BoxedStream, Capabilities, DirectRequestTransport, ItemV1, ManifestV1, Node,
-    NodeConfig, NodeId, PeerAddr, PeerConnector, SearchQuery, ShareId, ShareKeypair, SqliteStore,
-    Store, TransportProtocol,
+    describe_content, BoxedStream, Capabilities, DirectRequestTransport, FetchPolicy, ItemV1,
+    ManifestV1, Node, NodeConfig, NodeId, PeerAddr, PeerConnector, SearchQuery, ShareId,
+    ShareKeypair, SqliteStore, Store, TransportProtocol,
 };
 
 #[derive(Parser)]
@@ -72,6 +72,16 @@ enum Command {
     InspectState {
         #[arg(long, default_value = "scp2p.db")]
         state_db: String,
+    },
+    Download {
+        #[arg(long, default_value = "scp2p.db")]
+        state_db: String,
+        #[arg(long)]
+        content_id: String,
+        #[arg(long)]
+        out: String,
+        #[arg(long = "bootstrap", value_name = "IP:PORT", num_args = 1..)]
+        bootstrap: Vec<String>,
     },
 }
 
@@ -322,6 +332,37 @@ async fn main() -> anyhow::Result<()> {
                     manifest.items.len()
                 );
             }
+        }
+        Command::Download {
+            state_db,
+            content_id,
+            out,
+            bootstrap,
+        } => {
+            let node = open_node(&state_db, &bootstrap).await?;
+            let peers = bootstrap
+                .iter()
+                .map(|entry| parse_bootstrap_peer(entry))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let content_id = parse_hex_32(&content_id, "content_id")?;
+            let mut rng = OsRng;
+            let connector = CliSessionConnector {
+                signing_key: SigningKey::generate(&mut rng),
+                capabilities: Capabilities::default(),
+            };
+            node.download_from_peers(
+                &connector,
+                &peers,
+                content_id,
+                &out,
+                &FetchPolicy::default(),
+            )
+            .await?;
+            println!(
+                "downloaded content_id={} -> {}",
+                hex::encode(content_id),
+                out
+            );
         }
     }
 
