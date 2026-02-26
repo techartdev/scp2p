@@ -13,4 +13,6 @@ hex.workspace = true
 rand.workspace = true
 scp2p-core = { path = "../scp2p-core" }
 tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
 windows = "0.62.2"

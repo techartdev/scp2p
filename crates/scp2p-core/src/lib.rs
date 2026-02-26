@@ -17,7 +17,10 @@ pub mod transport;
 pub mod transport_net;
 pub mod wire;
 
-pub use api::{AbuseLimits, Node, NodeHandle, SearchQuery, SearchResult};
+pub use api::{
+    AbuseLimits, BlocklistRules, Node, NodeHandle, SearchPage, SearchPageQuery, SearchQuery,
+    SearchResult, SearchTrustFilter, SubscriptionTrustLevel,
+};
 pub use capabilities::Capabilities;
 pub use config::NodeConfig;
 pub use content::{

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
+    api::{BlocklistRules, SubscriptionTrustLevel},
     manifest::{ManifestV1, ShareHead},
     peer::PeerAddr,
     peer_db::PeerRecord,
@@ -34,6 +35,10 @@ pub struct PersistedState {
     pub search_index: Option<SearchIndexSnapshot>,
     pub partial_downloads: HashMap<[u8; 32], PersistedPartialDownload>,
     pub encrypted_node_key: Option<EncryptedSecret>,
+    #[serde(default)]
+    pub enabled_blocklist_shares: Vec<[u8; 32]>,
+    #[serde(default)]
+    pub blocklist_rules_by_share: HashMap<[u8; 32], BlocklistRules>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +47,8 @@ pub struct PersistedSubscription {
     pub share_pubkey: Option<[u8; 32]>,
     pub latest_seq: u64,
     pub latest_manifest_id: Option<[u8; 32]>,
+    #[serde(default)]
+    pub trust_level: SubscriptionTrustLevel,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,7 +111,8 @@ impl SqliteStore {
                 share_id BLOB PRIMARY KEY,
                 share_pubkey BLOB,
                 latest_seq INTEGER NOT NULL,
-                latest_manifest_id BLOB
+                latest_manifest_id BLOB,
+                trust_level TEXT NOT NULL DEFAULT 'normal'
             );
             CREATE TABLE IF NOT EXISTS manifests (
                 manifest_id BLOB PRIMARY KEY,
@@ -127,6 +135,7 @@ impl SqliteStore {
                 payload BLOB NOT NULL
             );",
         )?;
+        ensure_subscription_trust_column(&conn)?;
         Ok(())
     }
 }
@@ -161,7 +170,7 @@ impl Store for SqliteStore {
 
         {
             let mut stmt = conn.prepare(
-                "SELECT share_id, share_pubkey, latest_seq, latest_manifest_id FROM subscriptions",
+                "SELECT share_id, share_pubkey, latest_seq, latest_manifest_id, trust_level FROM subscriptions",
             )?;
             let rows = stmt.query_map([], |row| {
                 Ok((
@@ -169,10 +178,11 @@ impl Store for SqliteStore {
                     row.get::<_, Option<Vec<u8>>>(1)?,
                     row.get::<_, u64>(2)?,
                     row.get::<_, Option<Vec<u8>>>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })?;
             for row in rows {
-                let (share_id, share_pubkey, latest_seq, latest_manifest_id) = row?;
+                let (share_id, share_pubkey, latest_seq, latest_manifest_id, trust_level) = row?;
                 state.subscriptions.push(PersistedSubscription {
                     share_id: blob_to_array::<32>(&share_id, "subscriptions.share_id")?,
                     share_pubkey: share_pubkey
@@ -182,6 +192,7 @@ impl Store for SqliteStore {
                     latest_manifest_id: latest_manifest_id
                         .map(|v| blob_to_array::<32>(&v, "subscriptions.latest_manifest_id"))
                         .transpose()?,
+                    trust_level: parse_trust_level(&trust_level),
                 });
             }
         }
@@ -261,6 +272,28 @@ impl Store for SqliteStore {
             .map(|payload| serde_cbor::from_slice(&payload))
             .transpose()?;
 
+        state.enabled_blocklist_shares = conn
+            .query_row(
+                "SELECT payload FROM metadata WHERE key = 'enabled_blocklist_shares'",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|payload| serde_cbor::from_slice(&payload))
+            .transpose()?
+            .unwrap_or_default();
+
+        state.blocklist_rules_by_share = conn
+            .query_row(
+                "SELECT payload FROM metadata WHERE key = 'blocklist_rules_by_share'",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|payload| serde_cbor::from_slice(&payload))
+            .transpose()?
+            .unwrap_or_default();
+
         let has_normalized_data = !state.peers.is_empty()
             || !state.subscriptions.is_empty()
             || !state.manifests.is_empty()
@@ -268,7 +301,9 @@ impl Store for SqliteStore {
             || !state.share_weights.is_empty()
             || !state.partial_downloads.is_empty()
             || state.search_index.is_some()
-            || state.encrypted_node_key.is_some();
+            || state.encrypted_node_key.is_some()
+            || !state.enabled_blocklist_shares.is_empty()
+            || !state.blocklist_rules_by_share.is_empty();
         if has_normalized_data {
             return Ok(state);
         }
@@ -309,13 +344,14 @@ impl Store for SqliteStore {
 
         for sub in &state.subscriptions {
             tx.execute(
-                "INSERT INTO subscriptions(share_id, share_pubkey, latest_seq, latest_manifest_id)
-                 VALUES(?1, ?2, ?3, ?4)",
+                "INSERT INTO subscriptions(share_id, share_pubkey, latest_seq, latest_manifest_id, trust_level)
+                 VALUES(?1, ?2, ?3, ?4, ?5)",
                 params![
                     sub.share_id.to_vec(),
                     sub.share_pubkey.map(|v| v.to_vec()),
                     sub.latest_seq,
                     sub.latest_manifest_id.map(|v| v.to_vec()),
+                    trust_level_str(sub.trust_level),
                 ],
             )?;
         }
@@ -359,6 +395,18 @@ impl Store for SqliteStore {
                 params![serde_cbor::to_vec(encrypted_key)?],
             )?;
         }
+        if !state.enabled_blocklist_shares.is_empty() {
+            tx.execute(
+                "INSERT INTO metadata(key, payload) VALUES('enabled_blocklist_shares', ?1)",
+                params![serde_cbor::to_vec(&state.enabled_blocklist_shares)?],
+            )?;
+        }
+        if !state.blocklist_rules_by_share.is_empty() {
+            tx.execute(
+                "INSERT INTO metadata(key, payload) VALUES('blocklist_rules_by_share', ?1)",
+                params![serde_cbor::to_vec(&state.blocklist_rules_by_share)?],
+            )?;
+        }
 
         // Legacy compatibility snapshot (can be removed in a later migration window).
         let payload = serde_cbor::to_vec(state)?;
@@ -369,6 +417,37 @@ impl Store for SqliteStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+}
+
+fn ensure_subscription_trust_column(conn: &Connection) -> anyhow::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(subscriptions)")?;
+    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for column in columns {
+        if column? == "trust_level" {
+            return Ok(());
+        }
+    }
+    conn.execute(
+        "ALTER TABLE subscriptions ADD COLUMN trust_level TEXT NOT NULL DEFAULT 'normal'",
+        [],
+    )?;
+    Ok(())
+}
+
+fn parse_trust_level(value: &str) -> SubscriptionTrustLevel {
+    match value {
+        "trusted" => SubscriptionTrustLevel::Trusted,
+        "untrusted" => SubscriptionTrustLevel::Untrusted,
+        _ => SubscriptionTrustLevel::Normal,
+    }
+}
+
+fn trust_level_str(level: SubscriptionTrustLevel) -> &'static str {
+    match level {
+        SubscriptionTrustLevel::Trusted => "trusted",
+        SubscriptionTrustLevel::Normal => "normal",
+        SubscriptionTrustLevel::Untrusted => "untrusted",
     }
 }
 
@@ -460,8 +539,17 @@ mod tests {
             share_pubkey: None,
             latest_seq: 7,
             latest_manifest_id: Some([2u8; 32]),
+            trust_level: SubscriptionTrustLevel::Normal,
         });
         initial.share_weights.insert([1u8; 32], 1.5);
+        initial.enabled_blocklist_shares.push([3u8; 32]);
+        initial.blocklist_rules_by_share.insert(
+            [3u8; 32],
+            BlocklistRules {
+                blocked_share_ids: vec![[4u8; 32]],
+                blocked_content_ids: vec![[5u8; 32]],
+            },
+        );
 
         store.save_state(&initial).await.expect("save");
         let loaded = store.load_state().await.expect("load");
@@ -469,6 +557,8 @@ mod tests {
         assert_eq!(loaded.peers.len(), 1);
         assert_eq!(loaded.subscriptions.len(), 1);
         assert_eq!(loaded.share_weights.get(&[1u8; 32]), Some(&1.5));
+        assert_eq!(loaded.enabled_blocklist_shares, vec![[3u8; 32]]);
+        assert_eq!(loaded.blocklist_rules_by_share.len(), 1);
     }
 
     #[tokio::test]
@@ -488,6 +578,7 @@ mod tests {
             share_pubkey: Some([9u8; 32]),
             latest_seq: 3,
             latest_manifest_id: Some([5u8; 32]),
+            trust_level: SubscriptionTrustLevel::Trusted,
         });
         initial.partial_downloads.insert(
             [8u8; 32],
@@ -499,15 +590,50 @@ mod tests {
             },
         );
         initial.encrypted_node_key = Some(encrypt_secret(b"k", "pw").expect("encrypt"));
+        initial.enabled_blocklist_shares.push([7u8; 32]);
+        initial.blocklist_rules_by_share.insert(
+            [7u8; 32],
+            BlocklistRules {
+                blocked_share_ids: vec![[1u8; 32]],
+                blocked_content_ids: vec![[2u8; 32]],
+            },
+        );
 
         store.save_state(&initial).await.expect("save");
         let loaded = store.load_state().await.expect("load");
         assert_eq!(loaded.subscriptions.len(), 1);
         assert_eq!(loaded.subscriptions[0].latest_seq, 3);
+        assert_eq!(
+            loaded.subscriptions[0].trust_level,
+            SubscriptionTrustLevel::Trusted
+        );
         assert_eq!(loaded.partial_downloads.len(), 1);
         assert!(loaded.encrypted_node_key.is_some());
+        assert_eq!(loaded.enabled_blocklist_shares, vec![[7u8; 32]]);
+        assert_eq!(loaded.blocklist_rules_by_share.len(), 1);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn persisted_subscription_legacy_defaults_trust_level() {
+        #[derive(Serialize)]
+        struct LegacySubscription {
+            share_id: [u8; 32],
+            share_pubkey: Option<[u8; 32]>,
+            latest_seq: u64,
+            latest_manifest_id: Option<[u8; 32]>,
+        }
+
+        let legacy = LegacySubscription {
+            share_id: [3u8; 32],
+            share_pubkey: None,
+            latest_seq: 1,
+            latest_manifest_id: None,
+        };
+        let encoded = serde_cbor::to_vec(&legacy).expect("encode");
+        let decoded: PersistedSubscription = serde_cbor::from_slice(&encoded).expect("decode");
+        assert_eq!(decoded.trust_level, SubscriptionTrustLevel::Normal);
     }
 
     #[test]

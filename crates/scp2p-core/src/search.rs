@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::manifest::ManifestV1;
 
@@ -76,7 +77,7 @@ impl SearchIndex {
         subscribed_shares: &HashSet<[u8; 32]>,
         share_weights: &HashMap<[u8; 32], f32>,
     ) -> Vec<(IndexedItem, f32)> {
-        let q = query.trim().to_lowercase();
+        let q = normalize_text(query).trim().to_string();
         if q.is_empty() {
             return vec![];
         }
@@ -90,7 +91,7 @@ impl SearchIndex {
 
         if candidate_keys.is_empty() {
             for (k, item) in &self.items {
-                if item.name.to_lowercase().contains(&q) {
+                if normalize_text(&item.name).contains(&q) {
                     candidate_keys.insert(*k);
                 }
             }
@@ -130,7 +131,7 @@ impl SearchIndex {
 
 fn score_item(item: &IndexedItem, q: &str) -> f32 {
     let mut score = 0.0;
-    let name = item.name.to_lowercase();
+    let name = normalize_text(&item.name);
     if name == q {
         score += 100.0;
     } else if name.split_whitespace().any(|t| t == q) {
@@ -142,7 +143,7 @@ fn score_item(item: &IndexedItem, q: &str) -> f32 {
     }
 
     for tag in &item.tags {
-        let t = tag.to_lowercase();
+        let t = normalize_text(tag);
         if t == q {
             score += 30.0;
         } else if t.starts_with(q) {
@@ -153,7 +154,7 @@ fn score_item(item: &IndexedItem, q: &str) -> f32 {
     if item
         .title
         .as_ref()
-        .map(|t| t.to_lowercase().contains(q))
+        .map(|t| normalize_text(t).contains(q))
         .unwrap_or(false)
     {
         score += 12.0;
@@ -162,7 +163,7 @@ fn score_item(item: &IndexedItem, q: &str) -> f32 {
     if item
         .description
         .as_ref()
-        .map(|d| d.to_lowercase().contains(q))
+        .map(|d| normalize_text(d).contains(q))
         .unwrap_or(false)
     {
         score += 8.0;
@@ -186,18 +187,22 @@ fn tokens_for_item(item: &IndexedItem) -> Vec<String> {
 }
 
 fn tokenize(input: &str) -> Vec<String> {
-    input
-        .to_lowercase()
+    normalize_text(input)
         .split(|c: char| !c.is_alphanumeric())
         .filter(|s| !s.is_empty())
         .map(ToOwned::to_owned)
         .collect()
 }
 
+fn normalize_text(input: &str) -> String {
+    input.nfkc().collect::<String>().to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::manifest::ItemV1;
+    use std::time::Instant;
 
     fn manifest(name: &str, tag: &str, share_id: [u8; 32]) -> ManifestV1 {
         ManifestV1 {
@@ -255,5 +260,100 @@ mod tests {
         let hits = idx.search("movie", &subs, &weights);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0.share_id, b);
+    }
+
+    #[test]
+    fn unicode_normalization_is_applied_in_search() {
+        let mut idx = SearchIndex::default();
+        let share_id = [3u8; 32];
+        idx.index_manifest(&manifest("Cafe\u{301} Guide", "travel", share_id));
+        let mut subs = HashSet::new();
+        subs.insert(share_id);
+
+        let hits = idx.search("CAF\u{00C9}", &subs, &HashMap::new());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.name, "Cafe\u{301} Guide");
+    }
+
+    fn read_env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|v| v.clamp(min, max))
+            .unwrap_or(default)
+    }
+
+    fn read_env_u128(name: &str, default: u128, min: u128, max: u128) -> u128 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u128>().ok())
+            .map(|v| v.clamp(min, max))
+            .unwrap_or(default)
+    }
+
+    #[test]
+    fn large_catalog_benchmark_smoke() {
+        let share_count = read_env_usize("SCP2P_SEARCH_BENCH_SHARE_COUNT", 40, 5, 200);
+        let items_per_share = read_env_usize("SCP2P_SEARCH_BENCH_ITEMS_PER_SHARE", 200, 20, 1_000);
+        let max_index_ms = read_env_u128("SCP2P_SEARCH_BENCH_MAX_INDEX_MS", 8_000, 200, 120_000);
+        let max_query_ms = read_env_u128("SCP2P_SEARCH_BENCH_MAX_QUERY_MS", 600, 20, 20_000);
+
+        let mut idx = SearchIndex::default();
+        let mut subscribed = HashSet::new();
+        let weights = HashMap::new();
+
+        let index_started = Instant::now();
+        for share_idx in 0..share_count {
+            let mut share_id = [0u8; 32];
+            share_id[..8].copy_from_slice(&(share_idx as u64).to_le_bytes());
+            subscribed.insert(share_id);
+
+            let mut items = Vec::with_capacity(items_per_share);
+            for item_idx in 0..items_per_share {
+                let mut content_id = [0u8; 32];
+                content_id[..8].copy_from_slice(&(item_idx as u64).to_le_bytes());
+                content_id[8..16].copy_from_slice(&(share_idx as u64).to_le_bytes());
+                items.push(ItemV1 {
+                    content_id,
+                    size: 1_024 + item_idx as u64,
+                    name: format!("movie-{share_idx}-{item_idx}"),
+                    mime: None,
+                    tags: vec!["movie".into(), format!("share-{share_idx}")],
+                    chunks: vec![],
+                });
+            }
+
+            idx.index_manifest(&ManifestV1 {
+                version: 1,
+                share_pubkey: [0u8; 32],
+                share_id,
+                seq: 1,
+                created_at: 1,
+                expires_at: None,
+                title: Some(format!("Catalog {share_idx}")),
+                description: Some("benchmark catalog".into()),
+                items,
+                recommended_shares: vec![],
+                signature: None,
+            });
+        }
+        let index_ms = index_started.elapsed().as_millis();
+        assert!(
+            index_ms <= max_index_ms,
+            "search index build {}ms exceeded threshold {}ms",
+            index_ms,
+            max_index_ms
+        );
+
+        let query_started = Instant::now();
+        let hits = idx.search("movie", &subscribed, &weights);
+        let query_ms = query_started.elapsed().as_millis();
+        assert!(
+            query_ms <= max_query_ms,
+            "search query {}ms exceeded threshold {}ms",
+            query_ms,
+            max_query_ms
+        );
+        assert_eq!(hits.len(), share_count * items_per_share);
     }
 }

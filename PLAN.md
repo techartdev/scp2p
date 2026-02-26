@@ -147,12 +147,15 @@ Remaining hardening (future increments):
 
 ## 5. Search improvements
 
+Status: **In progress**
+- trust-tier filtering baseline implemented in core API (`trusted|normal|untrusted`, default `trusted+normal`)
+- pagination + optional snippets baseline implemented in core API search page queries
+- Unicode normalization baseline implemented in tokenizer/query path (`NFKC` + lowercase folding)
+- optional blocklist-share filtering baseline implemented via explicit `BlocklistRules` attached to subscribed blocklist shares
+- large-catalog benchmark smoke baseline implemented (index build + query latency thresholds, env-configurable)
+
 Current search is local and simple. Extend to:
-- better token normalization (casefolding, Unicode normalization)
-- pagination and result snippets
-- trust-tier filtering (`trusted|normal|untrusted`)
-- optional blocklist-share integration
-- benchmarking for large catalogs (index build time, query latency)
+- deeper benchmarking and profile-guided optimization for large catalogs (beyond smoke baseline)
 
 Notes:
 - Keep search strictly subscription-scoped in v0.1.
@@ -240,4 +243,9 @@ A practical v0.1 should include:
 - persistent local state (peers, subscriptions, manifests, index, partial downloads)
 - conformance pack + multi-node integration tests
 
+---
 
+## 11. Desktop Client Track
+
+- Chosen GUI direction: **Tauri + React** desktop client.
+- Detailed execution plan is tracked in `DESKTOP_APP_PLAN.md`.

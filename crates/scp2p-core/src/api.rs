@@ -8,6 +8,7 @@ use std::{
 
 use ed25519_dalek::SigningKey;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -27,7 +28,7 @@ use crate::{
     peer::PeerAddr,
     peer_db::PeerDb,
     relay::{RelayLimits, RelayManager, RelayPayloadKind as RelayInternalPayloadKind},
-    search::SearchIndex,
+    search::{IndexedItem, SearchIndex},
     store::{
         decrypt_secret, encrypt_secret, EncryptedSecret, MemoryStore, PersistedPartialDownload,
         PersistedState, PersistedSubscription, Store,
@@ -49,11 +50,93 @@ pub struct SearchQuery {
 }
 
 #[derive(Debug, Clone)]
+pub struct SearchPageQuery {
+    pub text: String,
+    pub offset: usize,
+    pub limit: usize,
+    pub include_snippets: bool,
+}
+
+impl SearchPageQuery {
+    const DEFAULT_LIMIT: usize = 20;
+    const MAX_LIMIT: usize = 200;
+
+    fn normalized(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            offset: self.offset,
+            limit: self.limit.clamp(1, Self::MAX_LIMIT),
+            include_snippets: self.include_snippets,
+        }
+    }
+}
+
+impl From<SearchQuery> for SearchPageQuery {
+    fn from(value: SearchQuery) -> Self {
+        Self {
+            text: value.text,
+            offset: 0,
+            limit: SearchPageQuery::DEFAULT_LIMIT,
+            include_snippets: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionTrustLevel {
+    Trusted,
+    #[default]
+    Normal,
+    Untrusted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BlocklistRules {
+    pub blocked_share_ids: Vec<[u8; 32]>,
+    pub blocked_content_ids: Vec<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchTrustFilter {
+    #[default]
+    TrustedAndNormal,
+    TrustedOnly,
+    NormalOnly,
+    UntrustedOnly,
+    All,
+}
+
+impl SearchTrustFilter {
+    fn allows(self, trust_level: SubscriptionTrustLevel) -> bool {
+        match self {
+            Self::TrustedAndNormal => {
+                matches!(
+                    trust_level,
+                    SubscriptionTrustLevel::Trusted | SubscriptionTrustLevel::Normal
+                )
+            }
+            Self::TrustedOnly => matches!(trust_level, SubscriptionTrustLevel::Trusted),
+            Self::NormalOnly => matches!(trust_level, SubscriptionTrustLevel::Normal),
+            Self::UntrustedOnly => matches!(trust_level, SubscriptionTrustLevel::Untrusted),
+            Self::All => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct SearchResult {
     pub share_id: ShareId,
     pub content_id: [u8; 32],
     pub name: String,
+    pub snippet: Option<String>,
     pub score: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchPage {
+    pub total: usize,
+    pub results: Vec<SearchResult>,
 }
 
 #[derive(Clone)]
@@ -78,6 +161,8 @@ struct NodeState {
     abuse_limits: AbuseLimits,
     partial_downloads: HashMap<[u8; 32], PersistedPartialDownload>,
     encrypted_node_key: Option<EncryptedSecret>,
+    enabled_blocklist_shares: HashSet<[u8; 32]>,
+    blocklist_rules_by_share: HashMap<[u8; 32], BlocklistRules>,
     store: Arc<dyn Store>,
 }
 
@@ -86,6 +171,7 @@ struct SubscriptionState {
     share_pubkey: Option<[u8; 32]>,
     latest_seq: u64,
     latest_manifest_id: Option<[u8; 32]>,
+    trust_level: SubscriptionTrustLevel,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +242,8 @@ impl NodeState {
             search_index,
             partial_downloads,
             encrypted_node_key,
+            enabled_blocklist_shares,
+            blocklist_rules_by_share,
         } = persisted;
         let mut peer_db = PeerDb::default();
         peer_db.replace_records(peers);
@@ -168,6 +256,7 @@ impl NodeState {
                         share_pubkey: sub.share_pubkey,
                         latest_seq: sub.latest_seq,
                         latest_manifest_id: sub.latest_manifest_id,
+                        trust_level: sub.trust_level,
                     },
                 )
             })
@@ -224,6 +313,8 @@ impl NodeState {
             abuse_limits: AbuseLimits::default(),
             partial_downloads,
             encrypted_node_key,
+            enabled_blocklist_shares: enabled_blocklist_shares.into_iter().collect(),
+            blocklist_rules_by_share,
             store,
         }
     }
@@ -237,6 +328,7 @@ impl NodeState {
                 share_pubkey: sub.share_pubkey,
                 latest_seq: sub.latest_seq,
                 latest_manifest_id: sub.latest_manifest_id,
+                trust_level: sub.trust_level,
             })
             .collect();
         PersistedState {
@@ -248,6 +340,8 @@ impl NodeState {
             search_index: Some(self.search_index.snapshot()),
             partial_downloads: self.partial_downloads.clone(),
             encrypted_node_key: self.encrypted_node_key.clone(),
+            enabled_blocklist_shares: self.enabled_blocklist_shares.iter().copied().collect(),
+            blocklist_rules_by_share: self.blocklist_rules_by_share.clone(),
         }
     }
 
@@ -861,13 +955,86 @@ impl NodeHandle {
     }
 
     pub async fn subscribe(&self, share_id: ShareId) -> anyhow::Result<()> {
-        self.subscribe_with_pubkey(share_id, None).await
+        self.subscribe_with_options(share_id, None, SubscriptionTrustLevel::Normal)
+            .await
     }
 
     pub async fn subscribe_with_pubkey(
         &self,
         share_id: ShareId,
         share_pubkey: Option<[u8; 32]>,
+    ) -> anyhow::Result<()> {
+        self.subscribe_with_options(share_id, share_pubkey, SubscriptionTrustLevel::Normal)
+            .await
+    }
+
+    pub async fn subscribe_with_trust(
+        &self,
+        share_id: ShareId,
+        share_pubkey: Option<[u8; 32]>,
+        trust_level: SubscriptionTrustLevel,
+    ) -> anyhow::Result<()> {
+        self.subscribe_with_options(share_id, share_pubkey, trust_level)
+            .await
+    }
+
+    pub async fn set_subscription_trust_level(
+        &self,
+        share_id: ShareId,
+        trust_level: SubscriptionTrustLevel,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        let Some(sub) = state.subscriptions.get_mut(&share_id.0) else {
+            anyhow::bail!("subscription not found");
+        };
+        sub.trust_level = trust_level;
+        persist_state_locked(&state).await?;
+        Ok(())
+    }
+
+    pub async fn set_blocklist_rules(
+        &self,
+        blocklist_share_id: ShareId,
+        rules: BlocklistRules,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        state
+            .blocklist_rules_by_share
+            .insert(blocklist_share_id.0, rules);
+        persist_state_locked(&state).await?;
+        Ok(())
+    }
+
+    pub async fn clear_blocklist_rules(&self, blocklist_share_id: ShareId) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        state.blocklist_rules_by_share.remove(&blocklist_share_id.0);
+        state.enabled_blocklist_shares.remove(&blocklist_share_id.0);
+        persist_state_locked(&state).await?;
+        Ok(())
+    }
+
+    pub async fn enable_blocklist_share(&self, blocklist_share_id: ShareId) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        if !state.subscriptions.contains_key(&blocklist_share_id.0) {
+            anyhow::bail!("blocklist share must be subscribed before enabling");
+        }
+        state.enabled_blocklist_shares.insert(blocklist_share_id.0);
+        persist_state_locked(&state).await?;
+        Ok(())
+    }
+
+    pub async fn disable_blocklist_share(&self, blocklist_share_id: ShareId) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        state.enabled_blocklist_shares.remove(&blocklist_share_id.0);
+        persist_state_locked(&state).await?;
+        Ok(())
+    }
+
+    async fn subscribe_with_options(
+        &self,
+        share_id: ShareId,
+        share_pubkey: Option<[u8; 32]>,
+        trust_level: SubscriptionTrustLevel,
     ) -> anyhow::Result<()> {
         let mut state = self.state.write().await;
         state
@@ -877,6 +1044,7 @@ impl NodeHandle {
                 share_pubkey,
                 latest_seq: 0,
                 latest_manifest_id: None,
+                trust_level,
             });
         persist_state_locked(&state).await?;
         Ok(())
@@ -885,6 +1053,8 @@ impl NodeHandle {
     pub async fn unsubscribe(&self, share_id: ShareId) -> anyhow::Result<()> {
         let mut state = self.state.write().await;
         state.subscriptions.remove(&share_id.0);
+        state.enabled_blocklist_shares.remove(&share_id.0);
+        state.blocklist_rules_by_share.remove(&share_id.0);
         persist_state_locked(&state).await?;
         Ok(())
     }
@@ -1106,19 +1276,96 @@ impl NodeHandle {
     }
 
     pub async fn search(&self, query: SearchQuery) -> anyhow::Result<Vec<SearchResult>> {
+        self.search_with_trust_filter(query, SearchTrustFilter::default())
+            .await
+    }
+
+    pub async fn search_with_trust_filter(
+        &self,
+        query: SearchQuery,
+        trust_filter: SearchTrustFilter,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        self.search_hits(&query.text, trust_filter, false).await
+    }
+
+    pub async fn search_page(&self, query: SearchPageQuery) -> anyhow::Result<SearchPage> {
+        self.search_page_with_trust_filter(query, SearchTrustFilter::default())
+            .await
+    }
+
+    pub async fn search_page_with_trust_filter(
+        &self,
+        query: SearchPageQuery,
+        trust_filter: SearchTrustFilter,
+    ) -> anyhow::Result<SearchPage> {
+        let query = query.normalized();
+        let hits = self
+            .search_hits(&query.text, trust_filter, query.include_snippets)
+            .await?;
+        let total = hits.len();
+        if query.offset >= total {
+            return Ok(SearchPage {
+                total,
+                results: vec![],
+            });
+        }
+        let results = hits
+            .into_iter()
+            .skip(query.offset)
+            .take(query.limit)
+            .collect();
+        Ok(SearchPage { total, results })
+    }
+
+    async fn search_hits(
+        &self,
+        query_text: &str,
+        trust_filter: SearchTrustFilter,
+        include_snippets: bool,
+    ) -> anyhow::Result<Vec<SearchResult>> {
         let state = self.state.read().await;
-        let subscribed = state.subscriptions.keys().copied().collect::<HashSet<_>>();
+        let subscribed = state
+            .subscriptions
+            .iter()
+            .filter_map(|(share_id, sub)| {
+                if trust_filter.allows(sub.trust_level) {
+                    Some(*share_id)
+                } else {
+                    None
+                }
+            })
+            .collect::<HashSet<_>>();
+        let mut blocked_shares = HashSet::<[u8; 32]>::new();
+        let mut blocked_content_ids = HashSet::<[u8; 32]>::new();
+        for share_id in &state.enabled_blocklist_shares {
+            if !state.subscriptions.contains_key(share_id) {
+                continue;
+            }
+            let Some(rules) = state.blocklist_rules_by_share.get(share_id) else {
+                continue;
+            };
+            blocked_shares.extend(rules.blocked_share_ids.iter().copied());
+            blocked_content_ids.extend(rules.blocked_content_ids.iter().copied());
+        }
         let hits = state
             .search_index
-            .search(&query.text, &subscribed, &state.share_weights)
+            .search(query_text, &subscribed, &state.share_weights)
             .into_iter()
-            .map(|(item, score)| SearchResult {
-                share_id: ShareId(item.share_id),
-                content_id: item.content_id,
-                name: item.name,
-                score,
+            .filter(|(item, _)| {
+                !blocked_shares.contains(&item.share_id)
+                    && !blocked_content_ids.contains(&item.content_id)
             })
-            .collect();
+            .map(|(item, score)| {
+                let snippet = build_search_snippet(&item, query_text, include_snippets);
+                SearchResult {
+                    share_id: ShareId(item.share_id),
+                    content_id: item.content_id,
+                    name: item.name,
+                    snippet,
+                    score,
+                }
+            })
+            .collect::<Vec<_>>();
         Ok(hits)
     }
 
@@ -1530,6 +1777,57 @@ impl NodeHandle {
         merge_peer_list(&mut peers, known);
         peers
     }
+}
+
+fn build_search_snippet(item: &IndexedItem, query: &str, include_snippet: bool) -> Option<String> {
+    if !include_snippet {
+        return None;
+    }
+    let terms = query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| term.to_lowercase())
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        return None;
+    }
+
+    let candidates = [
+        item.title.as_deref(),
+        item.description.as_deref(),
+        Some(item.name.as_str()),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        let lower = candidate.to_lowercase();
+        let mut first_match = None;
+        for term in &terms {
+            if let Some(idx) = lower.find(term) {
+                first_match = Some(idx);
+                break;
+            }
+        }
+        let Some(match_index) = first_match else {
+            continue;
+        };
+
+        let snippet_radius = 48usize;
+        let start = match_index.saturating_sub(snippet_radius);
+        let end = (match_index + snippet_radius).min(candidate.len());
+        let Some(window) = candidate.get(start..end) else {
+            continue;
+        };
+        let mut snippet = window.trim().to_string();
+        if start > 0 {
+            snippet.insert_str(0, "...");
+        }
+        if end < candidate.len() {
+            snippet.push_str("...");
+        }
+        if !snippet.is_empty() {
+            return Some(snippet);
+        }
+    }
+    None
 }
 
 fn now_unix_secs() -> anyhow::Result<u64> {
@@ -3165,6 +3463,267 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_default_excludes_untrusted_subscriptions() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        let mut rng = OsRng;
+        let trusted = ShareKeypair::new(SigningKey::generate(&mut rng));
+        let untrusted = ShareKeypair::new(SigningKey::generate(&mut rng));
+
+        for (share, trust, content_id) in [
+            (&trusted, SubscriptionTrustLevel::Trusted, [11u8; 32]),
+            (&untrusted, SubscriptionTrustLevel::Untrusted, [12u8; 32]),
+        ] {
+            handle
+                .subscribe_with_trust(
+                    share.share_id(),
+                    Some(share.verifying_key().to_bytes()),
+                    trust,
+                )
+                .await
+                .expect("subscribe");
+            let manifest = ManifestV1 {
+                version: 1,
+                share_pubkey: share.verifying_key().to_bytes(),
+                share_id: share.share_id().0,
+                seq: 1,
+                created_at: 1_700_000_010,
+                expires_at: None,
+                title: Some("tiered search".into()),
+                description: None,
+                items: vec![ItemV1 {
+                    content_id,
+                    size: 1,
+                    name: "movie trust".into(),
+                    mime: None,
+                    tags: vec!["movie".into()],
+                    chunks: vec![],
+                }],
+                recommended_shares: vec![],
+                signature: None,
+            };
+            handle
+                .publish_share(manifest, share)
+                .await
+                .expect("publish");
+        }
+
+        handle.sync_subscriptions().await.expect("sync");
+
+        let default_hits = handle
+            .search(SearchQuery {
+                text: "movie".into(),
+            })
+            .await
+            .expect("search default");
+        assert_eq!(default_hits.len(), 1);
+        assert_eq!(default_hits[0].share_id, trusted.share_id());
+
+        let all_hits = handle
+            .search_with_trust_filter(
+                SearchQuery {
+                    text: "movie".into(),
+                },
+                SearchTrustFilter::All,
+            )
+            .await
+            .expect("search all tiers");
+        assert_eq!(all_hits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn search_page_supports_offset_limit_and_snippets() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        let mut rng = OsRng;
+        for idx in 0..3u8 {
+            let share = ShareKeypair::new(SigningKey::generate(&mut rng));
+            handle
+                .subscribe_with_trust(
+                    share.share_id(),
+                    Some(share.verifying_key().to_bytes()),
+                    SubscriptionTrustLevel::Trusted,
+                )
+                .await
+                .expect("subscribe");
+            let manifest = ManifestV1 {
+                version: 1,
+                share_pubkey: share.verifying_key().to_bytes(),
+                share_id: share.share_id().0,
+                seq: 1,
+                created_at: 1_700_000_020 + idx as u64,
+                expires_at: None,
+                title: Some(format!("Trusted Movie Collection {}", idx + 1)),
+                description: Some("Curated trusted movie archive".into()),
+                items: vec![ItemV1 {
+                    content_id: [20 + idx; 32],
+                    size: 1,
+                    name: format!("movie-{}.mkv", idx + 1),
+                    mime: None,
+                    tags: vec!["movie".into(), "trusted".into()],
+                    chunks: vec![],
+                }],
+                recommended_shares: vec![],
+                signature: None,
+            };
+            handle
+                .publish_share(manifest, &share)
+                .await
+                .expect("publish");
+        }
+        handle.sync_subscriptions().await.expect("sync");
+
+        let page = handle
+            .search_page(SearchPageQuery {
+                text: "movie".into(),
+                offset: 1,
+                limit: 1,
+                include_snippets: true,
+            })
+            .await
+            .expect("search page");
+        assert_eq!(page.total, 3);
+        assert_eq!(page.results.len(), 1);
+
+        let full_page = handle
+            .search_page(SearchPageQuery {
+                text: "movie".into(),
+                offset: 0,
+                limit: 2,
+                include_snippets: true,
+            })
+            .await
+            .expect("search full page");
+        assert_eq!(full_page.total, 3);
+        assert_eq!(full_page.results.len(), 2);
+        assert!(full_page.results[0]
+            .snippet
+            .as_deref()
+            .map(|s| s.to_lowercase().contains("movie"))
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn can_update_subscription_trust_level() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        let mut rng = OsRng;
+        let share = ShareKeypair::new(SigningKey::generate(&mut rng));
+        handle
+            .subscribe_with_pubkey(share.share_id(), Some(share.verifying_key().to_bytes()))
+            .await
+            .expect("subscribe");
+        handle
+            .set_subscription_trust_level(share.share_id(), SubscriptionTrustLevel::Untrusted)
+            .await
+            .expect("set trust");
+
+        let state = handle.state.read().await;
+        let sub = state
+            .subscriptions
+            .get(&share.share_id().0)
+            .expect("subscription must exist");
+        assert_eq!(sub.trust_level, SubscriptionTrustLevel::Untrusted);
+    }
+
+    #[tokio::test]
+    async fn enabled_blocklist_share_filters_search_results() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        let mut rng = OsRng;
+        let share_a = ShareKeypair::new(SigningKey::generate(&mut rng));
+        let share_b = ShareKeypair::new(SigningKey::generate(&mut rng));
+        let blocklist_share = ShareKeypair::new(SigningKey::generate(&mut rng));
+        let blocked_content = [42u8; 32];
+
+        for (share, content_id, name) in [
+            (&share_a, [41u8; 32], "movie-a"),
+            (&share_b, blocked_content, "movie-b"),
+        ] {
+            handle
+                .subscribe_with_trust(
+                    share.share_id(),
+                    Some(share.verifying_key().to_bytes()),
+                    SubscriptionTrustLevel::Trusted,
+                )
+                .await
+                .expect("subscribe content share");
+            let manifest = ManifestV1 {
+                version: 1,
+                share_pubkey: share.verifying_key().to_bytes(),
+                share_id: share.share_id().0,
+                seq: 1,
+                created_at: 1_700_000_030,
+                expires_at: None,
+                title: Some("content share".into()),
+                description: None,
+                items: vec![ItemV1 {
+                    content_id,
+                    size: 1,
+                    name: name.into(),
+                    mime: None,
+                    tags: vec!["movie".into()],
+                    chunks: vec![],
+                }],
+                recommended_shares: vec![],
+                signature: None,
+            };
+            handle
+                .publish_share(manifest, share)
+                .await
+                .expect("publish");
+        }
+
+        handle
+            .subscribe_with_trust(
+                blocklist_share.share_id(),
+                Some(blocklist_share.verifying_key().to_bytes()),
+                SubscriptionTrustLevel::Trusted,
+            )
+            .await
+            .expect("subscribe blocklist share");
+        handle
+            .set_blocklist_rules(
+                blocklist_share.share_id(),
+                BlocklistRules {
+                    blocked_share_ids: vec![share_a.share_id().0],
+                    blocked_content_ids: vec![blocked_content],
+                },
+            )
+            .await
+            .expect("set blocklist rules");
+
+        handle.sync_subscriptions().await.expect("sync");
+        let baseline = handle
+            .search(SearchQuery {
+                text: "movie".into(),
+            })
+            .await
+            .expect("baseline search");
+        assert_eq!(baseline.len(), 2);
+
+        handle
+            .enable_blocklist_share(blocklist_share.share_id())
+            .await
+            .expect("enable blocklist");
+        let filtered = handle
+            .search(SearchQuery {
+                text: "movie".into(),
+            })
+            .await
+            .expect("filtered search");
+        assert_eq!(filtered.len(), 0);
+
+        handle
+            .disable_blocklist_share(blocklist_share.share_id())
+            .await
+            .expect("disable blocklist");
+        let restored = handle
+            .search(SearchQuery {
+                text: "movie".into(),
+            })
+            .await
+            .expect("restored search");
+        assert_eq!(restored.len(), 2);
+    }
+
+    #[tokio::test]
     async fn relay_register_connect_and_stream_roundtrip() {
         let handle = Node::start(NodeConfig::default()).await.expect("start");
         let owner = PeerAddr {
@@ -3621,6 +4180,20 @@ mod tests {
             .set_encrypted_node_key(b"node-private-key", "pw")
             .await
             .expect("set key");
+        first
+            .set_blocklist_rules(
+                share_id,
+                BlocklistRules {
+                    blocked_share_ids: vec![[7u8; 32]],
+                    blocked_content_ids: vec![[8u8; 32]],
+                },
+            )
+            .await
+            .expect("set blocklist");
+        first
+            .enable_blocklist_share(share_id)
+            .await
+            .expect("enable blocklist");
 
         let second = Node::start_with_store(NodeConfig::default(), store.clone())
             .await
@@ -3629,6 +4202,13 @@ mod tests {
         assert_eq!(state.peer_db.total_known_peers(), 1);
         assert!(state.subscriptions.contains_key(&share_id.0));
         assert_eq!(state.share_weights.get(&share_id.0), Some(&1.7));
+        assert!(state.enabled_blocklist_shares.contains(&share_id.0));
+        let rules = state
+            .blocklist_rules_by_share
+            .get(&share_id.0)
+            .expect("blocklist should persist");
+        assert_eq!(rules.blocked_share_ids, vec![[7u8; 32]]);
+        assert_eq!(rules.blocked_content_ids, vec![[8u8; 32]]);
         let partial = state
             .partial_downloads
             .get(&[9u8; 32])

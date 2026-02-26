@@ -72,6 +72,11 @@ The API is currently centered around `Node` and `NodeHandle`.
 ### Subscriptions / manifests
 - `NodeHandle::subscribe(share_id)`
 - `NodeHandle::subscribe_with_pubkey(share_id, pubkey_opt)`
+- `NodeHandle::subscribe_with_trust(share_id, pubkey_opt, trust_level)`
+- `NodeHandle::set_subscription_trust_level(share_id, trust_level)`
+- `NodeHandle::set_blocklist_rules(blocklist_share_id, rules)`
+- `NodeHandle::enable_blocklist_share(blocklist_share_id)`
+- `NodeHandle::disable_blocklist_share(blocklist_share_id)`
 - `NodeHandle::unsubscribe(share_id)`
 - `NodeHandle::publish_share(manifest, publisher)`
 - `NodeHandle::sync_subscriptions()`
@@ -80,6 +85,9 @@ The API is currently centered around `Node` and `NodeHandle`.
 ### Search
 - `NodeHandle::set_share_weight(share_id, weight)`
 - `NodeHandle::search(query)`
+- `NodeHandle::search_with_trust_filter(query, filter)`
+- `NodeHandle::search_page(query)`
+- `NodeHandle::search_page_with_trust_filter(query, filter)`
 
 ### Content transfer
 - `NodeHandle::register_local_provider_content(peer, bytes)`
@@ -162,6 +170,15 @@ The API is currently centered around `Node` and `NodeHandle`.
 ### Search
 - Local inverted index over synced manifest items
 - Subscription-scoped filtering
+- Unicode-normalized tokenization/querying baseline (`NFKC` + lowercase normalization)
+- Trust-tier filtering (`trusted`/`normal`/`untrusted`); default search includes `trusted+normal`
+- Pagination support (`offset`, `limit`) and optional snippets in search page results
+- Optional blocklist-share filtering via explicit `BlocklistRules` per subscribed share
+- Large-catalog benchmark smoke test (`search::tests::large_catalog_benchmark_smoke`) with env knobs:
+  - `SCP2P_SEARCH_BENCH_SHARE_COUNT`
+  - `SCP2P_SEARCH_BENCH_ITEMS_PER_SHARE`
+  - `SCP2P_SEARCH_BENCH_MAX_INDEX_MS`
+  - `SCP2P_SEARCH_BENCH_MAX_QUERY_MS`
 - Basic ranking and per-share weighting
 
 ### Transfer
