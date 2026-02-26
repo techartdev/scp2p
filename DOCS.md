@@ -95,6 +95,7 @@ The API is currently centered around `Node` and `NodeHandle`.
 - `NodeHandle::select_relay_peer()`
 - `NodeHandle::select_relay_peers(max_peers)`
 - `NodeHandle::note_relay_result(peer, success)`
+- `NodeHandle::set_abuse_limits(limits)`
 
 ### Transport/session primitives (spec section 3 foundations)
 - `handshake_initiator(...)`
@@ -175,6 +176,7 @@ The API is currently centered around `Node` and `NodeHandle`.
 - Control-only default relay policy with configurable content opt-in
 - Quota enforcement baseline (control bytes/day, content bytes/day, stream count/day)
 - Health-scored relay selection/rotation helpers to avoid sticky single-relay usage
+- Adaptive relay gating baseline (content relay requires positive trust score; payload size caps scale by trust score)
 
 ### Persistence
 - Durable state snapshot load/save via store backends

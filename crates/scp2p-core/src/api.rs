@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     sync::atomic::{AtomicU32, Ordering},
     sync::Arc,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 use ed25519_dalek::SigningKey;
@@ -765,7 +765,10 @@ impl NodeHandle {
             req.payload,
             now_unix_secs()?,
         )?;
-        let score_mut = state.relay_scores.entry(relay_peer_key(&peer_addr)).or_insert(0);
+        let score_mut = state
+            .relay_scores
+            .entry(relay_peer_key(&peer_addr))
+            .or_insert(0);
         *score_mut = (*score_mut + 1).clamp(-10, 10);
 
         Ok(RelayStream {
@@ -1565,9 +1568,9 @@ fn request_class(payload: &WirePayload) -> RequestClass {
             RequestClass::Dht
         }
         WirePayload::GetManifest(_) | WirePayload::GetChunk(_) => RequestClass::Fetch,
-        WirePayload::RelayRegister(_) | WirePayload::RelayConnect(_) | WirePayload::RelayStream(_) => {
-            RequestClass::Relay
-        }
+        WirePayload::RelayRegister(_)
+        | WirePayload::RelayConnect(_)
+        | WirePayload::RelayStream(_) => RequestClass::Relay,
         _ => RequestClass::Other,
     }
 }
@@ -2661,10 +2664,19 @@ mod tests {
             .unwrap_or(default)
     }
 
+    fn read_env_u64(name: &str, default: u64, min: u64, max: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|value| value.clamp(min, max))
+            .unwrap_or(default)
+    }
+
     #[tokio::test]
     async fn multi_node_churn_soak_is_configurable() {
         let node_count = read_env_usize("SCP2P_CHURN_NODE_COUNT", 5, 5, 50);
         let rounds = read_env_usize("SCP2P_CHURN_ROUNDS", 2, 1, 10);
+        let max_sync_ms = read_env_u64("SCP2P_SOAK_MAX_SYNC_MS", 8_000, 500, 60_000);
 
         let bootstrap_handle = Node::start(NodeConfig::default())
             .await
@@ -2731,6 +2743,8 @@ mod tests {
 
         let share = ShareKeypair::new(SigningKey::generate(&mut rng));
         let mut subscribers = Vec::with_capacity(node_count);
+        let mut sync_ms_samples = Vec::new();
+        let mut successful_downloads = 0usize;
         for _ in 0..node_count {
             let store = MemoryStore::new();
             let handle = Node::start_with_store(NodeConfig::default(), store.clone())
@@ -2799,11 +2813,13 @@ mod tests {
                     signing_key: requester_key,
                     capabilities: Capabilities::default(),
                 };
+                let sync_started = std::time::Instant::now();
                 subscriber
                     .handle
                     .sync_subscriptions_over_dht(&transport, &seed_peers)
                     .await
                     .expect("sync");
+                sync_ms_samples.push(sync_started.elapsed().as_millis() as u64);
 
                 let latest_seq = {
                     let state = subscriber.handle.state.read().await;
@@ -2845,9 +2861,22 @@ mod tests {
                     let read_back = std::fs::read(&target).expect("read target");
                     assert_eq!(read_back, payload);
                     let _ = std::fs::remove_file(target);
+                    successful_downloads += 1;
                 }
             }
         }
+
+        let mut sorted = sync_ms_samples.clone();
+        sorted.sort_unstable();
+        let p95_index = ((sorted.len() as f64) * 0.95).floor() as usize;
+        let p95_sync_ms = sorted[p95_index.min(sorted.len().saturating_sub(1))];
+        assert!(
+            p95_sync_ms <= max_sync_ms,
+            "p95 sync latency {}ms exceeded configured threshold {}ms",
+            p95_sync_ms,
+            max_sync_ms
+        );
+        assert_eq!(successful_downloads, rounds + 1);
 
         bootstrap_task.abort();
         publisher_task.abort();
@@ -3269,6 +3298,136 @@ mod tests {
         assert!(selected
             .iter()
             .all(|peer| relay_peer_key(peer) != relay_peer_key(&bad_peer)));
+    }
+
+    #[tokio::test]
+    async fn adaptive_relay_content_requires_positive_score() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        handle
+            .set_relay_limits(RelayLimits {
+                content_relay_enabled: true,
+                ..RelayLimits::default()
+            })
+            .await
+            .expect("set limits");
+
+        let owner = PeerAddr {
+            ip: "10.0.4.1".parse().expect("ip"),
+            port: 7301,
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: Some([31u8; 32]),
+        };
+        let requester = PeerAddr {
+            ip: "10.0.4.2".parse().expect("ip"),
+            port: 7302,
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: Some([32u8; 32]),
+        };
+
+        let registered = handle
+            .relay_register(owner.clone())
+            .await
+            .expect("register");
+        handle
+            .relay_connect(
+                requester.clone(),
+                RelayConnect {
+                    relay_slot_id: registered.relay_slot_id,
+                },
+            )
+            .await
+            .expect("connect");
+
+        let err = handle
+            .relay_stream(
+                requester.clone(),
+                RelayStream {
+                    relay_slot_id: registered.relay_slot_id,
+                    stream_id: 1,
+                    kind: WireRelayPayloadKind::Content,
+                    payload: vec![7u8; 32],
+                },
+            )
+            .await
+            .expect_err("content should require trust score");
+        assert!(err.to_string().contains("trust score"));
+
+        handle
+            .note_relay_result(&requester, true)
+            .await
+            .expect("raise score");
+        handle
+            .note_relay_result(&requester, true)
+            .await
+            .expect("raise score");
+        handle
+            .note_relay_result(&requester, true)
+            .await
+            .expect("raise score");
+
+        let relayed = handle
+            .relay_stream(
+                requester,
+                RelayStream {
+                    relay_slot_id: registered.relay_slot_id,
+                    stream_id: 2,
+                    kind: WireRelayPayloadKind::Content,
+                    payload: vec![9u8; 32],
+                },
+            )
+            .await
+            .expect("content should pass after score improves");
+        assert_eq!(relayed.kind, WireRelayPayloadKind::Content);
+    }
+
+    #[tokio::test]
+    async fn incoming_request_rate_limits_are_enforced() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        handle
+            .set_abuse_limits(AbuseLimits {
+                window_secs: 60,
+                max_total_requests_per_window: 2,
+                max_dht_requests_per_window: 10,
+                max_fetch_requests_per_window: 10,
+                max_relay_requests_per_window: 10,
+            })
+            .await
+            .expect("set abuse limits");
+
+        let remote = PeerAddr {
+            ip: "10.0.9.9".parse().expect("ip"),
+            port: 7999,
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: Some([44u8; 32]),
+        };
+        let req = Envelope::from_typed(
+            next_req_id(),
+            0,
+            &WirePayload::FindNode(FindNode {
+                target_node_id: [1u8; 20],
+            }),
+        )
+        .expect("encode request");
+
+        let first = handle
+            .handle_incoming_envelope(req.clone(), Some(&remote))
+            .await
+            .expect("first response");
+        assert_eq!(first.flags & FLAG_ERROR, 0);
+
+        let second = handle
+            .handle_incoming_envelope(req.clone(), Some(&remote))
+            .await
+            .expect("second response");
+        assert_eq!(second.flags & FLAG_ERROR, 0);
+
+        let third = handle
+            .handle_incoming_envelope(req, Some(&remote))
+            .await
+            .expect("third response");
+        assert_ne!(third.flags & FLAG_ERROR, 0);
+        let message = String::from_utf8(third.payload).expect("utf8");
+        assert!(message.contains("rate limit"));
     }
 
     #[tokio::test]

@@ -99,6 +99,7 @@ Status: **In progress**
 - relay slot keepalive renewal baseline implemented via RELAY_REGISTER with optional relay_slot_id refresh
 - relay selection/rotation baseline implemented with health-scored peer selection and anti-sticky rotation
 - relay quota baseline implemented (control-byte cap, content-byte cap, stream-count cap) with control-only default and explicit content opt-in
+- adaptive relay gating baseline implemented: content relay requires positive relay trust score; per-peer adaptive payload cap tied to relay score
 
 Current relay support is foundational only. Extend to:
 - stream routing tables between requester/owner
@@ -138,7 +139,7 @@ Status: **Done (foundational implementation complete)**
 - signature-enforced ShareHead fetch path implemented when share pubkey is known
 
 Remaining hardening (future increments):
-- stronger anti-abuse/rate-limit controls at network boundary
+- stronger anti-abuse/rate-limit controls at network boundary (beyond baseline per-peer fixed-window limits)
 - richer stale-data rejection policies and quotas
 - broader long-run multi-node soak and churn validation in integration harness
 
@@ -211,6 +212,7 @@ Add integration/e2e tests:
 - baseline churn harness progress: 3-node TCP integration test now covers publisher restart recovery for subscription sync, search, and verified network download
 - baseline soak progress: configurable multi-node churn test added (`SCP2P_CHURN_NODE_COUNT=5..50`, `SCP2P_CHURN_ROUNDS=1..10`) with subscriber restart churn and per-round sync/search/download assertions
 - baseline NAT/relay progress: TCP runtime now serves relay register/connect/stream over authenticated sessions with integration coverage for simulated NAT peers via relay-only control path
+- soak metrics baseline: churn soak now asserts p95 sync latency (`SCP2P_SOAK_MAX_SYNC_MS`) and expected per-round download completions
 
 ---
 
