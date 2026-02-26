@@ -10,7 +10,7 @@ use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use scp2p_core::{
     describe_content, BoxedStream, DirectRequestTransport, ItemV1, ManifestV1, Node, NodeConfig,
-    NodeId, PeerAddr, PeerConnector, SearchQuery, ShareId, ShareKeypair, SqliteStore,
+    NodeId, PeerAddr, PeerConnector, SearchQuery, ShareId, ShareKeypair, SqliteStore, Store,
     TransportProtocol,
 };
 use tokio::net::TcpStream;
@@ -68,6 +68,10 @@ enum Command {
         state_db: String,
         #[arg(long)]
         query: String,
+    },
+    InspectState {
+        #[arg(long, default_value = "scp2p.db")]
+        state_db: String,
     },
 }
 
@@ -227,7 +231,27 @@ async fn main() -> anyhow::Result<()> {
                 .collect::<anyhow::Result<Vec<_>>>()?;
             let transport = DirectRequestTransport::new(CliTcpConnector);
             node.sync_subscriptions_over_dht(&transport, &peers).await?;
-            println!("sync complete");
+            let state = load_state(&state_db).await?;
+            println!(
+                "sync complete: subscriptions={} manifests={} search_index={}",
+                state.subscriptions.len(),
+                state.manifests.len(),
+                state
+                    .search_index
+                    .as_ref()
+                    .map(|_| "present")
+                    .unwrap_or("absent")
+            );
+            for sub in state.subscriptions {
+                println!(
+                    "sub share_id={} latest_seq={} manifest_id={}",
+                    hex::encode(sub.share_id),
+                    sub.latest_seq,
+                    sub.latest_manifest_id
+                        .map(hex::encode)
+                        .unwrap_or_else(|| "<none>".into())
+                );
+            }
         }
         Command::Search { state_db, query } => {
             let node = open_node(&state_db, &[]).await?;
@@ -244,6 +268,39 @@ async fn main() -> anyhow::Result<()> {
                         hit.name
                     );
                 }
+            }
+        }
+        Command::InspectState { state_db } => {
+            let state = load_state(&state_db).await?;
+            println!(
+                "state: subscriptions={} manifests={} search_index={} partials={}",
+                state.subscriptions.len(),
+                state.manifests.len(),
+                state
+                    .search_index
+                    .as_ref()
+                    .map(|_| "present")
+                    .unwrap_or("absent"),
+                state.partial_downloads.len()
+            );
+            for sub in state.subscriptions {
+                println!(
+                    "sub share_id={} latest_seq={} manifest_id={}",
+                    hex::encode(sub.share_id),
+                    sub.latest_seq,
+                    sub.latest_manifest_id
+                        .map(hex::encode)
+                        .unwrap_or_else(|| "<none>".into())
+                );
+            }
+            for (mid, manifest) in state.manifests {
+                println!(
+                    "manifest id={} share_id={} seq={} items={}",
+                    hex::encode(mid),
+                    hex::encode(manifest.share_id),
+                    manifest.seq,
+                    manifest.items.len()
+                );
             }
         }
     }
@@ -268,6 +325,11 @@ async fn open_node(state_db: &str, bootstrap: &[String]) -> anyhow::Result<scp2p
         ..NodeConfig::default()
     };
     Node::start_with_store(config, store).await
+}
+
+async fn load_state(state_db: &str) -> anyhow::Result<scp2p_core::PersistedState> {
+    let store = SqliteStore::open(state_db)?;
+    store.load_state().await
 }
 
 fn parse_hex_32(input: &str, label: &str) -> anyhow::Result<[u8; 32]> {
