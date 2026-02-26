@@ -47,7 +47,7 @@ pub struct ManifestV1 {
     pub signature: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct ManifestUnsigned<'a> {
     version: u8,
     share_pubkey: [u8; 32],
@@ -60,6 +60,20 @@ struct ManifestUnsigned<'a> {
     items: &'a [ItemV1],
     recommended_shares: &'a [[u8; 32]],
 }
+
+#[derive(Serialize)]
+struct ManifestSigningTuple<'a>(
+    u8,
+    [u8; 32],
+    [u8; 32],
+    u64,
+    u64,
+    Option<u64>,
+    &'a Option<String>,
+    &'a Option<String>,
+    &'a [ItemV1],
+    &'a [[u8; 32]],
+);
 
 impl ManifestV1 {
     pub fn unsigned_bytes(&self) -> anyhow::Result<Vec<u8>> {
@@ -75,7 +89,19 @@ impl ManifestV1 {
             items: &self.items,
             recommended_shares: &self.recommended_shares,
         };
-        Ok(serde_cbor::to_vec(&unsigned)?)
+        let signing_tuple = ManifestSigningTuple(
+            unsigned.version,
+            unsigned.share_pubkey,
+            unsigned.share_id,
+            unsigned.seq,
+            unsigned.created_at,
+            unsigned.expires_at,
+            unsigned.title,
+            unsigned.description,
+            unsigned.items,
+            unsigned.recommended_shares,
+        );
+        Ok(serde_cbor::to_vec(&signing_tuple)?)
     }
 
     pub fn sign(&mut self, key: &ShareKeypair) -> anyhow::Result<()> {
@@ -120,13 +146,16 @@ pub struct ShareHead {
     pub sig: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct ShareHeadUnsigned {
     share_id: [u8; 32],
     latest_seq: u64,
     latest_manifest_id: [u8; 32],
     updated_at: u64,
 }
+
+#[derive(Serialize)]
+struct ShareHeadSigningTuple([u8; 32], u64, [u8; 32], u64);
 
 impl ShareHead {
     pub fn signable_bytes(&self) -> anyhow::Result<Vec<u8>> {
@@ -136,7 +165,13 @@ impl ShareHead {
             latest_manifest_id: self.latest_manifest_id,
             updated_at: self.updated_at,
         };
-        Ok(serde_cbor::to_vec(&unsigned)?)
+        let signing_tuple = ShareHeadSigningTuple(
+            unsigned.share_id,
+            unsigned.latest_seq,
+            unsigned.latest_manifest_id,
+            unsigned.updated_at,
+        );
+        Ok(serde_cbor::to_vec(&signing_tuple)?)
     }
 
     pub fn new_signed(
@@ -214,5 +249,50 @@ mod tests {
             .expect("sign head");
         head.verify_with_pubkey(share.verifying_key().to_bytes())
             .expect("verify head");
+    }
+
+    #[test]
+    fn signature_payloads_use_positional_arrays() {
+        let mut rng = OsRng;
+        let signing_key = SigningKey::generate(&mut rng);
+        let share = ShareKeypair::new(signing_key);
+
+        let manifest = ManifestV1 {
+            version: 1,
+            share_pubkey: share.verifying_key().to_bytes(),
+            share_id: share.share_id().0,
+            seq: 2,
+            created_at: 1_700_000_001,
+            expires_at: Some(1_700_000_100),
+            title: Some("sample".to_owned()),
+            description: Some("desc".to_owned()),
+            items: vec![],
+            recommended_shares: vec![],
+            signature: None,
+        };
+
+        let unsigned_manifest: serde_cbor::Value =
+            serde_cbor::from_slice(&manifest.unsigned_bytes().expect("manifest unsigned bytes"))
+                .expect("decode manifest unsigned");
+        match unsigned_manifest {
+            serde_cbor::Value::Array(values) => assert_eq!(values.len(), 10),
+            _ => panic!("manifest unsigned form should be cbor array"),
+        }
+
+        let head = ShareHead {
+            share_id: share.share_id().0,
+            latest_seq: 2,
+            latest_manifest_id: [5u8; 32],
+            updated_at: 1_700_000_002,
+            sig: vec![],
+        };
+
+        let unsigned_head: serde_cbor::Value =
+            serde_cbor::from_slice(&head.signable_bytes().expect("head signable bytes"))
+                .expect("decode head unsigned");
+        match unsigned_head {
+            serde_cbor::Value::Array(values) => assert_eq!(values.len(), 4),
+            _ => panic!("share head unsigned form should be cbor array"),
+        }
     }
 }
