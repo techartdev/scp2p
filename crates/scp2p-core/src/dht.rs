@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
 use crate::{ids::NodeId, peer::PeerAddr};
@@ -24,14 +25,46 @@ pub struct DhtValue {
 
 #[derive(Debug, Default, Clone)]
 pub struct Dht {
+    routing_target: Option<NodeId>,
+    buckets: Vec<Vec<[u8; 20]>>,
     routing: HashMap<[u8; 20], DhtNodeRecord>,
     values: HashMap<[u8; 32], DhtValue>,
 }
 
 impl Dht {
     pub fn upsert_node(&mut self, record: DhtNodeRecord, target: NodeId) {
-        self.routing.insert(record.node_id.0, record);
-        self.trim_routing(target);
+        if self.routing_target != Some(target) {
+            self.rebuild_buckets(target);
+        }
+        let Some(bucket_idx) = bucket_index(&target, &record.node_id) else {
+            return;
+        };
+        let node_key = record.node_id.0;
+        let bucket = &mut self.buckets[bucket_idx];
+
+        if let Entry::Occupied(mut occupied) = self.routing.entry(node_key) {
+            occupied.insert(record);
+            return;
+        }
+
+        if bucket.len() >= K {
+            let evict_idx = bucket
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, node_id)| {
+                    self.routing
+                        .get(*node_id)
+                        .map(|existing| existing.last_seen_unix)
+                        .unwrap_or(u64::MAX)
+                })
+                .map(|(idx, _)| idx)
+                .expect("bucket must contain at least one node when full");
+            let evicted = bucket.remove(evict_idx);
+            self.routing.remove(&evicted);
+        }
+
+        bucket.push(node_key);
+        self.routing.insert(node_key, record);
     }
 
     pub fn find_node(&self, target: NodeId, limit: usize) -> Vec<DhtNodeRecord> {
@@ -69,24 +102,41 @@ impl Dht {
         self.values.get(&key).cloned()
     }
 
+    pub fn active_values(&mut self, now_unix: u64) -> Vec<DhtValue> {
+        self.evict_expired(now_unix);
+        self.values.values().cloned().collect()
+    }
+
     fn evict_expired(&mut self, now_unix: u64) {
         self.values.retain(|_, v| v.expires_at_unix > now_unix);
     }
 
-    fn trim_routing(&mut self, target: NodeId) {
-        if self.routing.len() <= K {
-            return;
+    fn rebuild_buckets(&mut self, target: NodeId) {
+        self.routing_target = Some(target);
+        self.buckets = vec![Vec::new(); 160];
+        let ids = self.routing.keys().copied().collect::<Vec<_>>();
+        for node_id in ids {
+            if let Some(idx) = bucket_index(&target, &NodeId(node_id)) {
+                self.buckets[idx].push(node_id);
+            }
         }
-
-        let mut entries = self.routing.values().cloned().collect::<Vec<_>>();
-        entries.sort_by(|a, b| a.node_id.distance_cmp(&target, &b.node_id));
-        entries.truncate(K);
-
-        self.routing = entries
-            .into_iter()
-            .map(|record| (record.node_id.0, record))
-            .collect();
     }
+
+    #[cfg(test)]
+    fn routing_len(&self) -> usize {
+        self.routing.len()
+    }
+}
+
+fn bucket_index(local: &NodeId, node: &NodeId) -> Option<usize> {
+    let distance = local.xor_distance(node);
+    for (byte_idx, byte) in distance.iter().copied().enumerate() {
+        if byte != 0 {
+            let leading = byte.leading_zeros() as usize;
+            return Some((byte_idx * 8) + leading);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -117,6 +167,16 @@ mod tests {
 
         let closest = dht.find_node(target, 99);
         assert_eq!(closest.len(), K);
+    }
+
+    #[test]
+    fn routing_uses_per_bucket_limits_not_global_cap() {
+        let mut dht = Dht::default();
+        let target = NodeId([0u8; 20]);
+        for i in 1..=40 {
+            dht.upsert_node(node(i as u8, 7000 + i), target);
+        }
+        assert!(dht.routing_len() > K);
     }
 
     #[test]

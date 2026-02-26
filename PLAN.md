@@ -7,7 +7,7 @@ This plan captures what is complete, what remains, and high-value next steps.
 ## Done foundations
 - Milestone 1: identity, IDs, manifests, baseline wire framing/capabilities
 - Milestone 2: peer DB + PEX sampling/freshness
-- Milestone 3: in-memory DHT primitives
+- Milestone 3: DHT foundations + hardening baseline (iterative lookup/replication/republish/keyspace validation)
 - Milestone 4: ShareHead publication + subscription sync
 - Milestone 5: local subscription-scoped search
 - Milestone 6: provider hints + verified swarm download foundations
@@ -16,15 +16,22 @@ This plan captures what is complete, what remains, and high-value next steps.
 ## In-progress quality level
 - Functional prototype logic exists in-memory.
 - Behavior is strongly unit-tested.
-- **Interoperability is not yet guaranteed** (transport absent; conformance vectors incomplete).
-- Not yet production transport/runtime.
+- **Interoperability is improving**: transport/session runtime foundations and conformance vectors now exist.
+- Not yet production-grade runtime/persistence.
 
 ---
 
 ## 2. Immediate priorities
 
 ### A) Transport and session security (highest priority)
-Implement actual network runtime:
+Status: **Done (foundational implementation complete)**
+- QUIC runtime foundations implemented
+- TLS-over-TCP fallback foundations implemented
+- identity-bound handshake verification (`remote_node_pubkey` binding) implemented
+- message send/recv loop + dispatcher for all envelope `type` values implemented
+- backpressure/max message size checks implemented for framed envelopes
+
+Original scope:
 - QUIC primary transport
 - TLS-over-TCP fallback
 - identity-bound handshake verification (`remote_node_pubkey` binding)
@@ -39,6 +46,15 @@ Why now:
 - Most remaining features are currently simulated in-process.
 
 ### B) Persistence layer and boundaries
+Status: **In progress**
+- `Store` abstraction introduced in core
+- in-memory backend implemented and wired into node lifecycle
+- sqlite backend introduced for durable state snapshots
+- sqlite backend moved to normalized per-slice tables (peers/subscriptions/manifests/weights/partials/metadata)
+- peers/subscriptions/manifests/share weights/search index persisted
+- partial download records persisted
+- encrypted node-key material persistence with optional passphrase-based encryption added
+
 Add durable state for:
 - peer DB
 - subscriptions and trust levels
@@ -54,6 +70,14 @@ Why now:
 - Required for practical client behavior beyond one process lifetime.
 
 ### C) Manifest/content fetch over network
+Status: **Done (foundational implementation complete)**
+- Wire-level `GET_MANIFEST` and `GET_CHUNK` request/response helpers added
+- timeout + retry + provider rotation policy foundations added
+- per-peer chunk request cap policy added
+- session pooling transport added for connection reuse across repeated requests
+- adaptive provider scoring and failure backoff added
+- protocol error-flag handling added (`FLAG_ERROR` on response envelope)
+
 Move from local in-memory source assumptions to real remote fetch:
 - GET_MANIFEST from peers
 - GET_CHUNK from providers
@@ -94,16 +118,22 @@ Suggested policy defaults:
 
 ## 4. DHT hardening plan
 
-Current DHT is in-memory and single-node oriented. Extend to:
-- iterative network queries (`alpha=3`)
-- replication to K closest nodes
-- better bucket management + eviction policies
-- value signatures for selected keyspaces (ShareHead, optional provider hints)
-- background refresh and republish tasks
+Status: **Done (foundational implementation complete)**
+- iterative network queries (`alpha=3`) implemented
+- replication to K closest nodes implemented
+- per-bucket routing/eviction baseline implemented
+- background republish tasks implemented
+- TCP runtime DHT serving loop implemented for live `FIND_NODE`/`FIND_VALUE`/`STORE` and `GET_MANIFEST`
+- subscription sync-over-DHT now fetches missing manifests over network when ShareHead is newer
+- keyspace validation rules implemented for known keyspaces:
+  - ShareHead values must match `share:head` key derivation
+  - Providers values must match `content:prov` key derivation
+- signature-enforced ShareHead fetch path implemented when share pubkey is known
 
-Add:
-- validation rules per keyspace (max size, TTL bounds, signature requirements)
-- defensive limits (rate limiting, max values per key, ignore obviously stale data)
+Remaining hardening (future increments):
+- stronger anti-abuse/rate-limit controls at network boundary
+- richer stale-data rejection policies and quotas
+- full multi-node soak and churn validation in integration harness
 
 ---
 
