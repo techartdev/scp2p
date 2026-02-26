@@ -7,6 +7,12 @@ This plan defines a practical GUI target so SCP2P can be exercised across real m
 - Frontend: `React` (Vite)
 - Core integration: call into `scp2p-core` via a thin Rust app-service layer exposed as Tauri commands
 
+## Current Progress
+- `2026-02-26`: Milestone D1 started with `crates/scp2p-desktop` app-service scaffold (`app_state`, `commands`, `dto`) and runtime status/start-stop command surface.
+- `2026-02-26`: Added persisted desktop client config load/save flow and core `NodeConfig` retention so the desktop layer can inspect applied bind/bootstrap settings.
+- `2026-02-26`: Added a Windows-native desktop shell for immediate local testing with config editing, load/save, and runtime status/start-stop controls.
+- `2026-02-26`: Added Windows controls for subscription add/remove, manual sync, peer inspection, and local search over synced subscriptions.
+
 ## Goal
 Deliver a simple but working desktop app that supports regular user operations end-to-end:
 - connect to peers

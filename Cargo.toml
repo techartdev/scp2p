@@ -2,6 +2,7 @@
 members = [
   "crates/scp2p-core",
   "crates/scp2p-cli",
+  "crates/scp2p-desktop",
 ]
 resolver = "2"
 

@@ -25,7 +25,7 @@ use crate::{
         download_swarm_over_network, fetch_manifest_with_retry, FetchPolicy, PeerConnector,
         RequestTransport,
     },
-    peer::PeerAddr,
+    peer::{PeerAddr, TransportProtocol},
     peer_db::PeerDb,
     relay::{RelayLimits, RelayManager, RelayPayloadKind as RelayInternalPayloadKind},
     search::{IndexedItem, SearchIndex},
@@ -145,6 +145,7 @@ pub struct NodeHandle {
 }
 
 struct NodeState {
+    runtime_config: NodeConfig,
     subscriptions: HashMap<[u8; 32], SubscriptionState>,
     peer_db: PeerDb,
     dht: Dht,
@@ -220,11 +221,11 @@ impl Node {
     }
 
     pub async fn start_with_store(
-        _config: NodeConfig,
+        config: NodeConfig,
         store: Arc<dyn Store>,
     ) -> anyhow::Result<NodeHandle> {
         let persisted = store.load_state().await?;
-        let state = NodeState::from_persisted(persisted, store);
+        let state = NodeState::from_persisted(config, persisted, store);
         Ok(NodeHandle {
             state: Arc::new(RwLock::new(state)),
         })
@@ -232,7 +233,11 @@ impl Node {
 }
 
 impl NodeState {
-    fn from_persisted(persisted: PersistedState, store: Arc<dyn Store>) -> Self {
+    fn from_persisted(
+        runtime_config: NodeConfig,
+        persisted: PersistedState,
+        store: Arc<dyn Store>,
+    ) -> Self {
         let PersistedState {
             peers,
             subscriptions,
@@ -297,6 +302,7 @@ impl NodeState {
         }
 
         Self {
+            runtime_config,
             subscriptions,
             peer_db,
             dht,
@@ -399,6 +405,46 @@ impl NodeState {
 }
 
 impl NodeHandle {
+    pub async fn runtime_config(&self) -> NodeConfig {
+        self.state.read().await.runtime_config.clone()
+    }
+
+    pub async fn configured_bootstrap_peers(&self) -> anyhow::Result<Vec<PeerAddr>> {
+        let config = self.state.read().await.runtime_config.clone();
+        config
+            .bootstrap_peers
+            .iter()
+            .map(|entry| {
+                let socket: SocketAddr = entry.parse()?;
+                Ok(PeerAddr {
+                    ip: socket.ip(),
+                    port: socket.port(),
+                    transport: TransportProtocol::Tcp,
+                    pubkey_hint: None,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn peer_records(&self) -> Vec<crate::peer_db::PeerRecord> {
+        self.state.read().await.peer_db.all_records()
+    }
+
+    pub async fn subscriptions(&self) -> Vec<PersistedSubscription> {
+        let state = self.state.read().await;
+        state
+            .subscriptions
+            .iter()
+            .map(|(share_id, sub)| PersistedSubscription {
+                share_id: *share_id,
+                share_pubkey: sub.share_pubkey,
+                latest_seq: sub.latest_seq,
+                latest_manifest_id: sub.latest_manifest_id,
+                trust_level: sub.trust_level,
+            })
+            .collect()
+    }
+
     pub async fn connect(&self, peer_addr: PeerAddr) -> anyhow::Result<()> {
         self.record_peer_seen(peer_addr).await
     }
@@ -2136,6 +2182,63 @@ mod tests {
 
         handle.subscribe(id).await.expect("subscribe");
         handle.unsubscribe(id).await.expect("unsubscribe");
+    }
+
+    #[tokio::test]
+    async fn node_retains_runtime_config() {
+        let config = NodeConfig {
+            bind_quic: "127.0.0.1:7100".parse().ok(),
+            bind_tcp: "127.0.0.1:7101".parse().ok(),
+            bootstrap_peers: vec!["127.0.0.1:7201".to_string()],
+            ..NodeConfig::default()
+        };
+        let handle = Node::start(config.clone()).await.expect("start");
+        let actual = handle.runtime_config().await;
+        assert_eq!(actual.bind_quic, config.bind_quic);
+        assert_eq!(actual.bind_tcp, config.bind_tcp);
+        assert_eq!(actual.bootstrap_peers, config.bootstrap_peers);
+    }
+
+    #[tokio::test]
+    async fn configured_bootstrap_peers_parse_from_runtime_config() {
+        let handle = Node::start(NodeConfig {
+            bootstrap_peers: vec!["127.0.0.1:7301".to_string()],
+            ..NodeConfig::default()
+        })
+        .await
+        .expect("start");
+        let peers = handle
+            .configured_bootstrap_peers()
+            .await
+            .expect("configured peers");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].ip,
+            "127.0.0.1".parse::<std::net::IpAddr>().expect("ip")
+        );
+        assert_eq!(peers[0].port, 7301);
+        assert_eq!(peers[0].transport, crate::peer::TransportProtocol::Tcp);
+    }
+
+    #[tokio::test]
+    async fn peer_and_subscription_snapshots_are_exposed() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        let peer = PeerAddr {
+            ip: "10.0.0.99".parse().expect("ip"),
+            port: 7001,
+            transport: crate::peer::TransportProtocol::Tcp,
+            pubkey_hint: None,
+        };
+        let share_id = ShareId([9u8; 32]);
+
+        handle.record_peer_seen(peer.clone()).await.expect("record");
+        handle.subscribe(share_id).await.expect("subscribe");
+
+        let peers = handle.peer_records().await;
+        let subscriptions = handle.subscriptions().await;
+
+        assert!(peers.iter().any(|record| record.addr == peer));
+        assert!(subscriptions.iter().any(|sub| sub.share_id == share_id.0));
     }
 
     #[tokio::test]

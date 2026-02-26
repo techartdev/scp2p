@@ -22,7 +22,19 @@ cargo test --workspace
 cargo run -p scp2p-cli -- gen-identity
 cargo run -p scp2p-cli -- print-ids
 cargo run -p scp2p-cli -- start
+cargo run -p scp2p-desktop
 ```
+
+Windows desktop shell notes:
+- `cargo run -p scp2p-desktop` opens a native Windows desktop shell.
+- The shell can load/save `scp2p-desktop-config.cbor` in the current working directory.
+- Current controls:
+  - runtime config: state DB path, QUIC bind, TCP bind, bootstrap peer list
+  - lifecycle: load/save config, start/stop, refresh
+  - subscriptions: add/remove by share id
+  - sync: manual sync over configured bootstrap TCP peers
+  - search: local subscription-scoped search
+  - inspection: peer list, subscription list, search results
 
 ## 3. CLI usage
 

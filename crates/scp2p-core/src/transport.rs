@@ -16,6 +16,7 @@ use crate::{
 };
 
 pub const HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
+pub const HANDSHAKE_MAX_CLOCK_SKEW_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Clone)]
 pub struct AuthenticatedSession {
@@ -107,8 +108,23 @@ fn signed_hello(
     nonce: [u8; 32],
     echoed_nonce: Option<[u8; 32]>,
 ) -> anyhow::Result<HandshakeHello> {
+    signed_hello_at(
+        signing_key,
+        capabilities,
+        nonce,
+        echoed_nonce,
+        now_unix_secs()?,
+    )
+}
+
+fn signed_hello_at(
+    signing_key: &SigningKey,
+    capabilities: Capabilities,
+    nonce: [u8; 32],
+    echoed_nonce: Option<[u8; 32]>,
+    timestamp_unix_secs: u64,
+) -> anyhow::Result<HandshakeHello> {
     let pubkey = signing_key.verifying_key().to_bytes();
-    let timestamp_unix_secs = now_unix_secs()?;
     let signable = HandshakeSigningTuple(
         pubkey,
         capabilities.clone(),
@@ -130,6 +146,11 @@ fn signed_hello(
 fn verify_hello(hello: &HandshakeHello) -> anyhow::Result<()> {
     if hello.signature.len() != 64 {
         anyhow::bail!("handshake signature must be 64 bytes");
+    }
+    let now = now_unix_secs()?;
+    let skew = now.abs_diff(hello.timestamp_unix_secs);
+    if skew > HANDSHAKE_MAX_CLOCK_SKEW_SECS {
+        anyhow::bail!("handshake timestamp outside allowed clock skew");
     }
     let pubkey = VerifyingKey::from_bytes(&hello.node_pubkey)?;
     let signable = HandshakeSigningTuple(
@@ -579,6 +600,44 @@ mod tests {
             .contains("server handshake does not bind initiator nonce"));
 
         server.await.expect("server task");
+    }
+
+    #[test]
+    fn handshake_rejects_stale_timestamp() {
+        let mut rng = StdRng::seed_from_u64(1234);
+        let key = SigningKey::generate(&mut rng);
+        let now = now_unix_secs().expect("now");
+        let hello = signed_hello_at(
+            &key,
+            Capabilities::default(),
+            [3u8; 32],
+            None,
+            now.saturating_sub(HANDSHAKE_MAX_CLOCK_SKEW_SECS + 1),
+        )
+        .expect("hello");
+        let err = verify_hello(&hello).expect_err("stale timestamp must fail");
+        assert!(err
+            .to_string()
+            .contains("handshake timestamp outside allowed clock skew"));
+    }
+
+    #[test]
+    fn handshake_rejects_future_timestamp() {
+        let mut rng = StdRng::seed_from_u64(5678);
+        let key = SigningKey::generate(&mut rng);
+        let now = now_unix_secs().expect("now");
+        let hello = signed_hello_at(
+            &key,
+            Capabilities::default(),
+            [4u8; 32],
+            None,
+            now + HANDSHAKE_MAX_CLOCK_SKEW_SECS + 1,
+        )
+        .expect("hello");
+        let err = verify_hello(&hello).expect_err("future timestamp must fail");
+        assert!(err
+            .to_string()
+            .contains("handshake timestamp outside allowed clock skew"));
     }
 
     #[tokio::test]

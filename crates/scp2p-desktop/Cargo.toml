@@ -1,0 +1,24 @@
+[package]
+name = "scp2p-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+ed25519-dalek.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_cbor.workspace = true
+scp2p-core = { path = "../scp2p-core" }
+tokio.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_WindowsAndMessaging",
+] }
