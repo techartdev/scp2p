@@ -15,7 +15,11 @@ pub struct ManifestId(pub [u8; 32]);
 
 impl NodeId {
     pub fn from_pubkey(pubkey: &VerifyingKey) -> Self {
-        let digest = Sha256::digest(pubkey.as_bytes());
+        Self::from_pubkey_bytes(pubkey.as_bytes())
+    }
+
+    pub fn from_pubkey_bytes(pubkey: &[u8; 32]) -> Self {
+        let digest = Sha256::digest(pubkey);
         let mut id = [0u8; 20];
         id.copy_from_slice(&digest[..20]);
         Self(id)
@@ -38,7 +42,11 @@ impl NodeId {
 
 impl ShareId {
     pub fn from_pubkey(pubkey: &VerifyingKey) -> Self {
-        let digest = Sha256::digest(pubkey.as_bytes());
+        Self::from_pubkey_bytes(pubkey.as_bytes())
+    }
+
+    pub fn from_pubkey_bytes(pubkey: &[u8; 32]) -> Self {
+        let digest = Sha256::digest(pubkey);
         let mut id = [0u8; 32];
         id.copy_from_slice(&digest[..]);
         Self(id)

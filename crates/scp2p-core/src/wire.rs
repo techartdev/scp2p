@@ -12,6 +12,9 @@ pub struct Envelope {
     pub payload: Vec<u8>,
 }
 
+pub const FLAG_RESPONSE: u16 = 0x0001;
+pub const FLAG_ERROR: u16 = 0x0002;
+
 /// Default upper bound for serialized envelope size accepted from the wire.
 pub const MAX_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
 /// Default upper bound for decoded payload bytes accepted from the wire.

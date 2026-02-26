@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use crate::manifest::ManifestV1;
 
 type ItemKey = ([u8; 32], [u8; 32]);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexedItem {
     pub share_id: [u8; 32],
     pub content_id: [u8; 32],
@@ -12,6 +14,13 @@ pub struct IndexedItem {
     pub tags: Vec<String>,
     pub title: Option<String>,
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchIndexSnapshot {
+    items: HashMap<ItemKey, IndexedItem>,
+    by_share: HashMap<[u8; 32], Vec<ItemKey>>,
+    inverted: HashMap<String, HashSet<ItemKey>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -22,6 +31,22 @@ pub struct SearchIndex {
 }
 
 impl SearchIndex {
+    pub fn snapshot(&self) -> SearchIndexSnapshot {
+        SearchIndexSnapshot {
+            items: self.items.clone(),
+            by_share: self.by_share.clone(),
+            inverted: self.inverted.clone(),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: SearchIndexSnapshot) -> Self {
+        Self {
+            items: snapshot.items,
+            by_share: snapshot.by_share,
+            inverted: snapshot.inverted,
+        }
+    }
+
     pub fn index_manifest(&mut self, manifest: &ManifestV1) {
         let share_id = manifest.share_id;
         self.remove_share(share_id);

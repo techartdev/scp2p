@@ -57,7 +57,7 @@ struct ManifestUnsigned<'a> {
     expires_at: Option<u64>,
     title: &'a Option<String>,
     description: &'a Option<String>,
-    items: &'a [ItemV1],
+    items: &'a [ItemSigningTuple<'a>],
     recommended_shares: &'a [[u8; 32]],
 }
 
@@ -71,12 +71,37 @@ struct ManifestSigningTuple<'a>(
     Option<u64>,
     &'a Option<String>,
     &'a Option<String>,
-    &'a [ItemV1],
+    &'a [ItemSigningTuple<'a>],
+    &'a [[u8; 32]],
+);
+
+#[derive(Debug, Clone, Serialize)]
+struct ItemSigningTuple<'a>(
+    [u8; 32],
+    u64,
+    &'a str,
+    Option<&'a str>,
+    &'a [String],
     &'a [[u8; 32]],
 );
 
 impl ManifestV1 {
     pub fn unsigned_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        // Signature payloads use positional CBOR arrays to avoid map key ordering variance.
+        let items = self
+            .items
+            .iter()
+            .map(|item| {
+                ItemSigningTuple(
+                    item.content_id,
+                    item.size,
+                    item.name.as_str(),
+                    item.mime.as_deref(),
+                    &item.tags,
+                    &item.chunks,
+                )
+            })
+            .collect::<Vec<_>>();
         let unsigned = ManifestUnsigned {
             version: self.version,
             share_pubkey: self.share_pubkey,
@@ -86,7 +111,7 @@ impl ManifestV1 {
             expires_at: self.expires_at,
             title: &self.title,
             description: &self.description,
-            items: &self.items,
+            items: &items,
             recommended_shares: &self.recommended_shares,
         };
         let signing_tuple = ManifestSigningTuple(
@@ -133,9 +158,39 @@ impl ManifestV1 {
     }
 
     pub fn manifest_id(&self) -> anyhow::Result<ManifestId> {
-        Ok(ManifestId::from_manifest_bytes(&serde_cbor::to_vec(self)?))
+        let content = ManifestContentTuple(
+            self.version,
+            self.share_pubkey,
+            self.share_id,
+            self.seq,
+            self.created_at,
+            self.expires_at,
+            &self.title,
+            &self.description,
+            &self.items,
+            &self.recommended_shares,
+            self.signature.as_deref(),
+        );
+        Ok(ManifestId::from_manifest_bytes(&serde_cbor::to_vec(
+            &content,
+        )?))
     }
 }
+
+#[derive(Serialize)]
+struct ManifestContentTuple<'a>(
+    u8,
+    [u8; 32],
+    [u8; 32],
+    u64,
+    u64,
+    Option<u64>,
+    &'a Option<String>,
+    &'a Option<String>,
+    &'a [ItemV1],
+    &'a [[u8; 32]],
+    Option<&'a [u8]>,
+);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareHead {
@@ -274,9 +329,16 @@ mod tests {
         let unsigned_manifest: serde_cbor::Value =
             serde_cbor::from_slice(&manifest.unsigned_bytes().expect("manifest unsigned bytes"))
                 .expect("decode manifest unsigned");
-        match unsigned_manifest {
-            serde_cbor::Value::Array(values) => assert_eq!(values.len(), 10),
+        let items = match unsigned_manifest {
+            serde_cbor::Value::Array(values) => {
+                assert_eq!(values.len(), 10);
+                values[8].clone()
+            }
             _ => panic!("manifest unsigned form should be cbor array"),
+        };
+        match items {
+            serde_cbor::Value::Array(values) => assert_eq!(values.len(), 0),
+            _ => panic!("manifest items should be cbor array"),
         }
 
         let head = ShareHead {
@@ -293,6 +355,54 @@ mod tests {
         match unsigned_head {
             serde_cbor::Value::Array(values) => assert_eq!(values.len(), 4),
             _ => panic!("share head unsigned form should be cbor array"),
+        }
+    }
+
+    #[test]
+    fn manifest_items_are_encoded_as_arrays_for_signature() {
+        let mut rng = OsRng;
+        let signing_key = SigningKey::generate(&mut rng);
+        let share = ShareKeypair::new(signing_key);
+
+        let manifest = ManifestV1 {
+            version: 1,
+            share_pubkey: share.verifying_key().to_bytes(),
+            share_id: share.share_id().0,
+            seq: 2,
+            created_at: 1_700_000_001,
+            expires_at: None,
+            title: Some("sample".to_owned()),
+            description: Some("desc".to_owned()),
+            items: vec![ItemV1 {
+                content_id: [1u8; 32],
+                size: 42,
+                name: "item-a".into(),
+                mime: Some("application/octet-stream".into()),
+                tags: vec!["t1".into(), "t2".into()],
+                chunks: vec![[2u8; 32], [3u8; 32]],
+            }],
+            recommended_shares: vec![],
+            signature: None,
+        };
+
+        let unsigned_manifest: serde_cbor::Value =
+            serde_cbor::from_slice(&manifest.unsigned_bytes().expect("manifest unsigned bytes"))
+                .expect("decode manifest unsigned");
+        let items = match unsigned_manifest {
+            serde_cbor::Value::Array(values) => values[8].clone(),
+            _ => panic!("manifest unsigned form should be cbor array"),
+        };
+        match items {
+            serde_cbor::Value::Array(values) => {
+                assert_eq!(values.len(), 1);
+                match &values[0] {
+                    serde_cbor::Value::Array(item_values) => {
+                        assert_eq!(item_values.len(), 6);
+                    }
+                    _ => panic!("manifest item should be cbor array"),
+                }
+            }
+            _ => panic!("manifest items should be cbor array"),
         }
     }
 }

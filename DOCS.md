@@ -37,7 +37,12 @@ Generates a temporary keypair and prints:
 - `share_id` (SHA-256(pubkey) 256-bit)
 
 ### `scp2p start`
-Starts a minimal in-memory node handle and prints a startup message.
+Starts a node and runs until Ctrl+C.
+
+Options:
+- `--bootstrap <IP:PORT>` (repeatable): bootstrap TCP peers used for iterative DHT sync/republish loops
+- `--sync-interval-secs <u64>`: periodic signed subscription sync interval (default `30`)
+- `--republish-interval-secs <u64>`: periodic DHT republish interval (default `300`)
 
 ## 4. Core API overview (`scp2p-core`)
 
@@ -55,6 +60,14 @@ The API is currently centered around `Node` and `NodeHandle`.
 - `NodeHandle::dht_find_node(...)`
 - `NodeHandle::dht_store(...)`
 - `NodeHandle::dht_find_value(...)`
+- `NodeHandle::dht_find_node_iterative(...)`
+- `NodeHandle::dht_find_value_iterative(...)`
+- `NodeHandle::dht_find_share_head_iterative(...)`
+- `NodeHandle::dht_store_replicated(...)`
+- `NodeHandle::dht_republish_once(...)`
+- `NodeHandle::start_dht_republish_loop(...)`
+- `NodeHandle::start_subscription_sync_loop(...)`
+- `NodeHandle::start_tcp_dht_service(...)`
 
 ### Subscriptions / manifests
 - `NodeHandle::subscribe(share_id)`
@@ -62,6 +75,7 @@ The API is currently centered around `Node` and `NodeHandle`.
 - `NodeHandle::unsubscribe(share_id)`
 - `NodeHandle::publish_share(manifest, publisher)`
 - `NodeHandle::sync_subscriptions()`
+- `NodeHandle::sync_subscriptions_over_dht(...)`
 
 ### Search
 - `NodeHandle::set_share_weight(share_id, weight)`
@@ -77,6 +91,37 @@ The API is currently centered around `Node` and `NodeHandle`.
 - `NodeHandle::relay_connect(peer_addr, RelayConnect)`
 - `NodeHandle::relay_stream(peer_addr, RelayStream)`
 
+### Transport/session primitives (spec section 3 foundations)
+- `handshake_initiator(...)`
+- `handshake_responder(...)`
+- `read_envelope(...)` / `write_envelope(...)`
+- `dispatch_envelope(...)`
+- `run_message_loop(...)`
+- `tcp_accept_session(...)` / `tcp_connect_session(...)`
+- `build_tls_server_handle(...)`
+- `tls_accept_session(...)` / `tls_connect_session(...)`
+- `start_quic_server(...)`
+- `quic_accept_bi_session(...)` / `quic_connect_bi_session(...)`
+
+### Network fetch primitives (spec section 9 foundations)
+- `FetchPolicy`
+- `PeerConnector`
+- `fetch_manifest_with_retry(...)`
+- `download_swarm_over_network(...)`
+- `NodeHandle::fetch_manifest_from_peers(...)`
+- `NodeHandle::download_from_peers(...)`
+
+### Persistence primitives (spec section 12 foundations)
+- `Store` trait
+- `MemoryStore`
+- `SqliteStore`
+- `Node::start_with_store(...)`
+- `NodeHandle::begin_partial_download(...)`
+- `NodeHandle::mark_partial_chunk_complete(...)`
+- `NodeHandle::clear_partial_download(...)`
+- `NodeHandle::set_encrypted_node_key(...)`
+- `NodeHandle::decrypt_node_key(...)`
+
 ## 5. Implemented protocol components
 
 ### IDs and crypto
@@ -90,12 +135,23 @@ The API is currently centered around `Node` and `NodeHandle`.
   - DHT operations
   - manifest/content transfer
   - relay register/connect/stream
+- Stable `type: u16` registry enforced in code (`wire::MsgType`)
 
 ### DHT
-- In-memory Kademlia-lite primitives:
+- Kademlia-lite foundations:
   - nearest-node lookup by XOR distance
-  - TTL-based value storage
-  - value-size enforcement
+  - per-bucket routing with K-limited bucket membership
+  - TTL-based value storage with value-size enforcement
+- Iterative network query foundations:
+  - `FIND_NODE` iterative lookup (`alpha=3`)
+  - `FIND_VALUE` iterative lookup (`alpha=3`)
+- Replication/maintenance foundations:
+  - replicated `STORE` to K closest peers (best-effort)
+  - periodic republish loop support
+- Keyspace validation foundations:
+  - ShareHead payload/key matching (`share:head`)
+  - provider payload/key matching (`content:prov`)
+  - ShareHead signature verification when share pubkey is known
 
 ### Search
 - Local inverted index over synced manifest items
@@ -111,18 +167,64 @@ The API is currently centered around `Node` and `NodeHandle`.
 - In-memory relay slot manager with expiry
 - Register + connect + stream forwarding primitives
 
+### Persistence
+- Durable state snapshot load/save via store backends
+- Implemented persisted slices:
+  - peer DB records
+  - subscriptions (including latest seq and manifest id)
+  - manifest cache
+  - share weights
+  - search index snapshot
+  - partial download records
+  - encrypted node key material
+- Sqlite backend uses normalized tables (`peers`, `subscriptions`, `manifests`, `share_weights`, `partial_downloads`, `metadata`) with legacy snapshot compatibility fallback
+
 ## 6. Current limitations
 
 This is an in-memory prototype baseline.
 
 Not yet implemented as production-ready behavior:
-- Real network transport runtime (QUIC/TCP sessions, handshake auth)
-- Persistent on-disk databases/state
 - End-to-end relay tunnel transport integration
+- Multi-node integration/churn/NAT test harness coverage
 - Robust peer reputation, abuse controls, quotas
 - Full mobile/desktop profile split behavior
 
-## 7. Development workflow
+## 7. Message type registry (frozen for v0.1)
+
+`type: u16` values currently reserved/implemented:
+
+- `100`: `PEX_OFFER`
+- `101`: `PEX_REQUEST`
+- `200`: `FIND_NODE`
+- `201`: `FIND_VALUE`
+- `202`: `STORE`
+- `400`: `GET_MANIFEST`
+- `401`: `MANIFEST_DATA`
+- `450`: `RELAY_REGISTER`
+- `451`: `RELAY_REGISTERED`
+- `452`: `RELAY_CONNECT`
+- `453`: `RELAY_STREAM`
+- `498`: `PROVIDERS`
+- `499`: `HAVE_CONTENT`
+- `500`: `GET_CHUNK`
+- `501`: `CHUNK_DATA`
+
+Compatibility policy for this registry:
+
+- Existing numeric assignments are stable and must not be changed.
+- New message types must use new numbers and preserve backward compatibility.
+- Unknown message types must continue to fail cleanly as unsupported.
+
+## 8. Conformance vectors
+
+Current test vectors in `scp2p-core` include:
+
+- ID derivation (`pubkey -> ShareId/NodeId`)
+- DHT key derivation (`share:head`)
+- Signature vectors for `ManifestV1` and `ShareHead`
+- Chunk hashing/content ID vectors for deterministic payload input
+
+## 9. Development workflow
 
 Before submitting changes:
 

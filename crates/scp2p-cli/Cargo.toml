@@ -6,9 +6,11 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 hex.workspace = true
 rand.workspace = true
 scp2p-core = { path = "../scp2p-core" }
 tokio.workspace = true
+windows = "0.62.2"

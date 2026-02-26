@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
 use rand::seq::SliceRandom;
+use serde::{Deserialize, Serialize};
 
 use crate::peer::PeerAddr;
 
 pub const PEX_MAX_PEERS: usize = 64;
 pub const PEX_FRESHNESS_WINDOW_SECS: u64 = 24 * 60 * 60;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerRecord {
     pub addr: PeerAddr,
     pub last_seen_unix: u64,
@@ -32,6 +33,17 @@ impl PeerDb {
 
     pub fn total_known_peers(&self) -> usize {
         self.records.len()
+    }
+
+    pub fn all_records(&self) -> Vec<PeerRecord> {
+        self.records.values().cloned().collect()
+    }
+
+    pub fn replace_records(&mut self, records: impl IntoIterator<Item = PeerRecord>) {
+        self.records.clear();
+        for record in records {
+            self.records.insert(peer_key(&record.addr), record);
+        }
     }
 
     pub fn sample_fresh(&self, now_unix: u64, max_peers: usize) -> Vec<PeerAddr> {
