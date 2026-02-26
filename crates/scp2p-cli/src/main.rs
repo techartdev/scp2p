@@ -7,13 +7,13 @@ use std::{
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use rand::rngs::OsRng;
+use rand::{rngs::OsRng, RngCore};
+use scp2p_core::transport_net::tcp_connect_session;
 use scp2p_core::{
-    describe_content, BoxedStream, DirectRequestTransport, ItemV1, ManifestV1, Node, NodeConfig,
-    NodeId, PeerAddr, PeerConnector, SearchQuery, ShareId, ShareKeypair, SqliteStore, Store,
-    TransportProtocol,
+    describe_content, BoxedStream, Capabilities, DirectRequestTransport, ItemV1, ManifestV1, Node,
+    NodeConfig, NodeId, PeerAddr, PeerConnector, SearchQuery, ShareId, ShareKeypair, SqliteStore,
+    Store, TransportProtocol,
 };
-use tokio::net::TcpStream;
 
 #[derive(Parser)]
 #[command(name = "scp2p")]
@@ -75,16 +75,29 @@ enum Command {
     },
 }
 
-struct CliTcpConnector;
+struct CliSessionConnector {
+    signing_key: SigningKey,
+    capabilities: Capabilities,
+}
 
 #[async_trait]
-impl PeerConnector for CliTcpConnector {
+impl PeerConnector for CliSessionConnector {
     async fn connect(&self, peer: &PeerAddr) -> anyhow::Result<BoxedStream> {
         if peer.transport != TransportProtocol::Tcp {
-            anyhow::bail!("cli tcp connector only supports tcp peers");
+            anyhow::bail!("cli session connector only supports tcp peers");
         }
-        let socket = SocketAddr::new(peer.ip, peer.port);
-        let stream = TcpStream::connect(socket).await?;
+        let mut nonce = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        let remote = SocketAddr::new(peer.ip, peer.port);
+        let expected = peer.pubkey_hint;
+        let (stream, _session) = tcp_connect_session(
+            remote,
+            &self.signing_key,
+            self.capabilities.clone(),
+            nonce,
+            expected,
+        )
+        .await?;
         Ok(Box::new(stream) as BoxedStream)
     }
 }
@@ -132,7 +145,10 @@ async fn main() -> anyhow::Result<()> {
                 .collect::<anyhow::Result<Vec<_>>>()?;
 
             if !peers.is_empty() {
-                let transport = Arc::new(DirectRequestTransport::new(CliTcpConnector));
+                let transport = Arc::new(DirectRequestTransport::new(CliSessionConnector {
+                    signing_key: SigningKey::generate(&mut rng),
+                    capabilities: Capabilities::default(),
+                }));
                 let republish_peers = peers.clone();
                 let _sync = node.clone().start_subscription_sync_loop(
                     transport.clone(),
@@ -229,7 +245,11 @@ async fn main() -> anyhow::Result<()> {
                 .iter()
                 .map(|entry| parse_bootstrap_peer(entry))
                 .collect::<anyhow::Result<Vec<_>>>()?;
-            let transport = DirectRequestTransport::new(CliTcpConnector);
+            let mut rng = OsRng;
+            let transport = DirectRequestTransport::new(CliSessionConnector {
+                signing_key: SigningKey::generate(&mut rng),
+                capabilities: Capabilities::default(),
+            });
             node.sync_subscriptions_over_dht(&transport, &peers).await?;
             let state = load_state(&state_db).await?;
             println!(
