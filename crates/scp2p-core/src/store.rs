@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    manifest::ManifestV1, peer::PeerAddr, peer_db::PeerRecord, search::SearchIndexSnapshot,
+    manifest::{ManifestV1, ShareHead},
+    peer::PeerAddr,
+    peer_db::PeerRecord,
+    search::SearchIndexSnapshot,
 };
 
 const KEY_KDF_ITERATIONS: u32 = 120_000;
@@ -26,6 +29,7 @@ pub struct PersistedState {
     pub peers: Vec<PeerRecord>,
     pub subscriptions: Vec<PersistedSubscription>,
     pub manifests: HashMap<[u8; 32], ManifestV1>,
+    pub share_heads: HashMap<[u8; 32], ShareHead>,
     pub share_weights: HashMap<[u8; 32], f32>,
     pub search_index: Option<SearchIndexSnapshot>,
     pub partial_downloads: HashMap<[u8; 32], PersistedPartialDownload>,
@@ -236,6 +240,17 @@ impl Store for SqliteStore {
             .map(|payload| serde_cbor::from_slice(&payload))
             .transpose()?;
 
+        state.share_heads = conn
+            .query_row(
+                "SELECT payload FROM metadata WHERE key = 'share_heads'",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|payload| serde_cbor::from_slice(&payload))
+            .transpose()?
+            .unwrap_or_default();
+
         state.encrypted_node_key = conn
             .query_row(
                 "SELECT payload FROM metadata WHERE key = 'encrypted_node_key'",
@@ -249,6 +264,7 @@ impl Store for SqliteStore {
         let has_normalized_data = !state.peers.is_empty()
             || !state.subscriptions.is_empty()
             || !state.manifests.is_empty()
+            || !state.share_heads.is_empty()
             || !state.share_weights.is_empty()
             || !state.partial_downloads.is_empty()
             || state.search_index.is_some()
@@ -329,6 +345,12 @@ impl Store for SqliteStore {
             tx.execute(
                 "INSERT INTO metadata(key, payload) VALUES('search_index', ?1)",
                 params![serde_cbor::to_vec(snapshot)?],
+            )?;
+        }
+        if !state.share_heads.is_empty() {
+            tx.execute(
+                "INSERT INTO metadata(key, payload) VALUES('share_heads', ?1)",
+                params![serde_cbor::to_vec(&state.share_heads)?],
             )?;
         }
         if let Some(encrypted_key) = &state.encrypted_node_key {

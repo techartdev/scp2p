@@ -65,6 +65,7 @@ struct NodeState {
     peer_db: PeerDb,
     dht: Dht,
     manifest_cache: HashMap<[u8; 32], ManifestV1>,
+    published_share_heads: HashMap<[u8; 32], ShareHead>,
     search_index: SearchIndex,
     share_weights: HashMap<[u8; 32], f32>,
     content_catalog: HashMap<[u8; 32], ChunkedContent>,
@@ -107,6 +108,7 @@ impl NodeState {
             peers,
             subscriptions,
             manifests,
+            share_heads,
             share_weights,
             search_index,
             partial_downloads,
@@ -146,11 +148,28 @@ impl NodeState {
             .map(SearchIndex::from_snapshot)
             .unwrap_or(rebuilt_search_index);
 
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut dht = Dht::default();
+        for (share_id, head) in &share_heads {
+            if let Ok(encoded) = serde_cbor::to_vec(head) {
+                let _ = dht.store(
+                    share_head_key(&ShareId(*share_id)),
+                    encoded,
+                    DEFAULT_TTL_SECS,
+                    now,
+                );
+            }
+        }
+
         Self {
             subscriptions,
             peer_db,
-            dht: Dht::default(),
+            dht,
             manifest_cache: manifests,
+            published_share_heads: share_heads,
             search_index,
             share_weights,
             content_catalog,
@@ -177,6 +196,7 @@ impl NodeState {
             peers: self.peer_db.all_records(),
             subscriptions,
             manifests: self.manifest_cache.clone(),
+            share_heads: self.published_share_heads.clone(),
             share_weights: self.share_weights.clone(),
             search_index: Some(self.search_index.snapshot()),
             partial_downloads: self.partial_downloads.clone(),
@@ -610,6 +630,7 @@ impl NodeHandle {
 
         let mut state = self.state.write().await;
         state.manifest_cache.insert(manifest_id, manifest);
+        state.published_share_heads.insert(share_id.0, head.clone());
         state.dht.store(
             share_head_key(&share_id),
             serde_cbor::to_vec(&head)?,
