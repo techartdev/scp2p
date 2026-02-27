@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   Compass,
   RefreshCw,
@@ -24,6 +24,7 @@ import {
   Package,
   Globe,
   Wifi,
+  GripHorizontal,
 } from "lucide-react";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import { Card } from "@/components/ui/Card";
@@ -33,6 +34,8 @@ import { Badge } from "@/components/ui/Badge";
 import { HashDisplay } from "@/components/ui/HashDisplay";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Modal } from "@/components/ui/Modal";
+import { DownloadQueue } from "@/components/DownloadQueue";
+import type { DownloadJob } from "@/components/DownloadQueue";
 import * as cmd from "@/lib/commands";
 import { decodeShareLink, isShareLink } from "@/lib/shareLink";
 import type { SubscriptionView, PublicShareView, ShareItemView, PeerView } from "@/lib/types";
@@ -338,15 +341,18 @@ export function Discover() {
   const [browseLoading, setBrowseLoading] = useState(false);
   const [browseError, setBrowseError] = useState<string | null>(null);
 
-  // Selection & download
+  // Selection & download queue
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set()
   );
-  const [showDownload, setShowDownload] = useState(false);
-  const [downloading, setDownloading] = useState(false);
-  const [downloadedPaths, setDownloadedPaths] = useState<string[]>([]);
-  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [downloadJobs, setDownloadJobs] = useState<DownloadJob[]>([]);
+  const processingRef = useRef(false);
+
+  // Resizable download queue panel
+  const [queueHeight, setQueueHeight] = useState(180);
+  const resizingRef = useRef(false);
+  const containerRef = useRef<HTMLDivElement>(null);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -504,6 +510,79 @@ export function Discover() {
     setSelected(new Set(items.map((i) => i.content_id_hex)));
   const selectNone = () => setSelected(new Set());
 
+  /* ── Download queue logic ──────────────────────────────────────────── */
+
+  const processQueue = useCallback(async (jobs: DownloadJob[]) => {
+    if (processingRef.current) return;
+    const next = jobs.find((j) => j.status === "queued");
+    if (!next) return;
+
+    processingRef.current = true;
+
+    // Mark job as downloading
+    setDownloadJobs((prev) =>
+      prev.map((j) =>
+        j.id === next.id
+          ? { ...j, status: "downloading" as const, startedAt: Date.now() }
+          : j
+      )
+    );
+
+    // Download items one at a time for per-file progress
+    for (const item of next.items) {
+      try {
+        const paths = await cmd.downloadShareItems(
+          next.shareId,
+          [item.contentId],
+          next.targetDir
+        );
+        setDownloadJobs((prev) =>
+          prev.map((j) =>
+            j.id === next.id
+              ? {
+                  ...j,
+                  completedItems: [...j.completedItems, item.contentId],
+                  completedPaths: [...j.completedPaths, ...paths],
+                }
+              : j
+          )
+        );
+      } catch (e) {
+        setDownloadJobs((prev) =>
+          prev.map((j) =>
+            j.id === next.id
+              ? { ...j, status: "error" as const, error: String(e), completedAt: Date.now() }
+              : j
+          )
+        );
+        processingRef.current = false;
+        return;
+      }
+    }
+
+    // Mark complete
+    setDownloadJobs((prev) => {
+      const updated = prev.map((j) =>
+        j.id === next.id
+          ? { ...j, status: "complete" as const, completedAt: Date.now() }
+          : j
+      );
+      // Kick off next queued job
+      setTimeout(() => {
+        processingRef.current = false;
+        processQueue(updated);
+      }, 0);
+      return updated;
+    });
+  }, []);
+
+  // Process queue whenever jobs change
+  useEffect(() => {
+    if (!processingRef.current && downloadJobs.some((j) => j.status === "queued")) {
+      processQueue(downloadJobs);
+    }
+  }, [downloadJobs, processQueue]);
+
   const handleDownload = async () => {
     if (selected.size === 0 || !activeShareId) return;
     try {
@@ -513,23 +592,67 @@ export function Discover() {
       });
       if (!dir) return;
       const targetDir = typeof dir === "string" ? dir : String(dir);
+      const shareTitle = activeEntry?.title ?? `Share ${activeShareId.slice(0, 12)}…`;
 
-      setDownloading(true);
-      setDownloadError(null);
-      setDownloadedPaths([]);
-      setShowDownload(true);
+      const job: DownloadJob = {
+        id: `${activeShareId}-${Date.now()}`,
+        shareTitle,
+        shareId: activeShareId,
+        targetDir,
+        items: items
+          .filter((i) => selected.has(i.content_id_hex))
+          .map((i) => ({
+            contentId: i.content_id_hex,
+            name: i.name,
+            size: i.size,
+          })),
+        completedItems: [],
+        completedPaths: [],
+        status: "queued",
+      };
 
-      const paths = await cmd.downloadShareItems(
-        activeShareId,
-        Array.from(selected),
-        targetDir
-      );
-      setDownloadedPaths(paths);
-    } catch (e) {
-      setDownloadError(String(e));
+      setDownloadJobs((prev) => [...prev, job]);
+    } catch {
+      // dialog cancelled or error — ignore
     }
-    setDownloading(false);
   };
+
+  const handleRemoveJob = (id: string) => {
+    setDownloadJobs((prev) => prev.filter((j) => j.id !== id));
+  };
+
+  const handleClearCompleted = () => {
+    setDownloadJobs((prev) => prev.filter((j) => j.status !== "complete"));
+  };
+
+  /* ── Resize handle logic ───────────────────────────────────────────── */
+
+  const handleResizeMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      resizingRef.current = true;
+      const startY = e.clientY;
+      const startH = queueHeight;
+
+      const onMove = (ev: MouseEvent) => {
+        if (!resizingRef.current) return;
+        const container = containerRef.current;
+        const maxH = container ? container.clientHeight - 200 : 500;
+        const delta = startY - ev.clientY;
+        setQueueHeight(Math.max(80, Math.min(maxH, startH + delta)));
+      };
+
+      const onUp = () => {
+        resizingRef.current = false;
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+      };
+
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    },
+    [queueHeight]
+  );
 
   const tree = buildTree(items);
   const selectedItems = items.filter((i) => selected.has(i.content_id_hex));
@@ -538,8 +661,12 @@ export function Discover() {
 
   const activeEntry = entries.find((e) => e.share_id_hex === activeShareId);
 
+  const hasQueueJobs = downloadJobs.length > 0;
+
   return (
-    <div className="flex h-full overflow-hidden">
+    <div ref={containerRef} className="flex flex-col h-full overflow-hidden">
+      {/* ── Top area: share list + file browser ────────────────────────── */}
+      <div className="flex overflow-hidden" style={{ flex: hasQueueJobs ? `1 1 0` : '1 1 0', minHeight: 200 }}>
       {/* ── Left panel: share list ────────────────────────────────────── */}
       <div className="w-80 shrink-0 border-r border-border flex flex-col bg-surface-deep/30">
         {/* Header */}
@@ -884,6 +1011,26 @@ export function Discover() {
           </>
         )}
       </div>
+      </div>{/* end top area */}
+
+      {/* ── Resize handle + Download queue ─────────────────────────────── */}
+      {hasQueueJobs && (
+        <>
+          <div
+            className="h-1.5 shrink-0 cursor-row-resize bg-border/40 hover:bg-accent/30 active:bg-accent/50 transition-colors flex items-center justify-center group"
+            onMouseDown={handleResizeMouseDown}
+          >
+            <GripHorizontal className="h-3 w-6 text-text-muted/40 group-hover:text-accent/60 transition-colors" />
+          </div>
+          <div style={{ height: queueHeight, minHeight: 80 }} className="shrink-0">
+            <DownloadQueue
+              jobs={downloadJobs}
+              onRemoveJob={handleRemoveJob}
+              onClearCompleted={handleClearCompleted}
+            />
+          </div>
+        </>
+      )}
 
       {/* ── Subscribe by ID modal ─────────────────────────────────────── */}
       <Modal
@@ -946,91 +1093,6 @@ export function Discover() {
             return null;
           })()}
         </div>
-      </Modal>
-
-      {/* ── Download modal ────────────────────────────────────────────── */}
-      <Modal
-        open={showDownload}
-        onClose={() => {
-          if (!downloading) setShowDownload(false);
-        }}
-        title={downloading ? "Downloading..." : "Download Complete"}
-        footer={
-          !downloading ? (
-            <Button
-              variant="primary"
-              size="sm"
-              onClick={() => setShowDownload(false)}
-            >
-              Done
-            </Button>
-          ) : undefined
-        }
-      >
-        {downloading ? (
-          <div className="flex flex-col items-center py-6">
-            <svg
-              className="animate-spin h-8 w-8 text-accent mb-4"
-              viewBox="0 0 24 24"
-              fill="none"
-            >
-              <circle
-                className="opacity-25"
-                cx="12"
-                cy="12"
-                r="10"
-                stroke="currentColor"
-                strokeWidth="3"
-              />
-              <path
-                className="opacity-75"
-                fill="currentColor"
-                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
-              />
-            </svg>
-            <p className="text-sm text-text-secondary">
-              Downloading {selected.size} file
-              {selected.size !== 1 ? "s" : ""}...
-            </p>
-            <p className="text-xs text-text-muted mt-1">
-              {formatFileSize(selectedSize)}
-            </p>
-          </div>
-        ) : downloadError ? (
-          <div className="py-4">
-            <p className="text-sm text-danger">{downloadError}</p>
-          </div>
-        ) : (
-          <div className="py-4 space-y-3">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="p-2 rounded-xl bg-success/10 text-success">
-                <Check className="h-5 w-5" />
-              </div>
-              <div>
-                <p className="text-sm font-medium text-text-primary">
-                  {downloadedPaths.length} file
-                  {downloadedPaths.length !== 1 ? "s" : ""} downloaded
-                </p>
-                <p className="text-xs text-text-muted">
-                  {formatFileSize(selectedSize)}
-                </p>
-              </div>
-            </div>
-            <div className="max-h-40 overflow-y-auto space-y-1">
-              {downloadedPaths.map((p, i) => (
-                <div
-                  key={i}
-                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-surface border border-border-subtle"
-                >
-                  <Check className="h-3 w-3 text-success shrink-0" />
-                  <span className="text-xs text-text-secondary font-mono truncate">
-                    {p}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
       </Modal>
     </div>
   );
