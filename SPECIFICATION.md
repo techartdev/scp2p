@@ -1,5 +1,8 @@
 # Spec: Subscribed Catalog P2P Network (SCP2P) v0.1
 
+> **Implementation status (2026-02-27):** All Milestone 1–7 items are implemented in `crates/scp2p-core`.
+> 125 tests passing (115 core + 10 desktop). See `PLAN.md` for full progress detail.
+
 ## 0. Goals
 
 **Must**
@@ -151,7 +154,13 @@ Keys:
 2) **Manifest Blob Location Hint** (optional)
 - `key = SHA-256("manifest:loc:" || ManifestId)` → Value: `ManifestLoc`
 - `ManifestLoc = { manifest_id, providers: [PeerAddr], updated_at, sig_by_provider? }`
-
+3) **Content Provider Hint** (seeding swarm)
+- `key = SHA-256("content:prov:" || ContentId)` → Value: `Providers`
+- `Providers = { content_id, providers: [PeerAddr], updated_at }`
+- Written by any node that holds the content (publisher or downloader).
+- Untrusted hints; chunk hash verification always required.
+- Nodes MUST publish this entry after completing a verified download (`self_addr` seeding).
+- Nodes SHOULD refresh this entry periodically (every ~10 min) to prevent TTL expiry.
 **Note:** The DHT doesn’t need to store the whole manifest; it can, but v0.1 prefers:
 - fetch manifest from peers (providers) + swarm,
 - DHT stores just “what is latest” and “who might have it”.
@@ -170,6 +179,7 @@ Keys:
 - `expires_at: u64` (optional; default created_at+30d)
 - `title: string` (optional)
 - `description: string` (optional)
+- `visibility: "public" | "private"` — `public`: subscribable from browse scope; `private`: requires explicit `share_id`
 - `items: [ItemV1]`
 - `recommended_shares: [ShareRef]` (optional)
 - `signature: bytes64` (Ed25519 over canonical CBOR of all fields except signature)
@@ -180,8 +190,7 @@ Keys:
 - `name: string`
 - `mime: string` (optional)
 - `tags: [string]` (optional)
-- `chunks: [bytes32]` (BLAKE3 per chunk)  *(optional if you support “chunk hashes on demand”; v0.1 ok to include)*
-
+- `chunks: [bytes32]` (BLAKE3 per chunk)  *(optional if you support “chunk hashes on demand”; v0.1 ok to include)*- `path: string` (optional) — relative path within a multi-file/folder share (e.g. `"sub/dir/file.txt"`). Absent for single-file shares. Preserved through signing.
 `ShareRef`:
 - `share_id: bytes32`
 - `share_pubkey: bytes32` (optional if derivable)
@@ -230,13 +239,15 @@ Score based on:
 
 ### 9.1 Provider discovery for content
 Given `(content_id)`, find providers by:
-1) Ask peers connected + PEX for “who has content_id?”
-2) Use DHT hint key:
-   - `key = SHA-256("content:prov:" || content_id)` → Value: `Providers`
-   - `Providers = { content_id, providers:[PeerAddr], updated_at }`
-   - Providers are untrusted hints.
+1) Query DHT for content provider hint: `key = SHA-256("content:prov:" || content_id)` → `Providers`; merge any `providers` list into the peer candidate set. Perform this **before** initiating transfer so DHT-discovered seeders are included from the start.
+2) Ask directly connected peers + PEX contacts for "who has content_id?"
 
-Providers can publish these hints opportunistically.
+Providers are untrusted hints; chunk hash verification is always required.
+
+**Self-seeding obligation:** After a node completes a verified download of `content_id`, it MUST:
+1) Publish `Providers { content_id, providers: [self_addr], updated_at }` to the DHT so future downloaders discover it.
+2) Serve chunks from its local `ContentBlobStore` to requesting peers.
+3) Refresh the DHT `Providers` entry periodically (recommended: every 10–15 minutes) to prevent TTL expiry.
 
 ### 9.2 Transfer messages
 - `HAVE_CONTENT { content_id }` (optional announce)
@@ -250,9 +261,13 @@ Providers can publish these hints opportunistically.
 - After all chunks, verify `BLAKE3(file)` equals `content_id`.
 
 ### 9.4 Swarming
-- Client maintains a swarm for each content:
-  - request chunks from multiple providers in parallel
-  - rarest-first not required v0.1; round-robin ok
+- Client maintains a swarm for each content download.
+- Chunks are fetched in **parallel** across available providers:
+  - Concurrency cap: `parallel_chunks` (default 8; configurable in `FetchPolicy`).
+  - Peer selection uses a scoring function: `score × (1 / (in_flight + 1))` so peers under load are deprioritized.
+  - Failed chunks are placed in a retry queue and assigned to a different peer.
+  - Stall protection: if no forward progress after 60 consecutive scheduling attempts, the download is aborted with an error.
+- v0.1 does not require rarest-first chunk ordering.
 - Providers can limit:
   - max concurrent chunk streams per peer
   - bandwidth caps
@@ -323,23 +338,57 @@ Phones should implement:
 
 ---
 
-## 13. API surface for Rust core (suggested)
+## 13. API surface for Rust core (current)
 
-Expose a stable API that UI clients can wrap:
+The `NodeHandle` type exposes the following stable API:
 
+**Identity / lifecycle**
 - `Node::start(config) -> NodeHandle`
+- `NodeHandle::runtime_config() -> RuntimeConfig`
+
+**Peers**
 - `NodeHandle::connect(peer_addr)`
+- `NodeHandle::peer_records() -> Vec<PeerRecord>`
+
+**Subscriptions**
 - `NodeHandle::subscribe(share_id)`
 - `NodeHandle::unsubscribe(share_id)`
 - `NodeHandle::sync_subscriptions()`
-- `NodeHandle::search(query, filters) -> [SearchResult]`
-- `NodeHandle::download(content_id, target_path)`
-- `NodeHandle::publish_share(manifest)` (desktop/full nodes)
-- event stream:
-  - `PeerConnected`, `PeerDisconnected`
-  - `ManifestUpdated(share_id, seq)`
-  - `DownloadProgress(content_id, percent)`
-  - `SearchIndexUpdated`
+- `NodeHandle::list_subscriptions() -> Vec<SubscriptionView>`
+
+**Publishing**
+- `NodeHandle::publish_text(text, ...) -> ShareId`
+- `NodeHandle::publish_files(paths, ...) -> ShareId`
+- `NodeHandle::publish_folder(dir, ...) -> ShareId`
+- `NodeHandle::list_own_shares() -> Vec<PublicShareView>`
+
+**Browse**
+- `NodeHandle::list_public_shares_from_peers() -> Vec<PublicShareView>`
+- `NodeHandle::list_share_items(share_id) -> Vec<ShareItemView>`
+- `NodeHandle::browse_community_shares(community_id) -> Vec<PublicShareView>`
+
+**Download**
+- `NodeHandle::download_from_peers(content_id, chunks, peers, self_addr: Option<PeerAddr>) -> Vec<u8>`
+  - `self_addr`: when `Some`, node self-seeds after completing a verified download.
+- `NodeHandle::download_items(share_id, content_ids, target_dir) -> Result`
+
+**Seeding**
+- `NodeHandle::reannounce_seeded_content(self_addr: PeerAddr) -> anyhow::Result<usize>`
+  - Refreshes DHT `Providers` entries for all locally held blobs. Returns count. Schedule every ~10 min.
+
+**Search**
+- `NodeHandle::search(query, filters) -> Vec<SearchResult>`
+
+**Communities**
+- `NodeHandle::join_community(share_id, share_pubkey)`
+- `NodeHandle::list_communities() -> Vec<CommunityView>`
+- `NodeHandle::list_community_participants(community_id) -> Vec<PeerAddr>`
+
+**Event stream (planned)**
+- `PeerConnected`, `PeerDisconnected`
+- `ManifestUpdated(share_id, seq)`
+- `DownloadProgress(content_id, percent)`
+- `SearchIndexUpdated`
 
 ---
 
@@ -361,36 +410,46 @@ Publish a test suite with:
 
 # Implementation milestones (agent-friendly)
 
-### Milestone 1: Identity + transport
+### Milestone 1: Identity + transport ✅
 - Ed25519 identity
 - QUIC + TCP fallback
 - CBOR message envelope
 - Capabilities exchange
 
-### Milestone 2: PEX + peer DB
+### Milestone 2: PEX + peer DB ✅
 - store last-seen peers
 - PEX offer/request
 - bootstrap from invite + seed list
 
-### Milestone 3: DHT (Kademlia-lite)
-- routing table, ping, find_node, store/find_value
-- key/value store with TTL
+### Milestone 3: DHT (Kademlia-lite) ✅
+- routing table, ping, find_node, store/find_value (iterative, alpha=3)
+- key/value store with TTL + replication
+- keyspace validation rules
 
-### Milestone 4: Share manifests
+### Milestone 4: Share manifests ✅
 - manifest model + canonical CBOR signing
+- `visibility: public | private` field
 - publish ShareHead to DHT
 - fetch+verify manifest
 - subscription sync loop
 
-### Milestone 5: Local search
-- SQLite FTS5 (desktop) + lightweight index (mobile) or same everywhere
+### Milestone 5: Local search ✅
+- SQLite FTS5 index
 - index updates on manifest changes
+- trust-tier filtering, Unicode normalization, pagination
 
-### Milestone 6: Content transfer
-- chunk protocol
-- provider hints
+### Milestone 6: Content transfer ✅
+- chunk protocol + chunk hash verification
+- provider hints (DHT content-provider key)
 - download manager + verification
+- multi-file/folder sharing (`ItemV1.path`)
+- `ContentBlobStore` (file-backed on-disk blob serving)
+- parallel swarmed download (`FuturesUnordered`, `parallel_chunks=8`)
+- self-seed after download + DHT provider lookup before download
+- periodic re-announcement (`reannounce_seeded_content`)
 
-### Milestone 7: Optional relays
+### Milestone 7: Optional relays ✅ (foundational)
 - relay register/connect
 - relay stream multiplexing (control first; optional limited content)
+- keepalive renewal + slot expiry baseline
+- relay quota/rate-gate baseline

@@ -407,6 +407,7 @@ async fn main() -> anyhow::Result<()> {
                 content_id,
                 &out,
                 &FetchPolicy::default(),
+                None,
             )
             .await?;
             println!(

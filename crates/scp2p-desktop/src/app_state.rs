@@ -462,12 +462,17 @@ impl DesktopAppState {
             signing_key: SigningKey::generate(&mut rng),
             capabilities: Capabilities::default(),
         };
+
+        // Resolve our own advertise address so we can self-seed after download.
+        let self_addr = self.resolve_self_addr(&node).await.ok();
+
         node.download_from_peers(
             &connector,
             &peers,
             content_id,
             target_path,
             &scp2p_core::FetchPolicy::default(),
+            self_addr,
         )
         .await
     }
@@ -593,6 +598,22 @@ impl DesktopAppState {
             }
         }
         Ok(peers)
+    }
+
+    /// Resolve this node's own advertise address for self-seeding.
+    async fn resolve_self_addr(&self, node: &NodeHandle) -> anyhow::Result<PeerAddr> {
+        let runtime = node.runtime_config().await;
+        let bind_tcp = runtime
+            .bind_tcp
+            .ok_or_else(|| anyhow::anyhow!("tcp bind not enabled"))?;
+        let peer_records = node.peer_records().await;
+        let advertise_ip = resolve_advertise_ip(bind_tcp, &peer_records)?;
+        Ok(PeerAddr {
+            ip: advertise_ip,
+            port: bind_tcp.port(),
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: None,
+        })
     }
 
     pub async fn publish_files(

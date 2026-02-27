@@ -419,6 +419,13 @@ impl NodeHandle {
         Ok(manifest)
     }
 
+    /// Download content from the network using all available peers.
+    ///
+    /// Before fetching, any additional seeders recorded in the DHT via
+    /// `content_provider_key` are merged into the peer list.  After a
+    /// successful download the content is stored locally and the
+    /// downloading node registers itself as a new seeder so future
+    /// peers can pull from it (forming a swarm).
     pub async fn download_from_peers<C: PeerConnector>(
         &self,
         connector: &C,
@@ -426,6 +433,7 @@ impl NodeHandle {
         content_id: [u8; 32],
         target_path: &str,
         policy: &FetchPolicy,
+        self_addr: Option<PeerAddr>,
     ) -> anyhow::Result<()> {
         let content = {
             let mut state = self.state.write().await;
@@ -447,12 +455,31 @@ impl NodeHandle {
         };
         persist_state(self).await?;
 
+        // ── Gap 2: merge DHT-advertised seeders into the peer list ──
+        let mut all_peers = peers.to_vec();
+        {
+            let mut state = self.state.write().await;
+            let now = now_unix_secs()?;
+            if let Some(val) = state
+                .dht
+                .find_value(content_provider_key(&content_id), now)
+            {
+                if let Ok(providers) = serde_cbor::from_slice::<Providers>(&val.value) {
+                    for p in providers.providers {
+                        if !all_peers.contains(&p) {
+                            all_peers.push(p);
+                        }
+                    }
+                }
+            }
+        }
+
         // Pattern B: chunk hashes are not stored in the manifest.
         // If content_catalog has empty chunks (subscribed content), fetch them on demand.
         let chunk_hashes = if content.chunks.is_empty() && content.chunk_count > 0 {
             fetch_chunk_hashes_with_retry(
                 connector,
-                peers,
+                &all_peers,
                 content_id,
                 content.chunk_count,
                 content.chunk_list_hash,
@@ -464,9 +491,15 @@ impl NodeHandle {
         };
 
         let bytes =
-            download_swarm_over_network(connector, peers, content_id, &chunk_hashes, policy)
+            download_swarm_over_network(connector, &all_peers, content_id, &chunk_hashes, policy)
                 .await?;
-        std::fs::write(target_path, bytes)?;
+        std::fs::write(target_path, &bytes)?;
+
+        // ── Gap 1: self-seed — store content locally and register as provider ──
+        if let Some(addr) = self_addr {
+            self.register_local_provider_content(addr, bytes).await?;
+        }
+
         {
             let mut state = self.state.write().await;
             state.partial_downloads.remove(&content_id);
@@ -782,5 +815,60 @@ impl NodeHandle {
                 Some(c.chunks.clone())
             }
         }))
+    }
+
+    /// Re-announce all locally seeded content in the DHT.
+    ///
+    /// Call this periodically (e.g. every 10–15 minutes) to keep the
+    /// provider records alive past their TTL.  For each content ID in
+    /// the local blob store the node ensures its own `PeerAddr` appears
+    /// in the `Providers` list under `content_provider_key`.
+    pub async fn reannounce_seeded_content(
+        &self,
+        self_addr: PeerAddr,
+    ) -> anyhow::Result<usize> {
+        let content_ids: Vec<[u8; 32]> = {
+            let state = self.state.read().await;
+            state
+                .content_catalog
+                .keys()
+                .filter(|id| state.content_blobs.contains(id))
+                .copied()
+                .collect()
+        };
+
+        let mut announced = 0usize;
+        for content_id in &content_ids {
+            let now = now_unix_secs()?;
+            let mut state = self.state.write().await;
+
+            let mut providers: Providers = state
+                .dht
+                .find_value(content_provider_key(content_id), now)
+                .and_then(|v| serde_cbor::from_slice(&v.value).ok())
+                .unwrap_or(Providers {
+                    content_id: *content_id,
+                    providers: vec![],
+                    updated_at: now,
+                });
+
+            if !providers.providers.contains(&self_addr) {
+                providers.providers.push(self_addr.clone());
+            }
+            providers.updated_at = now;
+
+            state.dht.store(
+                content_provider_key(content_id),
+                serde_cbor::to_vec(&providers)?,
+                crate::dht::DEFAULT_TTL_SECS,
+                now,
+            )?;
+            announced += 1;
+        }
+
+        if announced > 0 {
+            persist_state(self).await?;
+        }
+        Ok(announced)
     }
 }

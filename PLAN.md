@@ -32,12 +32,17 @@ Spec mapping and gaps:
 - Milestone 5: local subscription-scoped search
 - Milestone 6: provider hints + verified swarm download foundations
 - Milestone 7: relay register/connect/stream primitives
+- Parallel chunk downloading via `FuturesUnordered` (bounded concurrency, peer scoring, retry queue)
+- Seeder swarm: self-seed after download, DHT provider lookup before download, periodic re-announcement
+- Desktop Tauri frontend: unified Discover page, rewritten Dashboard, simplified Sidebar
 
-### In-progress quality level
-- Functional prototype logic exists in memory and in the current desktop runtime.
-- Behavior is strongly unit-tested.
-- Interoperability is improving: transport/session runtime foundations and conformance vectors now exist.
-- Durable state exists, but the overall runtime is not yet production-grade.
+### Test count
+**125 tests passing** (115 scp2p-core + 10 scp2p-desktop), 0 clippy warnings.
+
+### Quality level
+- Functional prototype logic exists and is well covered by unit tests.
+- Transport/session runtime foundations and conformance vectors exist.
+- Durable state (SQLite) is wired; the overall runtime is a strong prototype, not yet production-grade.
 
 ## 3. Immediate Priorities
 
@@ -189,6 +194,46 @@ All section F work is complete. On-disk chunk serving was the last item:
 blobs to `{blob_dir}/{hex(content_id)}.blob` and serves chunks via seek
 (256 KiB per read). In-memory fallback preserved for tests.
 
+### G) Parallel multi-peer chunk downloading
+Status: **Done**
+
+Motivation: maximize LAN download throughput when multiple peers hold the same content.
+
+Implemented in `crates/scp2p-core/src/net_fetch.rs`:
+- `FetchPolicy.parallel_chunks: usize = 8` — configurable concurrency cap
+- `PeerRuntimeStats.in_flight: usize` — tracks per-peer concurrent requests
+- `download_swarm_over_network` rewritten with `FuturesUnordered` (from `futures-util 0.3`):
+  - work queue feeds chunks to the pool; max `parallel_chunks` tasks simultaneously in flight
+  - `pick_best_peer_index()` ranks peers by score × (1 / (in_flight + 1)) so loaded peers are deprioritized
+  - failed chunks go to a retry queue; stall protection triggers after 60 quiet iterations
+- `fetch_one_chunk()` helper extracts per-chunk result into `ChunkFetchOutcome` enum
+- 2 new tests: `parallel_download_distributes_chunks_across_peers`, `parallel_download_retries_failed_chunk_on_other_peer`
+
+### H) Seeder swarm — self-seed, DHT lookup, re-announcement
+Status: **Done**
+
+Three gaps closed so that a downloader automatically becomes a seeder and contributes to the swarm:
+
+**Gap 1 — Self-seed after download** (`node_net.rs`)
+- `download_from_peers` now accepts `self_addr: Option<PeerAddr>`.
+- After a successful verified download, if `self_addr` is `Some`, calls `register_local_provider_content(self_addr, &bytes)` so the node's DHT entry announces itself as a provider.
+
+**Gap 2 — DHT provider lookup before download** (`node_net.rs`)
+- Before starting the fetch, performs `dht.find_value(content_provider_key(&content_id))` (write lock) and merges any found `Providers.providers` into the peer list.
+- Allows downloading from peers that were not directly connected but were discovered via DHT.
+
+**Gap 3 — Periodic re-announcement** (`node_net.rs`)
+- New `NodeHandle::reannounce_seeded_content(self_addr: PeerAddr) -> anyhow::Result<usize>` method.
+- Iterates `content_catalog` keys where `content_blobs.contains(id)`, refreshes DHT `Providers` entry for each, returns the refresh count.
+- Caller (desktop app or CLI) should schedule this on a periodic timer (e.g. every 10–15 minutes) to prevent DHT TTL expiry.
+
+Call-site updates:
+- 4 tests in `api/tests.rs` updated to pass `None` for `self_addr`
+- `scp2p-cli/src/main.rs` download command updated
+- `scp2p-desktop/src/app_state.rs` `download_content` now resolves self addr via `resolve_self_addr()` and passes it
+
+New tests: `download_from_peers_self_seeds_after_completion`, `reannounce_seeded_content_refreshes_dht_entries`
+
 ## 4. Relay Expansion Plan
 
 Status: **In progress**
@@ -317,5 +362,22 @@ A practical v0.1 should include:
 
 ## 12. Desktop Client Track
 
-- Current practical desktop direction: native Windows shell on top of `crates/scp2p-desktop`.
+- Current practical desktop direction: Tauri v2 + React 19 + Vite 6 + Tailwind CSS + TypeScript desktop app.
+- Backend: `crates/scp2p-desktop` (Tauri commands, app state, DTOs).
+- Frontend: `app/src/` in the workspace root.
 - Detailed execution plan is tracked in `DESKTOP_APP_PLAN.md`.
+
+### Current frontend pages
+| Page | Status | Notes |
+|------|--------|-------|
+| Dashboard | ✅ Complete | Peer list with online/offline detection, stats cards, quick-action tips |
+| Discover | ✅ Complete | Unified page — merged subscribed shares + public browse + file tree + download |
+| Publish | ✅ Complete | Text / Files / Folder tabs with native pickers |
+| Search | ✅ Complete | Subscription-scoped search UI |
+| Communities | ✅ Complete | Join by share_id+pubkey, participant browse, public-share browse |
+| Settings | ✅ Complete | Runtime config, node identity display |
+
+### Pending desktop work
+- Wire `reannounce_seeded_content` to a periodic `tokio` interval (every ~10 min) in `DesktopAppState` so Gap 3 executes automatically without requiring a CLI call.
+- Expose seeder count per content item in Discover UI (query DHT Providers).
+- Add desktop two-machine smoke test for publish → subscribe → download flow.

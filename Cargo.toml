@@ -33,5 +33,6 @@ rustls = "0.23"
 tokio-rustls = "0.26"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chacha20poly1305 = "0.10"
+futures-util = "0.3"
 pbkdf2 = "0.12"
 unicode-normalization = "0.1"

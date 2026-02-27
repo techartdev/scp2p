@@ -752,6 +752,7 @@ async fn tcp_runtime_serves_chunk_data_for_network_download() {
             desc.content_id.0,
             target.to_str().expect("utf8 path"),
             &FetchPolicy::default(),
+            None,
         )
         .await
         .expect("download over network");
@@ -907,6 +908,7 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
             desc_v1.content_id.0,
             target_v1.to_str().expect("utf8 path"),
             &FetchPolicy::default(),
+            None,
         )
         .await
         .expect("download v1");
@@ -1007,6 +1009,7 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
             desc_v2.content_id.0,
             target_v2.to_str().expect("utf8 path"),
             &FetchPolicy::default(),
+            None,
         )
         .await
         .expect("download v2");
@@ -1222,6 +1225,7 @@ async fn multi_node_churn_soak_is_configurable() {
                         desc.content_id.0,
                         target.to_str().expect("utf8 path"),
                         &FetchPolicy::default(),
+                        None,
                     )
                     .await
                     .expect("download");
@@ -2486,4 +2490,217 @@ async fn state_persists_across_restart_with_memory_store() {
         .expect("decrypt")
         .expect("has key");
     assert_eq!(decrypted, b"node-private-key");
+}
+
+/// After downloading with a `self_addr`, the downloader should appear
+/// as a seeder in the DHT and the content should be in its blob store.
+#[tokio::test]
+async fn download_from_peers_self_seeds_after_completion() {
+    let mut rng = OsRng;
+    let server_node_key = SigningKey::generate(&mut rng);
+    let client_node_key = SigningKey::generate(&mut rng);
+
+    let server_handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start server");
+    let client_handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start client");
+
+    let port_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind probe");
+    let bind_addr = port_probe.local_addr().expect("probe addr");
+    drop(port_probe);
+
+    let server_task = server_handle.clone().start_tcp_dht_service(
+        bind_addr,
+        server_node_key.clone(),
+        Capabilities::default(),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let payload = vec![55u8; crate::content::CHUNK_SIZE + 7];
+    let desc = crate::content::describe_content(&payload);
+    let server_peer = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: bind_addr.port(),
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(server_node_key.verifying_key().to_bytes()),
+    };
+    server_handle
+        .register_local_provider_content(server_peer.clone(), payload.clone())
+        .await
+        .expect("register");
+
+    let share = ShareKeypair::new(SigningKey::generate(&mut rng));
+    let manifest = ManifestV1 {
+        version: 1,
+        share_pubkey: share.verifying_key().to_bytes(),
+        share_id: share.share_id().0,
+        seq: 1,
+        created_at: 1_700_000_200,
+        expires_at: None,
+        title: Some("self-seed-test".into()),
+        description: None,
+        visibility: crate::manifest::ShareVisibility::Private,
+        communities: vec![],
+        items: vec![ItemV1 {
+            content_id: desc.content_id.0,
+            size: payload.len() as u64,
+            name: "data.bin".into(),
+            path: None,
+            mime: None,
+            tags: vec![],
+            chunk_count: desc.chunk_count,
+            chunk_list_hash: desc.chunk_list_hash,
+        }],
+        recommended_shares: vec![],
+        signature: None,
+    };
+    server_handle
+        .publish_share(manifest, &share)
+        .await
+        .expect("publish");
+
+    client_handle
+        .subscribe_with_pubkey(share.share_id(), Some(share.verifying_key().to_bytes()))
+        .await
+        .expect("subscribe");
+
+    let transport = TcpSessionTransport {
+        signing_key: client_node_key,
+        capabilities: Capabilities::default(),
+    };
+    client_handle
+        .sync_subscriptions_over_dht(&transport, std::slice::from_ref(&server_peer))
+        .await
+        .expect("sync");
+
+    let client_self_addr = PeerAddr {
+        ip: "192.168.1.50".parse().expect("ip"),
+        port: 7001,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+    };
+
+    let target = std::env::temp_dir().join(format!(
+        "scp2p_selfseed_{}.bin",
+        now_unix_secs().expect("now")
+    ));
+    client_handle
+        .download_from_peers(
+            &transport,
+            std::slice::from_ref(&server_peer),
+            desc.content_id.0,
+            target.to_str().expect("utf8 path"),
+            &FetchPolicy::default(),
+            Some(client_self_addr.clone()),
+        )
+        .await
+        .expect("download with self-seed");
+
+    let read_back = std::fs::read(&target).expect("read target");
+    assert_eq!(read_back, payload);
+
+    // Verify the client now has the content in its blob store.
+    {
+        let state = client_handle.state.read().await;
+        assert!(
+            state.content_blobs.contains(&desc.content_id.0),
+            "client should have content in blob store after self-seeding"
+        );
+    }
+
+    // Verify the client registered itself as a provider in its local DHT.
+    {
+        let mut state = client_handle.state.write().await;
+        let now = now_unix_secs().expect("now");
+        let val = state
+            .dht
+            .find_value(
+                crate::dht_keys::content_provider_key(&desc.content_id.0),
+                now,
+            )
+            .expect("provider entry should exist");
+        let providers: crate::wire::Providers =
+            serde_cbor::from_slice(&val.value).expect("decode providers");
+        assert!(
+            providers.providers.contains(&client_self_addr),
+            "client should be listed as a provider"
+        );
+    }
+
+    let _ = std::fs::remove_file(target);
+    server_task.abort();
+}
+
+/// `reannounce_seeded_content` refreshes DHT provider records for all
+/// locally stored content.
+#[tokio::test]
+async fn reannounce_seeded_content_refreshes_dht_entries() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let payload = vec![88u8; 1024];
+    let desc = crate::content::describe_content(&payload);
+    let self_addr = PeerAddr {
+        ip: "10.0.0.1".parse().expect("ip"),
+        port: 7000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+    };
+
+    handle
+        .register_local_provider_content(self_addr.clone(), payload)
+        .await
+        .expect("register");
+
+    // Clear the DHT entry to simulate TTL expiry.
+    {
+        let mut state = handle.state.write().await;
+        let now = now_unix_secs().expect("now");
+        // Store an empty Providers to simulate expiry.
+        let empty = crate::wire::Providers {
+            content_id: desc.content_id.0,
+            providers: vec![],
+            updated_at: now,
+        };
+        state
+            .dht
+            .store(
+                crate::dht_keys::content_provider_key(&desc.content_id.0),
+                serde_cbor::to_vec(&empty).expect("encode"),
+                crate::dht::DEFAULT_TTL_SECS,
+                now,
+            )
+            .expect("store empty");
+    }
+
+    // Re-announce.
+    let count = handle
+        .reannounce_seeded_content(self_addr.clone())
+        .await
+        .expect("reannounce");
+    assert_eq!(count, 1, "should announce 1 content item");
+
+    // Verify the provider is back.
+    {
+        let mut state = handle.state.write().await;
+        let now = now_unix_secs().expect("now");
+        let val = state
+            .dht
+            .find_value(
+                crate::dht_keys::content_provider_key(&desc.content_id.0),
+                now,
+            )
+            .expect("provider entry must exist");
+        let providers: crate::wire::Providers =
+            serde_cbor::from_slice(&val.value).expect("decode");
+        assert!(
+            providers.providers.contains(&self_addr),
+            "self_addr should be re-announced"
+        );
+    }
 }
