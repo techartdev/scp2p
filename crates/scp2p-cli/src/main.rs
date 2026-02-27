@@ -524,11 +524,52 @@ async fn main() -> anyhow::Result<()> {
                 .map(|h| parse_hex_32(h, "content_id"))
                 .collect::<anyhow::Result<_>>()?;
             let target = std::path::Path::new(&out_dir);
-            let downloaded = node
-                .download_share_items(share_id, &content_ids, target)
+            let items = node.list_share_items(share_id).await?;
+            let to_download: Vec<_> = if content_ids.is_empty() {
+                items.iter().collect()
+            } else {
+                items
+                    .iter()
+                    .filter(|i| content_ids.contains(&i.content_id))
+                    .collect()
+            };
+            if to_download.is_empty() {
+                anyhow::bail!("no matching items found in share");
+            }
+            let peers = bootstrap
+                .iter()
+                .map(|e| parse_bootstrap_peer(e))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let mut rng = OsRng;
+            let connector = CliSessionConnector {
+                signing_key: SigningKey::generate(&mut rng),
+                capabilities: Capabilities::default(),
+            };
+            let policy = FetchPolicy::default();
+            let mut downloaded_paths = Vec::new();
+            for item in to_download {
+                let rel = item.path.as_deref().unwrap_or(&item.name);
+                let dest = rel
+                    .replace('\\', "/")
+                    .split('/')
+                    .filter(|p| !p.is_empty() && *p != "..")
+                    .fold(target.to_path_buf(), |acc, p| acc.join(p));
+                if let Some(parent) = dest.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                node.download_from_peers(
+                    &connector,
+                    &peers,
+                    item.content_id,
+                    &dest.to_string_lossy(),
+                    &policy,
+                    None,
+                )
                 .await?;
-            println!("downloaded {} files to {}", downloaded.len(), out_dir);
-            for path in &downloaded {
+                downloaded_paths.push(dest);
+            }
+            println!("downloaded {} files to {}", downloaded_paths.len(), out_dir);
+            for path in &downloaded_paths {
                 println!("  {}", path.display());
             }
         }

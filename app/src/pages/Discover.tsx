@@ -23,6 +23,7 @@ import {
   Bookmark,
   Package,
   Globe,
+  Wifi,
 } from "lucide-react";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import { Card } from "@/components/ui/Card";
@@ -33,7 +34,8 @@ import { HashDisplay } from "@/components/ui/HashDisplay";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Modal } from "@/components/ui/Modal";
 import * as cmd from "@/lib/commands";
-import type { SubscriptionView, PublicShareView, ShareItemView } from "@/lib/types";
+import { decodeShareLink, isShareLink } from "@/lib/shareLink";
+import type { SubscriptionView, PublicShareView, ShareItemView, PeerView } from "@/lib/types";
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -319,6 +321,8 @@ export function Discover() {
   // Left panel state
   const [subs, setSubs] = useState<SubscriptionView[]>([]);
   const [publicShares, setPublicShares] = useState<PublicShareView[]>([]);
+  const [peers, setPeers] = useState<PeerView[]>([]);
+  const [peersOpen, setPeersOpen] = useState(true);
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -348,12 +352,14 @@ export function Discover() {
     setLoading(true);
     setError(null);
     try {
-      const [s, p] = await Promise.all([
+      const [s, p, pr] = await Promise.all([
         cmd.listSubscriptions(),
         cmd.browsePublicShares().catch(() => [] as PublicShareView[]),
+        cmd.listPeers().catch(() => [] as PeerView[]),
       ]);
       setSubs(s);
       setPublicShares(p);
+      setPeers(pr);
     } catch (e) {
       setError(String(e));
     }
@@ -366,7 +372,7 @@ export function Discover() {
 
   const entries = mergeEntries(subs, publicShares);
 
-  // Auto-subscribe and browse when clicking a public share
+  // Auto-subscribe and browse when clicking a share; auto-syncs if manifest is missing
   const handleSelectEntry = async (entry: ShareEntry) => {
     setActiveShareId(entry.share_id_hex);
     setSelected(new Set());
@@ -384,7 +390,18 @@ export function Discover() {
         setSubs(updated);
       }
 
-      const result = await cmd.browseShareItems(entry.share_id_hex);
+      let result: ShareItemView[];
+      try {
+        result = await cmd.browseShareItems(entry.share_id_hex);
+      } catch (e) {
+        // Manifest not cached yet — sync from peers and retry once
+        setBrowseError("Syncing manifest from peer…");
+        const updated = await cmd.syncNow();
+        setSubs(updated);
+        result = await cmd.browseShareItems(entry.share_id_hex);
+      }
+
+      setBrowseError(null);
       setItems(result);
 
       // Auto-expand folders
@@ -425,10 +442,17 @@ export function Discover() {
     if (!subscribeId.trim()) return;
     setSubscribing(true);
     try {
-      const result = await cmd.subscribeShare(subscribeId.trim());
+      let shareIdToSubscribe = subscribeId.trim();
+      if (isShareLink(shareIdToSubscribe)) {
+        const decoded = decodeShareLink(shareIdToSubscribe);
+        shareIdToSubscribe = decoded.shareIdHex;
+      }
+      const result = await cmd.subscribeShare(shareIdToSubscribe);
       setSubs(result);
       setShowSubscribe(false);
       setSubscribeId("");
+      // Kick off a sync immediately so the manifest is fetched from the peer
+      cmd.syncNow().then((updated) => setSubs(updated)).catch(() => {});
     } catch (e) {
       setError(String(e));
     }
@@ -556,6 +580,55 @@ export function Discover() {
         {error && (
           <div className="px-4 py-2">
             <p className="text-xs text-danger">{error}</p>
+          </div>
+        )}
+
+        {/* LAN Peers section */}
+        {peers.length > 0 && (
+          <div className="border-b border-border">
+            <button
+              className="w-full flex items-center justify-between px-3 py-2 text-[10px] font-semibold text-text-muted uppercase tracking-wider hover:bg-surface-hover/40 transition-colors"
+              onClick={() => setPeersOpen((v) => !v)}
+            >
+              <span className="flex items-center gap-1.5">
+                <Wifi className="h-3 w-3" />
+                LAN Peers
+                <span className="ml-1 px-1.5 py-0.5 rounded bg-surface-hover text-text-muted font-mono normal-case">
+                  {peers.length}
+                </span>
+              </span>
+              {peersOpen ? (
+                <ChevronDown className="h-3 w-3" />
+              ) : (
+                <ChevronRight className="h-3 w-3" />
+              )}
+            </button>
+            {peersOpen && (
+              <div className="pb-1">
+                {peers.map((peer) => {
+                  const now = Math.floor(Date.now() / 1000);
+                  const online = now - peer.last_seen_unix < 300;
+                  return (
+                    <div
+                      key={peer.addr}
+                      className="flex items-center gap-2 px-3 py-1.5"
+                    >
+                      <span
+                        className={`h-1.5 w-1.5 rounded-full shrink-0 ${
+                          online ? "bg-success" : "bg-text-muted"
+                        }`}
+                      />
+                      <span className="text-xs text-text-secondary font-mono truncate flex-1">
+                        {peer.addr}
+                      </span>
+                      <span className="text-[10px] text-text-muted shrink-0">
+                        {peer.transport}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
 
@@ -739,7 +812,7 @@ export function Discover() {
             {/* File tree */}
             <div className="flex-1 overflow-y-auto">
               {browseLoading ? (
-                <div className="flex items-center justify-center py-16">
+                <div className="flex flex-col items-center justify-center py-16 gap-3">
                   <svg
                     className="animate-spin h-6 w-6 text-accent"
                     viewBox="0 0 24 24"
@@ -759,6 +832,9 @@ export function Discover() {
                       d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
                     />
                   </svg>
+                  {browseError && (
+                    <p className="text-xs text-text-muted">{browseError}</p>
+                  )}
                 </div>
               ) : browseError ? (
                 <div className="p-5">
@@ -812,14 +888,14 @@ export function Discover() {
       {/* ── Subscribe by ID modal ─────────────────────────────────────── */}
       <Modal
         open={showSubscribe}
-        onClose={() => setShowSubscribe(false)}
-        title="Subscribe by Share ID"
+        onClose={() => { setShowSubscribe(false); setSubscribeId(""); }}
+        title="Add Private Share"
         footer={
           <>
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => setShowSubscribe(false)}
+              onClick={() => { setShowSubscribe(false); setSubscribeId(""); }}
             >
               Cancel
             </Button>
@@ -837,15 +913,38 @@ export function Discover() {
       >
         <div className="space-y-4">
           <p className="text-sm text-text-secondary">
-            For private shares, paste the Share ID that was shared with you.
+            Paste a share link (<span className="font-mono text-xs text-text-primary">scp2p://s/…</span>) or a raw Share ID hex received from the publisher.
           </p>
           <Input
-            label="Share ID (hex)"
-            placeholder="Enter share ID..."
+            label="Share link or Share ID"
+            placeholder="scp2p://s/… or hex share ID"
             value={subscribeId}
             onChange={(e) => setSubscribeId(e.target.value)}
             className="font-mono text-xs"
           />
+          {(() => {
+            const v = subscribeId.trim();
+            if (!v) return null;
+            if (isShareLink(v)) {
+              try {
+                const { shareIdHex } = decodeShareLink(v);
+                return (
+                  <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-success/8 border border-success/20">
+                    <Check className="h-3.5 w-3.5 text-success mt-0.5 shrink-0" />
+                    <div>
+                      <p className="text-xs text-success font-medium">Valid share link detected</p>
+                      <p className="text-[10px] text-text-muted font-mono mt-0.5 break-all">{shareIdHex}</p>
+                    </div>
+                  </div>
+                );
+              } catch {
+                return (
+                  <p className="text-xs text-danger">Invalid share link format.</p>
+                );
+              }
+            }
+            return null;
+          })()}
         </div>
       </Modal>
 

@@ -2384,35 +2384,6 @@ async fn tcp_runtime_supports_relay_for_simulated_nat_peers() {
 }
 
 #[tokio::test]
-async fn download_uses_provider_hints_and_verifies_chunks() {
-    let handle = Node::start(NodeConfig::default()).await.expect("start");
-    let peer = PeerAddr {
-        ip: "10.0.0.9".parse().expect("valid ip"),
-        port: 7000,
-        transport: TransportProtocol::Quic,
-        pubkey_hint: None,
-    };
-    let data = vec![9u8; crate::content::CHUNK_SIZE + 5];
-    let content_id = handle
-        .register_local_provider_content(peer, data.clone())
-        .await
-        .expect("register provider content");
-
-    let target = std::env::temp_dir().join(format!(
-        "scp2p_download_{}.bin",
-        now_unix_secs().expect("now")
-    ));
-    handle
-        .download(content_id, target.to_str().expect("utf8 path"))
-        .await
-        .expect("download");
-
-    let read_back = std::fs::read(&target).expect("read target");
-    assert_eq!(read_back, data);
-    let _ = std::fs::remove_file(target);
-}
-
-#[tokio::test]
 async fn state_persists_across_restart_with_memory_store() {
     let store = MemoryStore::new();
     let mut rng = OsRng;
@@ -2701,6 +2672,140 @@ async fn reannounce_seeded_content_refreshes_dht_entries() {
         assert!(
             providers.providers.contains(&self_addr),
             "self_addr should be re-announced"
+        );
+    }
+}
+
+/// `reannounce_subscribed_share_heads` refreshes the DHT share-head entry
+/// for public subscriptions but NOT for private ones.
+#[tokio::test]
+async fn reannounce_share_heads_only_refreshes_public_subscriptions() {
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let mut rng = OsRng;
+
+    // ── Set up a public share and a private share ──
+    let public_kp = ShareKeypair::new(SigningKey::generate(&mut rng));
+    let private_kp = ShareKeypair::new(SigningKey::generate(&mut rng));
+
+    let public_manifest = ManifestV1 {
+        version: 1,
+        share_pubkey: public_kp.verifying_key().to_bytes(),
+        share_id: public_kp.share_id().0,
+        seq: 1,
+        created_at: 1_700_000_000,
+        expires_at: None,
+        title: Some("public share".into()),
+        description: None,
+        visibility: crate::manifest::ShareVisibility::Public,
+        communities: vec![],
+        items: vec![],
+        recommended_shares: vec![],
+        signature: None,
+    };
+    let private_manifest = ManifestV1 {
+        version: 1,
+        share_pubkey: private_kp.verifying_key().to_bytes(),
+        share_id: private_kp.share_id().0,
+        seq: 1,
+        created_at: 1_700_000_001,
+        expires_at: None,
+        title: Some("private share".into()),
+        description: None,
+        visibility: crate::manifest::ShareVisibility::Private,
+        communities: vec![],
+        items: vec![],
+        recommended_shares: vec![],
+        signature: None,
+    };
+
+    // Publish both (which publishes the share head + manifest).
+    handle
+        .publish_share(public_manifest, &public_kp)
+        .await
+        .expect("publish public");
+    handle
+        .publish_share(private_manifest, &private_kp)
+        .await
+        .expect("publish private");
+
+    // Subscribe to both.
+    handle
+        .subscribe(public_kp.share_id())
+        .await
+        .expect("subscribe public");
+    handle
+        .subscribe(private_kp.share_id())
+        .await
+        .expect("subscribe private");
+
+    // Sync subscriptions to populate latest_seq / latest_manifest_id.
+    handle
+        .sync_subscriptions()
+        .await
+        .expect("sync subscriptions");
+
+    // Now simulate the publisher going offline: remove the share head
+    // DHT entries (as if TTL expired).
+    {
+        let mut state = handle.state.write().await;
+        let now = now_unix_secs().expect("now");
+        // Overwrite with a short TTL that's already expired.
+        let pub_key = crate::dht_keys::share_head_key(&public_kp.share_id());
+        let priv_key = crate::dht_keys::share_head_key(&private_kp.share_id());
+        state
+            .dht
+            .store(pub_key, vec![0], 1, now.saturating_sub(100))
+            .expect("store expired");
+        state
+            .dht
+            .store(priv_key, vec![0], 1, now.saturating_sub(100))
+            .expect("store expired");
+    }
+
+    // Verify both entries are expired.
+    {
+        let mut state = handle.state.write().await;
+        let now = now_unix_secs().expect("now");
+        assert!(
+            state
+                .dht
+                .find_value(crate::dht_keys::share_head_key(&public_kp.share_id()), now)
+                .is_none(),
+            "public head should be expired"
+        );
+        assert!(
+            state
+                .dht
+                .find_value(crate::dht_keys::share_head_key(&private_kp.share_id()), now)
+                .is_none(),
+            "private head should be expired"
+        );
+    }
+
+    // Run re-announcement.
+    let refreshed = handle
+        .reannounce_subscribed_share_heads()
+        .await
+        .expect("reannounce");
+    assert_eq!(refreshed, 1, "only the public share should be refreshed");
+
+    // Verify: public share head is back in DHT, private is not.
+    {
+        let mut state = handle.state.write().await;
+        let now = now_unix_secs().expect("now");
+        let pub_val = state
+            .dht
+            .find_value(crate::dht_keys::share_head_key(&public_kp.share_id()), now);
+        assert!(
+            pub_val.is_some(),
+            "public share head should be refreshed in DHT"
+        );
+        let priv_val = state
+            .dht
+            .find_value(crate::dht_keys::share_head_key(&private_kp.share_id()), now);
+        assert!(
+            priv_val.is_none(),
+            "private share head must NOT be refreshed"
         );
     }
 }

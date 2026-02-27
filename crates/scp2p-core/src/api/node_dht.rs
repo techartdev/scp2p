@@ -293,6 +293,10 @@ impl NodeHandle {
         transport: &T,
         seed_peers: &[PeerAddr],
     ) -> anyhow::Result<usize> {
+        // Refresh share heads for public subscriptions so they survive
+        // after the original publisher goes offline.
+        let _ = self.reannounce_subscribed_share_heads().await;
+
         let now = now_unix_secs()?;
         let values = {
             let mut state = self.state.write().await;

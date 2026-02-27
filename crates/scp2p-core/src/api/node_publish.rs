@@ -23,7 +23,7 @@ use crate::{
 use super::{
     helpers::{
         check_manifest_limits, collect_files_recursive, mime_from_extension, normalize_item_path,
-        now_unix_secs, persist_state, validate_download_path,
+        now_unix_secs, persist_state,
     },
     NodeHandle, ShareItemInfo,
 };
@@ -252,41 +252,4 @@ impl NodeHandle {
             .collect())
     }
 
-    /// Selectively download specific items from a share by their content IDs.
-    ///
-    /// Files are written into `target_dir`, reproducing the `path` hierarchy
-    /// from the manifest when present.  If `content_ids` is empty, all items
-    /// in the share are downloaded.
-    pub async fn download_share_items(
-        &self,
-        share_id: [u8; 32],
-        content_ids: &[[u8; 32]],
-        target_dir: &Path,
-    ) -> anyhow::Result<Vec<PathBuf>> {
-        let items = self.list_share_items(share_id).await?;
-        let to_download: Vec<&ShareItemInfo> = if content_ids.is_empty() {
-            items.iter().collect()
-        } else {
-            items
-                .iter()
-                .filter(|item| content_ids.contains(&item.content_id))
-                .collect()
-        };
-        if to_download.is_empty() {
-            anyhow::bail!("no matching items found in share");
-        }
-
-        let mut downloaded = Vec::with_capacity(to_download.len());
-        for item in to_download {
-            let rel = item.path.as_deref().unwrap_or(&item.name);
-            let dest = validate_download_path(target_dir, rel)?;
-            if let Some(parent) = dest.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            self.download(item.content_id, &dest.to_string_lossy())
-                .await?;
-            downloaded.push(dest);
-        }
-        Ok(downloaded)
-    }
 }

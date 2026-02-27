@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
 use crate::{
     blob_store::ContentBlobStore,
     config::NodeConfig,
-    content::ChunkedContent,
+    content::{chunk_hashes, ChunkedContent},
     dht::{Dht, DEFAULT_TTL_SECS},
     dht_keys::share_head_key,
     ids::{ContentId, ShareId},
@@ -307,16 +307,30 @@ impl NodeState {
             .map(|identity| (identity.label, identity.share_secret))
             .collect::<HashMap<_, _>>();
 
+        let content_blobs = match &runtime_config.blob_dir {
+            Some(dir) => ContentBlobStore::on_disk(dir.clone())?,
+            None => ContentBlobStore::in_memory(),
+        };
+
         let mut rebuilt_search_index = SearchIndex::default();
         let mut content_catalog = HashMap::new();
         for manifest in manifests.values() {
             rebuilt_search_index.index_manifest(manifest);
             for item in &manifest.items {
+                // Recompute chunk hashes from local blob if available so
+                // that the publisher can serve GetChunkHashes requests
+                // after a restart.
+                let chunks = content_blobs
+                    .read_full(&item.content_id)
+                    .ok()
+                    .flatten()
+                    .map(|bytes| chunk_hashes(&bytes))
+                    .unwrap_or_default();
                 content_catalog.insert(
                     item.content_id,
                     ChunkedContent {
                         content_id: ContentId(item.content_id),
-                        chunks: vec![],
+                        chunks,
                         chunk_count: item.chunk_count,
                         chunk_list_hash: item.chunk_list_hash,
                     },
@@ -342,11 +356,6 @@ impl NodeState {
                 );
             }
         }
-
-        let content_blobs = match &runtime_config.blob_dir {
-            Some(dir) => ContentBlobStore::on_disk(dir.clone())?,
-            None => ContentBlobStore::in_memory(),
-        };
 
         Ok(Self {
             runtime_config,
@@ -611,7 +620,7 @@ impl NodeHandle {
     pub async fn list_owned_shares(&self) -> Vec<OwnedShareRecord> {
         let state = self.state.read().await;
         let mut records = Vec::new();
-        for (_label, secret) in &state.publisher_identities {
+        for secret in state.publisher_identities.values() {
             let signing_key = SigningKey::from_bytes(secret);
             let verifying_key = signing_key.verifying_key();
             let share_id = ShareId::from_pubkey(&verifying_key);

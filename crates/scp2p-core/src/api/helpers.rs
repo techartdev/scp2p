@@ -403,33 +403,6 @@ pub(super) fn normalize_item_path(raw: &str) -> anyhow::Result<String> {
     Ok(result)
 }
 
-/// Validate that a path from a manifest is safe to join onto a target
-/// directory for file creation.
-pub(super) fn validate_download_path(target_dir: &Path, rel: &str) -> anyhow::Result<PathBuf> {
-    let normalised = normalize_item_path(rel)?;
-    let dest = target_dir.join(&normalised);
-
-    let canon_target = if target_dir.exists() {
-        std::fs::canonicalize(target_dir)?
-    } else {
-        target_dir.to_path_buf()
-    };
-
-    let mut check = canon_target.clone();
-    for component in std::path::Path::new(&normalised).components() {
-        match component {
-            std::path::Component::Normal(seg) => check.push(seg),
-            _ => anyhow::bail!("unexpected path component in: {normalised}"),
-        }
-    }
-
-    if !check.starts_with(&canon_target) {
-        anyhow::bail!("path escapes target directory: {normalised}");
-    }
-
-    Ok(dest)
-}
-
 /// Validate manifest item counts against protocol limits.
 pub(super) fn check_manifest_limits(manifest: &ManifestV1) -> anyhow::Result<()> {
     if manifest.items.len() > MAX_MANIFEST_ITEMS {

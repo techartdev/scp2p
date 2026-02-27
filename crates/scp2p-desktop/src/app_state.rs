@@ -12,9 +12,10 @@ use ed25519_dalek::SigningKey;
 use rand::{rngs::OsRng, RngCore};
 use scp2p_core::{
     describe_content, transport_net::tcp_connect_session, BoxedStream, Capabilities,
-    DirectRequestTransport, ItemV1, ManifestV1, Node, NodeConfig, NodeHandle, OwnedShareRecord,
-    PeerAddr, PeerConnector, PeerRecord, PersistedSubscription, PublicShareSummary,
-    SearchPageQuery, ShareVisibility, SqliteStore, Store, TransportProtocol,
+    DirectRequestTransport, FetchPolicy, ItemV1, ManifestV1, Node, NodeConfig, NodeHandle,
+    OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord, PersistedSubscription,
+    PublicShareSummary, SearchPageQuery, ShareItemInfo, ShareVisibility, SqliteStore, Store,
+    TransportProtocol,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -790,14 +791,60 @@ impl DesktopAppState {
             .iter()
             .map(|h| parse_hex_32(h, "content_id"))
             .collect::<anyhow::Result<_>>()?;
+
+        // List items from the cached manifest.
+        let items = node.list_share_items(share_id).await?;
+        let to_download: Vec<&ShareItemInfo> = if content_ids.is_empty() {
+            items.iter().collect()
+        } else {
+            items
+                .iter()
+                .filter(|item| content_ids.contains(&item.content_id))
+                .collect()
+        };
+        if to_download.is_empty() {
+            anyhow::bail!("no matching items found in share");
+        }
+
+        // Build connector and peer list — same as download_content.
+        let peers = self.sync_peer_targets(&node).await?;
+        let mut rng = OsRng;
+        let connector = DesktopSessionConnector {
+            signing_key: SigningKey::generate(&mut rng),
+            capabilities: Capabilities::default(),
+        };
+        let self_addr = self.resolve_self_addr(&node).await.ok();
+        let policy = FetchPolicy::default();
         let target = std::path::Path::new(target_dir);
-        let paths = node
-            .download_share_items(share_id, &content_ids, target)
+
+        let mut downloaded = Vec::with_capacity(to_download.len());
+        for item in to_download {
+            // Sanitise relative path: normalise separators, reject traversal.
+            let rel = item
+                .path
+                .as_deref()
+                .unwrap_or(&item.name)
+                .replace('\\', "/");
+            let parts: Vec<&str> = rel
+                .split('/')
+                .filter(|p| !p.is_empty() && *p != "..")
+                .collect();
+            let dest = parts.iter().fold(target.to_path_buf(), |acc, p| acc.join(p));
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            node.download_from_peers(
+                &connector,
+                &peers,
+                item.content_id,
+                &dest.to_string_lossy(),
+                &policy,
+                self_addr.clone(),
+            )
             .await?;
-        Ok(paths
-            .into_iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect())
+            downloaded.push(dest.to_string_lossy().to_string());
+        }
+        Ok(downloaded)
     }
 }
 

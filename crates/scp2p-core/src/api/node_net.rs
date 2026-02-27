@@ -14,14 +14,13 @@ use crate::{
     content::ChunkedContent,
     dht_keys::{content_provider_key, share_head_key},
     ids::{ContentId, ShareId},
-    manifest::ManifestV1,
+    manifest::{ManifestV1, ShareVisibility},
     net_fetch::{
         download_swarm_over_network, fetch_chunk_hashes_with_retry, fetch_manifest_with_retry,
         FetchPolicy, PeerConnector, RequestTransport,
     },
     peer::PeerAddr,
     store::{decrypt_secret, encrypt_secret, PersistedPartialDownload},
-    transfer::{download_swarm, ChunkProvider},
     transport::{read_envelope, write_envelope},
     wire::{
         ChunkData, CommunityPublicShareList, CommunityStatus, Envelope, FindNode, FindNodeResult,
@@ -347,58 +346,6 @@ impl NodeHandle {
             return Ok(None);
         };
         Ok(Some(decrypt_secret(encrypted, passphrase)?))
-    }
-
-    pub async fn download(&self, content_id: [u8; 32], target_path: &str) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        let now = now_unix_secs()?;
-        let content = state
-            .content_catalog
-            .get(&content_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown content metadata"))?;
-
-        let providers_msg: Providers = state
-            .dht
-            .find_value(content_provider_key(&content_id), now)
-            .and_then(|v| serde_cbor::from_slice(&v.value).ok())
-            .ok_or_else(|| anyhow::anyhow!("no provider hints for content"))?;
-
-        let providers = providers_msg
-            .providers
-            .into_iter()
-            .filter_map(|peer| {
-                state
-                    .content_blobs
-                    .read_full(&content_id)
-                    .ok()
-                    .flatten()
-                    .map(|content_bytes| ChunkProvider {
-                        peer,
-                        content_bytes,
-                    })
-            })
-            .collect::<Vec<_>>();
-
-        state.partial_downloads.insert(
-            content_id,
-            PersistedPartialDownload {
-                content_id,
-                target_path: target_path.to_owned(),
-                total_chunks: content.chunk_count,
-                completed_chunks: vec![],
-            },
-        );
-        drop(state);
-        persist_state(self).await?;
-
-        let bytes = download_swarm(content_id, &content.chunks, &providers)?;
-        std::fs::write(target_path, bytes)?;
-        {
-            let mut state = self.state.write().await;
-            state.partial_downloads.remove(&content_id);
-        }
-        persist_state(self).await
     }
 
     pub async fn fetch_manifest_from_peers<C: PeerConnector>(
@@ -870,5 +817,71 @@ impl NodeHandle {
             persist_state(self).await?;
         }
         Ok(announced)
+    }
+
+    /// Re-announce share heads for **public** subscribed shares in the local DHT.
+    ///
+    /// Subscribers cache signed `ShareHead` records received during sync.
+    /// For public shares we re-store them so that `dht_republish_once`
+    /// propagates them to the network — keeping the share discoverable
+    /// even after the original publisher goes offline.
+    ///
+    /// Private shares are **never** re-announced: they die when the
+    /// publisher stops refreshing.
+    pub async fn reannounce_subscribed_share_heads(&self) -> anyhow::Result<usize> {
+        let now = now_unix_secs()?;
+        let mut state = self.state.write().await;
+        let mut refreshed = 0usize;
+
+        let share_ids: Vec<[u8; 32]> = state.subscriptions.keys().copied().collect();
+        for share_id in share_ids {
+            let sub = match state.subscriptions.get(&share_id) {
+                Some(s) => s,
+                None => continue,
+            };
+            // Need a cached manifest to check visibility.
+            let manifest_id = match sub.latest_manifest_id {
+                Some(id) => id,
+                None => continue,
+            };
+            let manifest = match state.manifest_cache.get(&manifest_id) {
+                Some(m) => m,
+                None => continue,
+            };
+            if manifest.visibility != ShareVisibility::Public {
+                continue;
+            }
+
+            // Try to find the signed share-head bytes already in the DHT.
+            let key = share_head_key(&ShareId(share_id));
+            let encoded = match state.dht.find_value(key, now) {
+                Some(val) => val.value,
+                None => {
+                    // Fallback: if the publisher also stores it in
+                    // `published_share_heads`, encode from there.
+                    match state.published_share_heads.get(&share_id) {
+                        Some(head) => match serde_cbor::to_vec(head) {
+                            Ok(enc) => enc,
+                            Err(_) => continue,
+                        },
+                        None => continue,
+                    }
+                }
+            };
+
+            state.dht.store(
+                key,
+                encoded,
+                crate::dht::DEFAULT_TTL_SECS,
+                now,
+            )?;
+            refreshed += 1;
+        }
+
+        if refreshed > 0 {
+            drop(state);
+            persist_state(self).await?;
+        }
+        Ok(refreshed)
     }
 }
