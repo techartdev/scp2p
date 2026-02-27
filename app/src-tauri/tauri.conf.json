@@ -7,8 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build",
-    "watchIgnore": ["content_blobs", "*.db", "*.db-shm", "*.db-wal"]
+    "beforeBuildCommand": "npm run build"
   },
   "app": {
     "windows": [
