@@ -1,4 +1,42 @@
+# ── Rust ───────────────────────────────────────────────────────────────
 /target
 Cargo.lock
+
+# ── State / generated files ─────────────────────────────────────────────
 *.db
+*.db-shm
+*.db-wal
 scp2p-desktop-config.cbor
+
+# ── Node / Frontend ─────────────────────────────────────────────────────
+app/node_modules/
+app/dist/
+app/.tauri/
+
+# ── Tauri local config overrides ────────────────────────────────────────
+app/src-tauri/.cargo/
+# Note: app/src-tauri/icons/ is committed (required by tauri-build)
+
+# ── OS ──────────────────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Editor / IDE ─────────────────────────────────────────────────────────
+.vscode/settings.json
+.vscode/launch.json
+.vscode/tasks.json
+.idea/
+*.swp
+*.swo
+*.orig
+
+# ── Environment ──────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── Logs ─────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
