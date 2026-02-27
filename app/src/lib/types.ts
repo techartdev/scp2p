@@ -88,6 +88,14 @@ export interface PublishResultView {
 
 export type PublishVisibility = "private" | "public";
 
+export interface ShareItemView {
+  content_id_hex: string;
+  size: number;
+  name: string;
+  path: string | null;
+  mime: string | null;
+}
+
 // ── Navigation ──────────────────────────────────────────────────────────
 
 export type PageId =
@@ -97,4 +105,5 @@ export type PageId =
   | "subscriptions"
   | "search"
   | "publish"
+  | "share-browser"
   | "settings";

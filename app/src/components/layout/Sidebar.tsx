@@ -5,6 +5,7 @@ import {
   Bookmark,
   Search,
   Upload,
+  Package,
   Settings,
   Radio,
 } from "lucide-react";
@@ -56,6 +57,11 @@ const navItems: NavItem[] = [
     id: "publish",
     label: "Publish",
     icon: <Upload className="h-4 w-4" />,
+  },
+  {
+    id: "share-browser",
+    label: "Share Browser",
+    icon: <Package className="h-4 w-4" />,
   },
   {
     id: "settings",

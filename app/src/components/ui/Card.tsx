@@ -6,6 +6,7 @@ interface CardProps {
   hover?: boolean;
   glow?: boolean;
   padding?: "none" | "sm" | "md" | "lg";
+  onClick?: () => void;
 }
 
 const paddingStyles: Record<string, string> = {
@@ -21,6 +22,7 @@ export function Card({
   hover = false,
   glow = false,
   padding = "md",
+  onClick,
 }: CardProps) {
   return (
     <div
@@ -31,6 +33,7 @@ export function Card({
         ${glow ? "shadow-glow" : "shadow-card"}
         ${className}
       `}
+      onClick={onClick}
     >
       {children}
     </div>

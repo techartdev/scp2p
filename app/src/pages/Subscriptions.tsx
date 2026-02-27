@@ -6,9 +6,8 @@ import {
   Trash2,
   RotateCw,
   Eye,
-  X,
 } from "lucide-react";
-import { Card, CardHeader } from "@/components/ui/Card";
+import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { Badge } from "@/components/ui/Badge";

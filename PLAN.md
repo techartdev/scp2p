@@ -143,7 +143,7 @@ Implemented:
 - protocol error-flag handling
 
 ### F) Multi-file and folder sharing
-Status: **In progress**
+Status: **Done (core + desktop app)**
 
 Goal: expand sharing from single text items to arbitrary single files, multi-file,
 and whole-folder shares, with a share-item browser and selective download.
@@ -171,9 +171,20 @@ Implemented:
 - CLI commands: `publish-files`, `publish-folder`, `browse-share`, `download-share`
 - `ShareItemView` DTO with serde roundtrip tests
 - Conformance vectors updated for the new `ItemSigningTuple` (7 fields)
+- Desktop app Publish page with Text / Files / Folder tabbed UI
+  - Native file/folder picker dialogs via `@tauri-apps/plugin-dialog`
+  - Multi-file selection with add/remove UX
+  - Folder selection with path display
+- Desktop app Share Browser page
+  - Browse any share by ID to see its contents
+  - Hierarchical tree view with folders and files
+  - Mime-type icons, file sizes, path info
+  - Checkbox selection for individual files or whole folders
+  - Select All / Clear with download size summary
+  - Native folder picker for download destination
+  - Download progress + completion modal with file list
 
 Remaining work:
-- App frontend pages for file/folder publish, share browser, selective download
 - On-disk chunk serving (stream from file instead of holding full payload in RAM)
   for large files — current approach buffers content in `provider_payloads`
 

@@ -11,6 +11,7 @@ import type {
   PublicShareView,
   PublishResultView,
   PublishVisibility,
+  ShareItemView,
 } from "./types";
 
 // ── Node lifecycle ──────────────────────────────────────────────────────
@@ -135,5 +136,53 @@ export async function publishTextShare(
     itemText,
     visibility,
     communityIdsHex,
+  });
+}
+
+export async function publishFiles(
+  filePaths: string[],
+  title: string,
+  visibility: PublishVisibility,
+  communityIdsHex: string[]
+): Promise<PublishResultView> {
+  return invoke("publish_files", {
+    filePaths,
+    title,
+    visibility,
+    communityIdsHex,
+  });
+}
+
+export async function publishFolder(
+  dirPath: string,
+  title: string,
+  visibility: PublishVisibility,
+  communityIdsHex: string[]
+): Promise<PublishResultView> {
+  return invoke("publish_folder", {
+    dirPath,
+    title,
+    visibility,
+    communityIdsHex,
+  });
+}
+
+// ── Share Browser ───────────────────────────────────────────────────────
+
+export async function browseShareItems(
+  shareIdHex: string
+): Promise<ShareItemView[]> {
+  return invoke("browse_share_items", { shareIdHex });
+}
+
+export async function downloadShareItems(
+  shareIdHex: string,
+  contentIdsHex: string[],
+  targetDir: string
+): Promise<string[]> {
+  return invoke("download_share_items", {
+    shareIdHex,
+    contentIdsHex,
+    targetDir,
   });
 }
