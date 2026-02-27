@@ -220,9 +220,11 @@ mod tests {
                 content_id: [1u8; 32],
                 size: 42,
                 name: name.into(),
+                path: None,
                 mime: None,
                 tags: vec![tag.into()],
-                chunks: vec![],
+                chunk_count: 0,
+                chunk_list_hash: [0u8; 32],
             }],
             recommended_shares: vec![],
             signature: None,
@@ -319,9 +321,11 @@ mod tests {
                     content_id,
                     size: 1_024 + item_idx as u64,
                     name: format!("movie-{share_idx}-{item_idx}"),
+                    path: None,
                     mime: None,
                     tags: vec!["movie".into(), format!("share-{share_idx}")],
-                    chunks: vec![],
+                    chunk_count: 0,
+                    chunk_list_hash: [0u8; 32],
                 });
             }
 

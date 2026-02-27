@@ -101,10 +101,14 @@ Status: **Done (foundational implementation complete)**
 
 - QUIC runtime foundations implemented
 - TLS-over-TCP fallback foundations implemented
+- **3-message handshake** (ClientHello → ServerHello → ClientAck) implemented; both nonces are mutually echoed, fully binding the channel
 - identity-bound handshake verification (`remote_node_pubkey` binding) implemented
+- `protocol_version: u16` field in handshake; current version is 1
+- bootstrap peer address parsing supports `quic://` and `tcp://` prefixes
 - message send/recv loop + dispatcher for all envelope `type` values implemented
 - backpressure/max message size checks implemented for framed envelopes
 - handshake timestamp freshness/skew validation added
+- frame length prefix documented as big-endian (network byte order)
 
 Critical spec alignment:
 - define and freeze a stable `type: u16` registry for message kinds
@@ -119,10 +123,13 @@ Implemented:
 - sqlite backend introduced for durable state snapshots
 - sqlite backend moved to normalized per-slice tables
 - peers, subscriptions, manifests, share weights, search index, partial downloads, and encrypted node-key material persisted
+- all SQLite I/O runs inside `tokio::task::spawn_blocking` (no async blocking)
+- `CURRENT_SCHEMA_VERSION` constant + migration runner in `ensure_schema`; schema version persisted in metadata table
+- all writes use UPSERT (`INSERT … ON CONFLICT DO UPDATE`) with stale-key pruning — no more DELETE+INSERT
+- all legacy fallback code removed (no old `scp2p_state` table, no legacy migration helpers)
 
 Remaining work:
-- harden migration story for future schema changes
-- harden versioning/migration around persisted community membership and publisher identity slices
+- harden versioning/migration around persisted community membership and publisher identity slices when those object models stabilize in the spec
 
 ### E) Manifest/content fetch over network
 Status: **Done (foundational implementation complete)**
@@ -134,6 +141,41 @@ Implemented:
 - session pooling transport for repeated requests
 - adaptive provider scoring and failure backoff
 - protocol error-flag handling
+
+### F) Multi-file and folder sharing
+Status: **In progress**
+
+Goal: expand sharing from single text items to arbitrary single files, multi-file,
+and whole-folder shares, with a share-item browser and selective download.
+
+Design notes:
+- `ContentId = BLAKE3(file_bytes)` — identical files from different publishers yield
+  the same `content_id` (content-addressed dedup), but each publisher's `ShareId`
+  (derived from their Ed25519 keypair) is always unique, so shares never collide.
+- `ItemV1.path` (new optional field) preserves relative directory structure inside a share.
+  Single-file shares leave `path` as `None`; folder shares set it to the relative path
+  (e.g. `"sub/dir/file.txt"`).
+- Subscribers can browse a share's item list before downloading, and selectively
+  download individual files or the whole share.
+
+Implemented:
+- `ItemV1.path: Option<String>` field added (with signing-tuple coverage)
+- `publish_files(paths, ...)` core API — reads files from disk, chunks each, builds
+  multi-item manifest, registers content
+- `publish_folder(dir, ...)` core API — recursively walks a directory tree
+- `list_share_items(share_id)` core API — returns item metadata for UI browsing
+- `download_items(share_id, content_ids, target_dir)` core API — selective download
+  that reconstructs folder structure from `path` field
+- Tauri commands: `publish_files`, `publish_folder`, `browse_share_items`,
+  `download_share_items`
+- CLI commands: `publish-files`, `publish-folder`, `browse-share`, `download-share`
+- `ShareItemView` DTO with serde roundtrip tests
+- Conformance vectors updated for the new `ItemSigningTuple` (7 fields)
+
+Remaining work:
+- App frontend pages for file/folder publish, share browser, selective download
+- On-disk chunk serving (stream from file instead of holding full payload in RAM)
+  for large files — current approach buffers content in `provider_payloads`
 
 ## 4. Relay Expansion Plan
 

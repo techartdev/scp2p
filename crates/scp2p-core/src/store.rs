@@ -159,10 +159,7 @@ impl SqliteStore {
                 [],
                 |row| {
                     let blob: Vec<u8> = row.get(0)?;
-                    Ok(u32::from_le_bytes(
-                        blob.try_into()
-                            .unwrap_or([0, 0, 0, 0]),
-                    ))
+                    Ok(u32::from_le_bytes(blob.try_into().unwrap_or([0, 0, 0, 0])))
                 },
             )
             .unwrap_or(0);
@@ -423,8 +420,16 @@ fn save_state_sync(conn: &mut Connection, state: &PersistedState) -> anyhow::Res
     upsert_metadata_cbor_opt(&tx, "search_index", &state.search_index)?;
     upsert_metadata_cbor(&tx, "share_heads", &state.share_heads)?;
     upsert_metadata_cbor_opt(&tx, "encrypted_node_key", &state.encrypted_node_key)?;
-    upsert_metadata_cbor(&tx, "enabled_blocklist_shares", &state.enabled_blocklist_shares)?;
-    upsert_metadata_cbor(&tx, "blocklist_rules_by_share", &state.blocklist_rules_by_share)?;
+    upsert_metadata_cbor(
+        &tx,
+        "enabled_blocklist_shares",
+        &state.enabled_blocklist_shares,
+    )?;
+    upsert_metadata_cbor(
+        &tx,
+        "blocklist_rules_by_share",
+        &state.blocklist_rules_by_share,
+    )?;
 
     tx.commit()?;
     Ok(())

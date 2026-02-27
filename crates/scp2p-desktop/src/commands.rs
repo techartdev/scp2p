@@ -2,8 +2,8 @@ use crate::{
     app_state::DesktopAppState,
     dto::{
         CommunityBrowseView, CommunityView, DesktopClientConfig, PeerView, PublicShareView,
-        PublishResultView, PublishVisibility, RuntimeStatus, SearchResultsView, StartNodeRequest,
-        SubscriptionView,
+        PublishResultView, PublishVisibility, RuntimeStatus, SearchResultsView, ShareItemView,
+        StartNodeRequest, SubscriptionView,
     },
 };
 
@@ -132,5 +132,47 @@ pub async fn publish_text_share(
             visibility,
             &community_ids_hex,
         )
+        .await
+}
+
+pub async fn publish_files(
+    app_state: &DesktopAppState,
+    file_paths: Vec<String>,
+    title: String,
+    visibility: PublishVisibility,
+    community_ids_hex: Vec<String>,
+) -> anyhow::Result<PublishResultView> {
+    app_state
+        .publish_files(&file_paths, &title, visibility, &community_ids_hex)
+        .await
+}
+
+pub async fn publish_folder(
+    app_state: &DesktopAppState,
+    dir_path: String,
+    title: String,
+    visibility: PublishVisibility,
+    community_ids_hex: Vec<String>,
+) -> anyhow::Result<PublishResultView> {
+    app_state
+        .publish_folder(&dir_path, &title, visibility, &community_ids_hex)
+        .await
+}
+
+pub async fn browse_share_items(
+    app_state: &DesktopAppState,
+    share_id_hex: String,
+) -> anyhow::Result<Vec<ShareItemView>> {
+    app_state.browse_share_items(&share_id_hex).await
+}
+
+pub async fn download_share_items(
+    app_state: &DesktopAppState,
+    share_id_hex: String,
+    content_ids_hex: Vec<String>,
+    target_dir: String,
+) -> anyhow::Result<Vec<String>> {
+    app_state
+        .download_share_items(&share_id_hex, &content_ids_hex, &target_dir)
         .await
 }

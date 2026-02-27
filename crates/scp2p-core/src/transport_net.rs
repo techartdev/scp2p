@@ -449,6 +449,18 @@ mod tests {
         ) -> anyhow::Result<DispatchResult> {
             Ok(DispatchResult::none())
         }
+        async fn on_get_chunk_hashes(
+            &mut self,
+            _msg: crate::wire::GetChunkHashes,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_chunk_hash_list(
+            &mut self,
+            _msg: crate::wire::ChunkHashList,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
     }
 
     #[tokio::test]

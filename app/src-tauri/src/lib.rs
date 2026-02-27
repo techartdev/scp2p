@@ -1,7 +1,7 @@
 use scp2p_desktop::{
     commands, CommunityBrowseView, CommunityView, DesktopAppState, DesktopClientConfig, PeerView,
     PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus, SearchResultsView,
-    StartNodeRequest, SubscriptionView,
+    ShareItemView, StartNodeRequest, SubscriptionView,
 };
 
 struct AppState(DesktopAppState);
@@ -105,9 +105,7 @@ async fn sync_now(state: tauri::State<'_, AppState>) -> Result<Vec<SubscriptionV
 // ── Communities ─────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn list_communities(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<CommunityView>, String> {
+async fn list_communities(state: tauri::State<'_, AppState>) -> Result<Vec<CommunityView>, String> {
     commands::list_communities(&state.0)
         .await
         .map_err(|e| format!("{e:#}"))
@@ -203,6 +201,54 @@ async fn publish_text_share(
     .map_err(|e| format!("{e:#}"))
 }
 
+#[tauri::command]
+async fn publish_files(
+    state: tauri::State<'_, AppState>,
+    file_paths: Vec<String>,
+    title: String,
+    visibility: PublishVisibility,
+    community_ids_hex: Vec<String>,
+) -> Result<PublishResultView, String> {
+    commands::publish_files(&state.0, file_paths, title, visibility, community_ids_hex)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn publish_folder(
+    state: tauri::State<'_, AppState>,
+    dir_path: String,
+    title: String,
+    visibility: PublishVisibility,
+    community_ids_hex: Vec<String>,
+) -> Result<PublishResultView, String> {
+    commands::publish_folder(&state.0, dir_path, title, visibility, community_ids_hex)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn browse_share_items(
+    state: tauri::State<'_, AppState>,
+    share_id_hex: String,
+) -> Result<Vec<ShareItemView>, String> {
+    commands::browse_share_items(&state.0, share_id_hex)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn download_share_items(
+    state: tauri::State<'_, AppState>,
+    share_id_hex: String,
+    content_ids_hex: Vec<String>,
+    target_dir: String,
+) -> Result<Vec<String>, String> {
+    commands::download_share_items(&state.0, share_id_hex, content_ids_hex, target_dir)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 // ── App entry ───────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -230,6 +276,10 @@ pub fn run() {
             subscribe_public_share,
             download_content,
             publish_text_share,
+            publish_files,
+            publish_folder,
+            browse_share_items,
+            download_share_items,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SCP2P application");

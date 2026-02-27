@@ -27,9 +27,20 @@ pub struct ItemV1 {
     pub content_id: [u8; 32],
     pub size: u64,
     pub name: String,
+    /// Relative path inside a folder share (e.g. `"sub/dir/file.txt"`).
+    /// `None` for single-file shares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     pub mime: Option<String>,
     pub tags: Vec<String>,
-    pub chunks: Vec<[u8; 32]>,
+    /// Number of 256 KiB chunks that constitute this item.
+    pub chunk_count: u32,
+    /// BLAKE3 hash over the concatenation of all chunk hashes.
+    ///
+    /// Chunk hashes are fetched on demand via `GetChunkHashes`;
+    /// the receiver verifies `BLAKE3(chunk_hashes) == chunk_list_hash`
+    /// to authenticate them against the signed manifest.
+    pub chunk_list_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -97,8 +108,10 @@ struct ItemSigningTuple<'a>(
     u64,
     &'a str,
     Option<&'a str>,
+    Option<&'a str>,
     &'a [String],
-    &'a [[u8; 32]],
+    u32,
+    [u8; 32],
 );
 
 impl ManifestV1 {
@@ -112,9 +125,11 @@ impl ManifestV1 {
                     item.content_id,
                     item.size,
                     item.name.as_str(),
+                    item.path.as_deref(),
                     item.mime.as_deref(),
                     &item.tags,
-                    &item.chunks,
+                    item.chunk_count,
+                    item.chunk_list_hash,
                 )
             })
             .collect::<Vec<_>>();
@@ -422,9 +437,11 @@ mod tests {
                 content_id: [1u8; 32],
                 size: 42,
                 name: "item-a".into(),
+                path: None,
                 mime: Some("application/octet-stream".into()),
                 tags: vec!["t1".into(), "t2".into()],
-                chunks: vec![[2u8; 32], [3u8; 32]],
+                chunk_count: 2,
+                chunk_list_hash: [2u8; 32],
             }],
             recommended_shares: vec![],
             signature: None,
@@ -451,7 +468,7 @@ mod tests {
                 assert_eq!(values.len(), 1);
                 match &values[0] {
                     serde_cbor::Value::Array(item_values) => {
-                        assert_eq!(item_values.len(), 6);
+                        assert_eq!(item_values.len(), 8);
                     }
                     _ => panic!("manifest item should be cbor array"),
                 }

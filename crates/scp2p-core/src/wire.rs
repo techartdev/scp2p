@@ -114,11 +114,15 @@ pub enum MsgType {
     GetChunk = 500,
     /// Chunk payload response.
     ChunkData = 501,
+    /// Request chunk hash list for a content object.
+    GetChunkHashes = 502,
+    /// Chunk hash list response.
+    ChunkHashList = 503,
 }
 
 impl MsgType {
     /// Stable `u16` registry for protocol envelope types.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 23] = [
         Self::PexOffer,
         Self::PexRequest,
         Self::FindNode,
@@ -140,6 +144,8 @@ impl MsgType {
         Self::HaveContent,
         Self::GetChunk,
         Self::ChunkData,
+        Self::GetChunkHashes,
+        Self::ChunkHashList,
     ];
 }
 
@@ -175,6 +181,8 @@ impl TryFrom<u16> for MsgType {
             499 => Ok(Self::HaveContent),
             500 => Ok(Self::GetChunk),
             501 => Ok(Self::ChunkData),
+            502 => Ok(Self::GetChunkHashes),
+            503 => Ok(Self::ChunkHashList),
             _ => anyhow::bail!("unknown message type {value}"),
         }
     }
@@ -327,6 +335,19 @@ pub struct ChunkData {
     pub bytes: Vec<u8>,
 }
 
+/// Request the chunk hash list for a content object.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetChunkHashes {
+    pub content_id: [u8; 32],
+}
+
+/// Chunk hash list response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChunkHashList {
+    pub content_id: [u8; 32],
+    pub hashes: Vec<[u8; 32]>,
+}
+
 /// Typed envelope payloads used by dispatcher-style message handling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WirePayload {
@@ -351,6 +372,8 @@ pub enum WirePayload {
     HaveContent(HaveContent),
     GetChunk(GetChunk),
     ChunkData(ChunkData),
+    GetChunkHashes(GetChunkHashes),
+    ChunkHashList(ChunkHashList),
 }
 
 impl WirePayload {
@@ -377,6 +400,8 @@ impl WirePayload {
             Self::HaveContent(_) => MsgType::HaveContent,
             Self::GetChunk(_) => MsgType::GetChunk,
             Self::ChunkData(_) => MsgType::ChunkData,
+            Self::GetChunkHashes(_) => MsgType::GetChunkHashes,
+            Self::ChunkHashList(_) => MsgType::ChunkHashList,
         }
     }
 
@@ -403,6 +428,8 @@ impl WirePayload {
             Self::HaveContent(msg) => serde_cbor::to_vec(msg)?,
             Self::GetChunk(msg) => serde_cbor::to_vec(msg)?,
             Self::ChunkData(msg) => serde_cbor::to_vec(msg)?,
+            Self::GetChunkHashes(msg) => serde_cbor::to_vec(msg)?,
+            Self::ChunkHashList(msg) => serde_cbor::to_vec(msg)?,
         })
     }
 
@@ -436,6 +463,8 @@ impl WirePayload {
             MsgType::HaveContent => Self::HaveContent(serde_cbor::from_slice(payload)?),
             MsgType::GetChunk => Self::GetChunk(serde_cbor::from_slice(payload)?),
             MsgType::ChunkData => Self::ChunkData(serde_cbor::from_slice(payload)?),
+            MsgType::GetChunkHashes => Self::GetChunkHashes(serde_cbor::from_slice(payload)?),
+            MsgType::ChunkHashList => Self::ChunkHashList(serde_cbor::from_slice(payload)?),
         })
     }
 }
@@ -682,6 +711,24 @@ mod tests {
     }
 
     #[test]
+    fn chunk_hash_messages_roundtrip() {
+        let get = GetChunkHashes {
+            content_id: [11u8; 32],
+        };
+        let get_rt: GetChunkHashes =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&get).expect("encode")).expect("decode");
+        assert_eq!(get_rt, get);
+
+        let list = ChunkHashList {
+            content_id: [11u8; 32],
+            hashes: vec![[1u8; 32], [2u8; 32]],
+        };
+        let list_rt: ChunkHashList =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&list).expect("encode")).expect("decode");
+        assert_eq!(list_rt, list);
+    }
+
+    #[test]
     fn msg_type_registry_roundtrip_and_unique_values() {
         let mut sorted_values = MsgType::ALL
             .iter()
@@ -829,6 +876,13 @@ mod tests {
                 content_id: [13u8; 32],
                 chunk_index: 2,
                 bytes: vec![6, 6, 6],
+            }),
+            WirePayload::GetChunkHashes(GetChunkHashes {
+                content_id: [14u8; 32],
+            }),
+            WirePayload::ChunkHashList(ChunkHashList {
+                content_id: [14u8; 32],
+                hashes: vec![[1u8; 32], [2u8; 32]],
             }),
         ];
 

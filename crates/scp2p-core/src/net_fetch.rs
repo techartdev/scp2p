@@ -10,13 +10,14 @@ use tokio::{
 };
 
 use crate::{
-    content::{verify_chunk, verify_content},
+    content::{compute_chunk_list_hash, verify_chunk, verify_content},
     ids::ContentId,
     manifest::ManifestV1,
     peer::PeerAddr,
     transport::{read_envelope, write_envelope},
     wire::{
-        ChunkData, Envelope, GetChunk, GetManifest, ManifestData, MsgType, WirePayload, FLAG_ERROR,
+        ChunkData, ChunkHashList, Envelope, GetChunk, GetChunkHashes, GetManifest, ManifestData,
+        MsgType, WirePayload, FLAG_ERROR,
     },
 };
 
@@ -176,6 +177,91 @@ pub async fn fetch_manifest_with_retry<T: RequestTransport + ?Sized>(
     }
 
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("manifest fetch failed")))
+}
+
+/// Fetch the chunk hash list for a content ID from a set of peers, verifying
+/// the result against the expected `chunk_list_hash` commitment.
+pub async fn fetch_chunk_hashes_with_retry<T: RequestTransport + ?Sized>(
+    transport: &T,
+    peers: &[PeerAddr],
+    content_id: [u8; 32],
+    expected_chunk_count: u32,
+    expected_chunk_list_hash: [u8; 32],
+    policy: &FetchPolicy,
+) -> anyhow::Result<Vec<[u8; 32]>> {
+    if peers.is_empty() {
+        anyhow::bail!("no peers available for chunk hash fetch");
+    }
+
+    let mut req_id = 5_000u32;
+    let mut last_err = None;
+    for attempt in 0..policy.attempts_per_peer {
+        for offset in 0..peers.len() {
+            let idx = (attempt + offset) % peers.len();
+            let target = &peers[idx];
+            let result =
+                fetch_chunk_hashes_once(transport, target, content_id, req_id, policy).await;
+            req_id = req_id.wrapping_add(1);
+            match result {
+                Ok(hashes) => {
+                    if hashes.len() != expected_chunk_count as usize {
+                        last_err = Some(anyhow::anyhow!(
+                            "chunk hash count mismatch: got {} expected {}",
+                            hashes.len(),
+                            expected_chunk_count
+                        ));
+                        continue;
+                    }
+                    let actual_hash = compute_chunk_list_hash(&hashes);
+                    if actual_hash != expected_chunk_list_hash {
+                        last_err =
+                            Some(anyhow::anyhow!("chunk_list_hash verification failed"));
+                        continue;
+                    }
+                    return Ok(hashes);
+                }
+                Err(err) => last_err = Some(err),
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("chunk hash fetch failed")))
+}
+
+async fn fetch_chunk_hashes_once<T: RequestTransport + ?Sized>(
+    transport: &T,
+    peer: &PeerAddr,
+    content_id: [u8; 32],
+    req_id: u32,
+    policy: &FetchPolicy,
+) -> anyhow::Result<Vec<[u8; 32]>> {
+    let request = Envelope::from_typed(
+        req_id,
+        0,
+        &WirePayload::GetChunkHashes(GetChunkHashes { content_id }),
+    )?;
+    let response = transport
+        .request(peer, request, policy.request_timeout)
+        .await?;
+
+    if response.req_id != req_id {
+        anyhow::bail!("chunk hash response req_id mismatch");
+    }
+    if response.r#type != MsgType::ChunkHashList as u16 {
+        anyhow::bail!("unexpected response type for chunk hash request");
+    }
+    let payload = response.decode_typed()?;
+    let WirePayload::ChunkHashList(ChunkHashList {
+        content_id: returned_id,
+        hashes,
+    }) = payload
+    else {
+        anyhow::bail!("invalid chunk hash response payload");
+    };
+    if returned_id != content_id {
+        anyhow::bail!("chunk hash content_id mismatch");
+    }
+    Ok(hashes)
 }
 
 pub async fn download_swarm_over_network<T: RequestTransport + ?Sized>(

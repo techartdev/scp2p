@@ -123,6 +123,15 @@ pub struct PublishResultView {
     pub community_ids_hex: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShareItemView {
+    pub content_id_hex: String,
+    pub size: u64,
+    pub name: String,
+    pub path: Option<String>,
+    pub mime: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +206,34 @@ mod tests {
         };
         let bytes = serde_cbor::to_vec(&view).expect("encode");
         let decoded: CommunityBrowseView = serde_cbor::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, view);
+    }
+
+    #[test]
+    fn share_item_view_serde_roundtrip() {
+        let view = ShareItemView {
+            content_id_hex: "aa".repeat(32),
+            size: 65536,
+            name: "readme.md".to_string(),
+            path: Some("docs/readme.md".to_string()),
+            mime: Some("text/markdown".to_string()),
+        };
+        let bytes = serde_cbor::to_vec(&view).expect("encode");
+        let decoded: ShareItemView = serde_cbor::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, view);
+    }
+
+    #[test]
+    fn share_item_view_without_path_roundtrip() {
+        let view = ShareItemView {
+            content_id_hex: "bb".repeat(32),
+            size: 42,
+            name: "note.txt".to_string(),
+            path: None,
+            mime: None,
+        };
+        let bytes = serde_cbor::to_vec(&view).expect("encode");
+        let decoded: ShareItemView = serde_cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, view);
     }
 }

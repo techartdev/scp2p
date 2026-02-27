@@ -19,7 +19,7 @@ use tokio::time::{self, Duration};
 use crate::dto::{
     CommunityBrowseView, CommunityParticipantView, CommunityView, DesktopClientConfig, PeerView,
     PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus, SearchResultView,
-    SearchResultsView, StartNodeRequest, SubscriptionView,
+    SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
 };
 
 #[derive(Clone, Default)]
@@ -517,9 +517,11 @@ impl DesktopAppState {
                 content_id: content.content_id.0,
                 size: item_text.len() as u64,
                 name: item_name.trim().to_string(),
+                path: None,
                 mime: Some("text/plain".to_string()),
                 tags: vec!["desktop".to_string(), "lan".to_string()],
-                chunks: content.chunks,
+                chunk_count: content.chunk_count,
+                chunk_list_hash: content.chunk_list_hash,
             }],
             recommended_shares: vec![],
             signature: None,
@@ -583,6 +585,153 @@ impl DesktopAppState {
             }
         }
         Ok(peers)
+    }
+
+    pub async fn publish_files(
+        &self,
+        file_paths: &[String],
+        title: &str,
+        visibility: PublishVisibility,
+        community_ids_hex: &[String],
+    ) -> anyhow::Result<PublishResultView> {
+        let node = self.node_handle().await?;
+        let runtime = node.runtime_config().await;
+        let bind_tcp = runtime
+            .bind_tcp
+            .ok_or_else(|| anyhow::anyhow!("tcp bind must be enabled to publish"))?;
+        let peer_records = node.peer_records().await;
+        let advertise_ip = resolve_advertise_ip(bind_tcp, &peer_records)?;
+        let provider = PeerAddr {
+            ip: advertise_ip,
+            port: bind_tcp.port(),
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: None,
+        };
+
+        let paths: Vec<std::path::PathBuf> =
+            file_paths.iter().map(std::path::PathBuf::from).collect();
+        let share = node.ensure_publisher_identity("default").await?;
+        let communities = resolve_joined_communities(&node, community_ids_hex).await?;
+        let community_ids: Vec<[u8; 32]> = communities.iter().map(|c| c.share_id).collect();
+
+        let manifest_id = node
+            .publish_files(
+                &paths,
+                None,
+                title,
+                Some("published from scp2p-desktop"),
+                share_visibility(visibility),
+                &community_ids,
+                provider.clone(),
+                &share,
+            )
+            .await?;
+
+        Ok(PublishResultView {
+            share_id_hex: hex::encode(share.share_id().0),
+            share_pubkey_hex: hex::encode(share.verifying_key().to_bytes()),
+            share_secret_hex: hex::encode(share.signing_key.to_bytes()),
+            manifest_id_hex: hex::encode(manifest_id),
+            provider_addr: format!("{}:{}", provider.ip, provider.port),
+            visibility,
+            community_ids_hex: communities
+                .iter()
+                .map(|c| hex::encode(c.share_id))
+                .collect(),
+        })
+    }
+
+    pub async fn publish_folder(
+        &self,
+        dir_path: &str,
+        title: &str,
+        visibility: PublishVisibility,
+        community_ids_hex: &[String],
+    ) -> anyhow::Result<PublishResultView> {
+        let node = self.node_handle().await?;
+        let runtime = node.runtime_config().await;
+        let bind_tcp = runtime
+            .bind_tcp
+            .ok_or_else(|| anyhow::anyhow!("tcp bind must be enabled to publish"))?;
+        let peer_records = node.peer_records().await;
+        let advertise_ip = resolve_advertise_ip(bind_tcp, &peer_records)?;
+        let provider = PeerAddr {
+            ip: advertise_ip,
+            port: bind_tcp.port(),
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: None,
+        };
+
+        let share = node.ensure_publisher_identity("default").await?;
+        let communities = resolve_joined_communities(&node, community_ids_hex).await?;
+        let community_ids: Vec<[u8; 32]> = communities.iter().map(|c| c.share_id).collect();
+
+        let dir = std::path::Path::new(dir_path);
+        let manifest_id = node
+            .publish_folder(
+                dir,
+                title,
+                Some("published from scp2p-desktop"),
+                share_visibility(visibility),
+                &community_ids,
+                provider.clone(),
+                &share,
+            )
+            .await?;
+
+        Ok(PublishResultView {
+            share_id_hex: hex::encode(share.share_id().0),
+            share_pubkey_hex: hex::encode(share.verifying_key().to_bytes()),
+            share_secret_hex: hex::encode(share.signing_key.to_bytes()),
+            manifest_id_hex: hex::encode(manifest_id),
+            provider_addr: format!("{}:{}", provider.ip, provider.port),
+            visibility,
+            community_ids_hex: communities
+                .iter()
+                .map(|c| hex::encode(c.share_id))
+                .collect(),
+        })
+    }
+
+    pub async fn browse_share_items(
+        &self,
+        share_id_hex: &str,
+    ) -> anyhow::Result<Vec<ShareItemView>> {
+        let node = self.node_handle().await?;
+        let share_id = parse_hex_32(share_id_hex, "share_id")?;
+        let items = node.list_share_items(share_id).await?;
+        Ok(items
+            .into_iter()
+            .map(|item| ShareItemView {
+                content_id_hex: hex::encode(item.content_id),
+                size: item.size,
+                name: item.name,
+                path: item.path,
+                mime: item.mime,
+            })
+            .collect())
+    }
+
+    pub async fn download_share_items(
+        &self,
+        share_id_hex: &str,
+        content_ids_hex: &[String],
+        target_dir: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let node = self.node_handle().await?;
+        let share_id = parse_hex_32(share_id_hex, "share_id")?;
+        let content_ids: Vec<[u8; 32]> = content_ids_hex
+            .iter()
+            .map(|h| parse_hex_32(h, "content_id"))
+            .collect::<anyhow::Result<_>>()?;
+        let target = std::path::Path::new(target_dir);
+        let paths = node
+            .download_share_items(share_id, &content_ids, target)
+            .await?;
+        Ok(paths
+            .into_iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect())
     }
 }
 

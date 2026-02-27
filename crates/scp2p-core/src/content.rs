@@ -8,6 +8,8 @@ pub const CHUNK_SIZE: usize = 256 * 1024;
 pub struct ChunkedContent {
     pub content_id: ContentId,
     pub chunks: Vec<[u8; 32]>,
+    pub chunk_count: u32,
+    pub chunk_list_hash: [u8; 32],
 }
 
 pub fn chunk_hashes(bytes: &[u8]) -> Vec<[u8; 32]> {
@@ -21,10 +23,28 @@ pub fn chunk_hashes(bytes: &[u8]) -> Vec<[u8; 32]> {
         .collect()
 }
 
+/// Compute the BLAKE3 hash over the concatenation of all chunk hashes.
+///
+/// This value is stored in the signed manifest so that chunk hashes
+/// can be fetched on demand and verified without embedding them
+/// directly in the manifest.
+pub fn compute_chunk_list_hash(chunk_hashes: &[[u8; 32]]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for hash in chunk_hashes {
+        hasher.update(hash);
+    }
+    *hasher.finalize().as_bytes()
+}
+
 pub fn describe_content(bytes: &[u8]) -> ChunkedContent {
+    let chunks = chunk_hashes(bytes);
+    let chunk_count = chunks.len() as u32;
+    let chunk_list_hash = compute_chunk_list_hash(&chunks);
     ChunkedContent {
         content_id: ContentId::from_bytes(bytes),
-        chunks: chunk_hashes(bytes),
+        chunks,
+        chunk_count,
+        chunk_list_hash,
     }
 }
 

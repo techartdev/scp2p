@@ -6,5 +6,5 @@ pub use app_state::DesktopAppState;
 pub use dto::{
     CommunityBrowseView, CommunityParticipantView, CommunityView, DesktopClientConfig, PeerView,
     PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus, SearchResultView,
-    SearchResultsView, StartNodeRequest, SubscriptionView,
+    SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
 };

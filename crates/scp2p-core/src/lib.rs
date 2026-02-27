@@ -19,13 +19,13 @@ pub mod wire;
 
 pub use api::{
     AbuseLimits, BlocklistRules, Node, NodeHandle, SearchPage, SearchPageQuery, SearchQuery,
-    SearchResult, SearchTrustFilter, SubscriptionTrustLevel,
+    SearchResult, SearchTrustFilter, ShareItemInfo, SubscriptionTrustLevel,
 };
 pub use capabilities::Capabilities;
 pub use config::NodeConfig;
 pub use content::{
-    chunk_hashes, describe_content, verify_chunk, verify_chunked_content, verify_content,
-    ChunkedContent, CHUNK_SIZE,
+    chunk_hashes, compute_chunk_list_hash, describe_content, verify_chunk, verify_chunked_content,
+    verify_content, ChunkedContent, CHUNK_SIZE,
 };
 pub use dht::{
     Dht, DhtNodeRecord, DhtValue, ALPHA, DEFAULT_TTL_SECS, K, MAX_TTL_SECS, MAX_VALUE_SIZE,

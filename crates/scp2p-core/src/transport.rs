@@ -348,6 +348,14 @@ pub trait WireDispatcher {
     async fn on_have_content(&mut self, msg: HaveContent) -> anyhow::Result<DispatchResult>;
     async fn on_get_chunk(&mut self, msg: GetChunk) -> anyhow::Result<DispatchResult>;
     async fn on_chunk_data(&mut self, msg: ChunkData) -> anyhow::Result<DispatchResult>;
+    async fn on_get_chunk_hashes(
+        &mut self,
+        msg: crate::wire::GetChunkHashes,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_chunk_hash_list(
+        &mut self,
+        msg: crate::wire::ChunkHashList,
+    ) -> anyhow::Result<DispatchResult>;
 }
 
 pub async fn dispatch_envelope<D: WireDispatcher + Send>(
@@ -381,6 +389,8 @@ pub async fn dispatch_envelope<D: WireDispatcher + Send>(
         WirePayload::HaveContent(msg) => dispatcher.on_have_content(msg).await?,
         WirePayload::GetChunk(msg) => dispatcher.on_get_chunk(msg).await?,
         WirePayload::ChunkData(msg) => dispatcher.on_chunk_data(msg).await?,
+        WirePayload::GetChunkHashes(msg) => dispatcher.on_get_chunk_hashes(msg).await?,
+        WirePayload::ChunkHashList(msg) => dispatcher.on_chunk_hash_list(msg).await?,
     };
     Ok(result.response)
 }
@@ -506,6 +516,20 @@ impl WireDispatcher for NoopDispatcher {
     async fn on_chunk_data(&mut self, _msg: ChunkData) -> anyhow::Result<DispatchResult> {
         Ok(DispatchResult::none())
     }
+
+    async fn on_get_chunk_hashes(
+        &mut self,
+        _msg: crate::wire::GetChunkHashes,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_chunk_hash_list(
+        &mut self,
+        _msg: crate::wire::ChunkHashList,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
 }
 
 fn now_unix_secs() -> anyhow::Result<u64> {
@@ -518,7 +542,7 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
 
     use super::*;
-    use crate::wire::MsgType;
+    use crate::wire::{ChunkHashList, GetChunkHashes, MsgType};
 
     struct TestDispatcher;
 
@@ -615,6 +639,18 @@ mod tests {
         async fn on_chunk_data(&mut self, _msg: ChunkData) -> anyhow::Result<DispatchResult> {
             Ok(DispatchResult::none())
         }
+        async fn on_get_chunk_hashes(
+            &mut self,
+            _msg: GetChunkHashes,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_chunk_hash_list(
+            &mut self,
+            _msg: ChunkHashList,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
     }
 
     #[tokio::test]
@@ -699,6 +735,9 @@ mod tests {
         .await
         .expect_err("should reject wrong expected pubkey");
         assert!(err.to_string().contains("remote pubkey mismatch"));
+        // Drop the client half so the server's read_frame gets an EOF
+        // instead of blocking forever waiting for the ClientAck.
+        drop(client_io);
         let _ = server_task.await;
     }
 

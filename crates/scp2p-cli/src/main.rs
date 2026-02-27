@@ -12,7 +12,7 @@ use scp2p_core::transport_net::tcp_connect_session;
 use scp2p_core::{
     describe_content, BoxedStream, Capabilities, DirectRequestTransport, FetchPolicy, ItemV1,
     ManifestV1, Node, NodeConfig, NodeId, PeerAddr, PeerConnector, SearchQuery, ShareId,
-    ShareKeypair, SqliteStore, Store, TransportProtocol,
+    ShareKeypair, ShareVisibility, SqliteStore, Store, TransportProtocol,
 };
 
 #[derive(Parser)]
@@ -81,6 +81,47 @@ enum Command {
         #[arg(long)]
         out: String,
         #[arg(long = "bootstrap", value_name = "IP:PORT", num_args = 1..)]
+        bootstrap: Vec<String>,
+    },
+    PublishFiles {
+        #[arg(long, default_value = "scp2p.db")]
+        state_db: String,
+        #[arg(long, default_value = "Shared Files")]
+        title: String,
+        /// One or more file paths to publish.
+        #[arg(long = "file", num_args = 1..)]
+        files: Vec<String>,
+        #[arg(long, default_value = "private")]
+        visibility: String,
+    },
+    PublishFolder {
+        #[arg(long, default_value = "scp2p.db")]
+        state_db: String,
+        #[arg(long, default_value = "Shared Folder")]
+        title: String,
+        /// Path to the directory to publish.
+        #[arg(long)]
+        dir: String,
+        #[arg(long, default_value = "private")]
+        visibility: String,
+    },
+    BrowseShare {
+        #[arg(long, default_value = "scp2p.db")]
+        state_db: String,
+        #[arg(long)]
+        share_id: String,
+    },
+    DownloadShare {
+        #[arg(long, default_value = "scp2p.db")]
+        state_db: String,
+        #[arg(long)]
+        share_id: String,
+        /// Optional content IDs to download selectively. Omit to download all.
+        #[arg(long = "content-id", num_args = 0..)]
+        content_ids: Vec<String>,
+        #[arg(long)]
+        out_dir: String,
+        #[arg(long = "bootstrap", value_name = "IP:PORT", num_args = 0..)]
         bootstrap: Vec<String>,
     },
 }
@@ -229,9 +270,11 @@ async fn main() -> anyhow::Result<()> {
                     content_id: content.content_id.0,
                     size: item_text.len() as u64,
                     name: item_name,
+                    path: None,
                     mime: Some("text/plain".into()),
                     tags: vec!["lan".into(), "test".into()],
-                    chunks: content.chunks,
+                    chunk_count: content.chunk_count,
+                    chunk_list_hash: content.chunk_list_hash,
                 }],
                 recommended_shares: vec![],
                 signature: None,
@@ -366,6 +409,122 @@ async fn main() -> anyhow::Result<()> {
                 out
             );
         }
+        Command::PublishFiles {
+            state_db,
+            title,
+            files,
+            visibility,
+        } => {
+            let node = open_node(&state_db, &[]).await?;
+            let vis = parse_visibility(&visibility)?;
+            let share = node.ensure_publisher_identity("default").await?;
+            let bind: SocketAddr = "0.0.0.0:7001".parse()?;
+            let provider = PeerAddr {
+                ip: "127.0.0.1".parse()?,
+                port: bind.port(),
+                transport: TransportProtocol::Tcp,
+                pubkey_hint: None,
+            };
+            let paths: Vec<std::path::PathBuf> =
+                files.iter().map(std::path::PathBuf::from).collect();
+            let manifest_id = node
+                .publish_files(
+                    &paths,
+                    None,
+                    &title,
+                    Some("published via scp2p-cli"),
+                    vis,
+                    &[],
+                    provider,
+                    &share,
+                )
+                .await?;
+            println!("share_id: {}", hex::encode(share.share_id().0));
+            println!(
+                "share_pubkey: {}",
+                hex::encode(share.verifying_key().to_bytes())
+            );
+            println!("manifest_id: {}", hex::encode(manifest_id));
+            println!("items: {}", files.len());
+        }
+        Command::PublishFolder {
+            state_db,
+            title,
+            dir,
+            visibility,
+        } => {
+            let node = open_node(&state_db, &[]).await?;
+            let vis = parse_visibility(&visibility)?;
+            let share = node.ensure_publisher_identity("default").await?;
+            let bind: SocketAddr = "0.0.0.0:7001".parse()?;
+            let provider = PeerAddr {
+                ip: "127.0.0.1".parse()?,
+                port: bind.port(),
+                transport: TransportProtocol::Tcp,
+                pubkey_hint: None,
+            };
+            let dir_path = std::path::Path::new(&dir);
+            let manifest_id = node
+                .publish_folder(
+                    dir_path,
+                    &title,
+                    Some("published via scp2p-cli"),
+                    vis,
+                    &[],
+                    provider,
+                    &share,
+                )
+                .await?;
+            println!("share_id: {}", hex::encode(share.share_id().0));
+            println!(
+                "share_pubkey: {}",
+                hex::encode(share.verifying_key().to_bytes())
+            );
+            println!("manifest_id: {}", hex::encode(manifest_id));
+        }
+        Command::BrowseShare { state_db, share_id } => {
+            let node = open_node(&state_db, &[]).await?;
+            let share_id = parse_hex_32(&share_id, "share_id")?;
+            let items = node.list_share_items(share_id).await?;
+            if items.is_empty() {
+                println!("no items in share");
+            } else {
+                println!("{} items:", items.len());
+                for (i, item) in items.iter().enumerate() {
+                    println!(
+                        "  [{}] content_id={} size={} name={} path={} mime={}",
+                        i + 1,
+                        hex::encode(item.content_id),
+                        item.size,
+                        item.name,
+                        item.path.as_deref().unwrap_or("-"),
+                        item.mime.as_deref().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        Command::DownloadShare {
+            state_db,
+            share_id,
+            content_ids,
+            out_dir,
+            bootstrap,
+        } => {
+            let node = open_node(&state_db, &bootstrap).await?;
+            let share_id = parse_hex_32(&share_id, "share_id")?;
+            let content_ids: Vec<[u8; 32]> = content_ids
+                .iter()
+                .map(|h| parse_hex_32(h, "content_id"))
+                .collect::<anyhow::Result<_>>()?;
+            let target = std::path::Path::new(&out_dir);
+            let downloaded = node
+                .download_share_items(share_id, &content_ids, target)
+                .await?;
+            println!("downloaded {} files to {}", downloaded.len(), out_dir);
+            for path in &downloaded {
+                println!("  {}", path.display());
+            }
+        }
     }
 
     Ok(())
@@ -414,4 +573,12 @@ fn parse_signing_key_hex(input: &str) -> anyhow::Result<SigningKey> {
 
 fn now_unix_secs() -> anyhow::Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+}
+
+fn parse_visibility(input: &str) -> anyhow::Result<ShareVisibility> {
+    match input.to_lowercase().as_str() {
+        "private" => Ok(ShareVisibility::Private),
+        "public" => Ok(ShareVisibility::Public),
+        _ => anyhow::bail!("visibility must be 'private' or 'public'"),
+    }
 }

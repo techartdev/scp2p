@@ -1,11 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
+    path::{Path, PathBuf},
     sync::atomic::{AtomicU32, Ordering},
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
+use anyhow::Context as _;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -20,10 +22,10 @@ use crate::{
     dht::{Dht, DhtNodeRecord, DhtValue, ALPHA, DEFAULT_TTL_SECS, K, MAX_VALUE_SIZE},
     dht_keys::{content_provider_key, share_head_key},
     ids::{ContentId, NodeId, ShareId},
-    manifest::{ManifestV1, PublicShareSummary, ShareHead, ShareKeypair, ShareVisibility},
+    manifest::{ItemV1, ManifestV1, PublicShareSummary, ShareHead, ShareKeypair, ShareVisibility},
     net_fetch::{
-        download_swarm_over_network, fetch_manifest_with_retry, FetchPolicy, PeerConnector,
-        RequestTransport,
+        download_swarm_over_network, fetch_chunk_hashes_with_retry, fetch_manifest_with_retry,
+        FetchPolicy, PeerConnector, RequestTransport,
     },
     peer::{PeerAddr, TransportProtocol},
     peer_db::PeerDb,
@@ -139,6 +141,16 @@ pub struct SearchResult {
 pub struct SearchPage {
     pub total: usize,
     pub results: Vec<SearchResult>,
+}
+
+/// Item metadata exposed to UIs for share browsing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareItemInfo {
+    pub content_id: [u8; 32],
+    pub size: u64,
+    pub name: String,
+    pub path: Option<String>,
+    pub mime: Option<String>,
 }
 
 #[derive(Clone)]
@@ -290,7 +302,9 @@ impl NodeState {
                     item.content_id,
                     ChunkedContent {
                         content_id: ContentId(item.content_id),
-                        chunks: item.chunks.clone(),
+                        chunks: vec![],
+                        chunk_count: item.chunk_count,
+                        chunk_list_hash: item.chunk_list_hash,
                     },
                 );
             }
@@ -1364,6 +1378,7 @@ impl NodeHandle {
         mut manifest: ManifestV1,
         publisher: &ShareKeypair,
     ) -> anyhow::Result<[u8; 32]> {
+        check_manifest_limits(&manifest)?;
         manifest.sign(publisher)?;
         manifest.verify()?;
         let manifest_id = manifest.manifest_id()?.0;
@@ -1434,6 +1449,193 @@ impl NodeHandle {
         Ok(content_id)
     }
 
+    /// Publish one or more files from disk as a single share.
+    ///
+    /// Each file becomes an `ItemV1` in the manifest.  If `base_dir` is
+    /// `Some`, then `ItemV1.path` is set to the path of the file relative to
+    /// `base_dir`; otherwise `path` is `None` and `name` is the plain
+    /// filename.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_files(
+        &self,
+        files: &[PathBuf],
+        base_dir: Option<&Path>,
+        title: &str,
+        description: Option<&str>,
+        visibility: ShareVisibility,
+        communities: &[[u8; 32]],
+        provider: PeerAddr,
+        publisher: &ShareKeypair,
+    ) -> anyhow::Result<[u8; 32]> {
+        let now = now_unix_secs()?;
+        let next_seq = self
+            .published_share_head(publisher.share_id())
+            .await
+            .map(|h| h.latest_seq.saturating_add(1))
+            .unwrap_or(1);
+
+        let mut items = Vec::with_capacity(files.len());
+        for file_path in files {
+            let bytes = tokio::fs::read(file_path)
+                .await
+                .with_context(|| format!("read {}", file_path.display()))?;
+            let desc = describe_content(&bytes);
+            let file_name = file_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let rel_path = match base_dir {
+                Some(base) => {
+                    let raw = file_path
+                        .strip_prefix(base)
+                        .with_context(|| {
+                            format!(
+                                "file {} is not under base {}",
+                                file_path.display(),
+                                base.display()
+                            )
+                        })?
+                        .to_string_lossy();
+                    Some(normalize_item_path(&raw)?)
+                }
+                None => None,
+            };
+            let mime = mime_from_extension(&file_name);
+            items.push(ItemV1 {
+                content_id: desc.content_id.0,
+                size: bytes.len() as u64,
+                name: file_name,
+                path: rel_path,
+                mime,
+                tags: vec![],
+                chunk_count: desc.chunk_count,
+                chunk_list_hash: desc.chunk_list_hash,
+            });
+            self.register_local_provider_content(provider.clone(), bytes)
+                .await?;
+        }
+
+        let manifest = ManifestV1 {
+            version: 1,
+            share_pubkey: publisher.verifying_key().to_bytes(),
+            share_id: publisher.share_id().0,
+            seq: next_seq,
+            created_at: now,
+            expires_at: None,
+            title: Some(title.to_owned()),
+            description: description.map(|d| d.to_owned()),
+            visibility,
+            communities: communities.to_vec(),
+            items,
+            recommended_shares: vec![],
+            signature: None,
+        };
+        self.publish_share(manifest, publisher).await
+    }
+
+    /// Publish an entire folder tree as a new share revision.
+    ///
+    /// Every file under `folder` is recursively collected, hashed, and
+    /// registered as a local provider.  Each item carries a `path`
+    /// relative to `folder`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_folder(
+        &self,
+        folder: &Path,
+        title: &str,
+        description: Option<&str>,
+        visibility: ShareVisibility,
+        communities: &[[u8; 32]],
+        provider: PeerAddr,
+        publisher: &ShareKeypair,
+    ) -> anyhow::Result<[u8; 32]> {
+        let files = collect_files_recursive(folder).await?;
+        if files.is_empty() {
+            anyhow::bail!("no files found under {}", folder.display());
+        }
+        self.publish_files(
+            &files,
+            Some(folder),
+            title,
+            description,
+            visibility,
+            communities,
+            provider,
+            publisher,
+        )
+        .await
+    }
+
+    /// List all items in a share manifest.
+    pub async fn list_share_items(&self, share_id: [u8; 32]) -> anyhow::Result<Vec<ShareItemInfo>> {
+        let state = self.state.read().await;
+        let head = state.published_share_heads.get(&share_id);
+
+        // Try to find the manifest from published heads first, then from
+        // the manifest cache keyed by any known manifest_id for this share.
+        let manifest = if let Some(head) = head {
+            state.manifest_cache.get(&head.latest_manifest_id)
+        } else {
+            // Walk subscriptions to find the manifest.
+            let sub = state.subscriptions.get(&share_id);
+            sub.and_then(|s| s.latest_manifest_id)
+                .and_then(|mid| state.manifest_cache.get(&mid))
+        };
+
+        let manifest = manifest.ok_or_else(|| anyhow::anyhow!("no manifest found for share"))?;
+
+        Ok(manifest
+            .items
+            .iter()
+            .map(|item| ShareItemInfo {
+                content_id: item.content_id,
+                size: item.size,
+                name: item.name.clone(),
+                path: item.path.clone(),
+                mime: item.mime.clone(),
+            })
+            .collect())
+    }
+
+    /// Selectively download specific items from a share by their content IDs.
+    ///
+    /// Files are written into `target_dir`, reproducing the `path` hierarchy
+    /// from the manifest when present.  If `content_ids` is empty, all items
+    /// in the share are downloaded.
+    pub async fn download_share_items(
+        &self,
+        share_id: [u8; 32],
+        content_ids: &[[u8; 32]],
+        target_dir: &Path,
+    ) -> anyhow::Result<Vec<PathBuf>> {
+        let items = self.list_share_items(share_id).await?;
+        let to_download: Vec<&ShareItemInfo> = if content_ids.is_empty() {
+            items.iter().collect()
+        } else {
+            items
+                .iter()
+                .filter(|item| content_ids.contains(&item.content_id))
+                .collect()
+        };
+        if to_download.is_empty() {
+            anyhow::bail!("no matching items found in share");
+        }
+
+        let mut downloaded = Vec::with_capacity(to_download.len());
+        for item in to_download {
+            let rel = item.path.as_deref().unwrap_or(&item.name);
+            let dest = validate_download_path(target_dir, rel)?;
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            self.download(item.content_id, &dest.to_string_lossy())
+                .await?;
+            downloaded.push(dest);
+        }
+        Ok(downloaded)
+    }
+
     pub async fn sync_subscriptions(&self) -> anyhow::Result<()> {
         let mut state = self.state.write().await;
         let now = now_unix_secs()?;
@@ -1477,7 +1679,9 @@ impl NodeHandle {
             for item in &manifest.items {
                 let content = ChunkedContent {
                     content_id: ContentId(item.content_id),
-                    chunks: item.chunks.clone(),
+                    chunks: vec![],
+                    chunk_count: item.chunk_count,
+                    chunk_list_hash: item.chunk_list_hash,
                 };
                 state.content_catalog.insert(item.content_id, content);
             }
@@ -1565,7 +1769,9 @@ impl NodeHandle {
                 for item in &manifest.items {
                     let content = ChunkedContent {
                         content_id: ContentId(item.content_id),
-                        chunks: item.chunks.clone(),
+                        chunks: vec![],
+                        chunk_count: item.chunk_count,
+                        chunk_list_hash: item.chunk_list_hash,
                     };
                     state.content_catalog.insert(item.content_id, content);
                 }
@@ -1775,7 +1981,7 @@ impl NodeHandle {
             PersistedPartialDownload {
                 content_id,
                 target_path: target_path.to_owned(),
-                total_chunks: content.chunks.len() as u32,
+                total_chunks: content.chunk_count,
                 completed_chunks: vec![],
             },
         );
@@ -1829,7 +2035,7 @@ impl NodeHandle {
                 PersistedPartialDownload {
                     content_id,
                     target_path: target_path.to_owned(),
-                    total_chunks: content.chunks.len() as u32,
+                    total_chunks: content.chunk_count,
                     completed_chunks: vec![],
                 },
             );
@@ -1837,8 +2043,24 @@ impl NodeHandle {
         };
         persist_state(self).await?;
 
+        // Pattern B: chunk hashes are not stored in the manifest.
+        // If content_catalog has empty chunks (subscribed content), fetch them on demand.
+        let chunk_hashes = if content.chunks.is_empty() && content.chunk_count > 0 {
+            fetch_chunk_hashes_with_retry(
+                connector,
+                peers,
+                content_id,
+                content.chunk_count,
+                content.chunk_list_hash,
+                policy,
+            )
+            .await?
+        } else {
+            content.chunks.clone()
+        };
+
         let bytes =
-            download_swarm_over_network(connector, peers, content_id, &content.chunks, policy)
+            download_swarm_over_network(connector, peers, content_id, &chunk_hashes, policy)
                 .await?;
         std::fs::write(target_path, bytes)?;
         {
@@ -2047,6 +2269,26 @@ impl NodeHandle {
                     flags: FLAG_RESPONSE,
                     payload,
                 }),
+            WirePayload::GetChunkHashes(msg) => self
+                .chunk_hash_list(msg.content_id)
+                .await
+                .and_then(|maybe| {
+                    maybe
+                        .ok_or_else(|| anyhow::anyhow!("chunk hashes not found"))
+                        .and_then(|hashes| {
+                            serde_cbor::to_vec(&crate::wire::ChunkHashList {
+                                content_id: msg.content_id,
+                                hashes,
+                            })
+                            .map_err(Into::into)
+                        })
+                })
+                .map(|payload| Envelope {
+                    r#type: MsgType::ChunkHashList as u16,
+                    req_id,
+                    flags: FLAG_RESPONSE,
+                    payload,
+                }),
             WirePayload::RelayRegister(RelayRegister { relay_slot_id }) => {
                 let Some(peer) = remote_peer else {
                     return Some(error_envelope(
@@ -2138,6 +2380,18 @@ impl NodeHandle {
         }
         let end = ((idx + 1) * crate::content::CHUNK_SIZE).min(bytes.len());
         Ok(Some(bytes[start..end].to_vec()))
+    }
+
+    /// Return the chunk hash list for a locally-stored content object.
+    async fn chunk_hash_list(&self, content_id: [u8; 32]) -> anyhow::Result<Option<Vec<[u8; 32]>>> {
+        let state = self.state.read().await;
+        Ok(state.content_catalog.get(&content_id).and_then(|c| {
+            if c.chunks.is_empty() {
+                None
+            } else {
+                Some(c.chunks.clone())
+            }
+        }))
     }
 
     async fn collect_seed_and_known_node_peers(
@@ -2248,7 +2502,8 @@ fn request_class(payload: &WirePayload) -> RequestClass {
         | WirePayload::ListPublicShares(_)
         | WirePayload::GetCommunityStatus(_)
         | WirePayload::ListCommunityPublicShares(_)
-        | WirePayload::GetChunk(_) => RequestClass::Fetch,
+        | WirePayload::GetChunk(_)
+        | WirePayload::GetChunkHashes(_) => RequestClass::Fetch,
         WirePayload::RelayRegister(_)
         | WirePayload::RelayConnect(_)
         | WirePayload::RelayStream(_) => RequestClass::Relay,
@@ -2525,6 +2780,182 @@ fn error_envelope(message_type: u16, req_id: u32, message: &str) -> Envelope {
         flags: FLAG_RESPONSE | FLAG_ERROR,
         payload: message.as_bytes().to_vec(),
     }
+}
+// Path-safety helpers (GPT-5.2 hardening)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of items allowed in a single manifest.
+const MAX_MANIFEST_ITEMS: usize = 10_000;
+
+/// Maximum total number of chunk hashes across all items in a manifest.
+const MAX_MANIFEST_CHUNK_HASHES: usize = 100_000;
+
+/// Maximum byte length of a normalised path.
+const MAX_PATH_BYTES: usize = 1024;
+
+/// Normalise a relative path for inclusion in a manifest item.
+///
+/// Rules:
+/// - Separator normalised to `/` (Windows `\` → `/`).
+/// - Leading `/` stripped (paths are always relative).
+/// - `.` (current-dir) segments removed.
+/// - `..` segments rejected outright.
+/// - Empty segments (consecutive `/`) collapsed.
+/// - Drive-letter prefixes like `C:` rejected.
+/// - Result must be non-empty and within [`MAX_PATH_BYTES`].
+fn normalize_item_path(raw: &str) -> anyhow::Result<String> {
+    let unified = raw.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+
+    for seg in unified.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            anyhow::bail!("path contains disallowed '..' segment: {raw}");
+        }
+        // Reject Windows drive letters like "C:" at the start.
+        if parts.is_empty() && seg.len() == 2 && seg.as_bytes()[1] == b':' {
+            let letter = seg.as_bytes()[0];
+            if letter.is_ascii_alphabetic() {
+                anyhow::bail!("path contains drive letter prefix: {raw}");
+            }
+        }
+        parts.push(seg);
+    }
+
+    if parts.is_empty() {
+        anyhow::bail!("path is empty after normalisation: {raw}");
+    }
+
+    let result = parts.join("/");
+    if result.len() > MAX_PATH_BYTES {
+        anyhow::bail!(
+            "normalised path exceeds {MAX_PATH_BYTES} bytes ({} bytes): {result}",
+            result.len()
+        );
+    }
+    Ok(result)
+}
+
+/// Validate that a path from a manifest is safe to join onto a target
+/// directory for file creation.  Returns the canonical destination path
+/// that is guaranteed to reside under `target_dir`.
+fn validate_download_path(target_dir: &Path, rel: &str) -> anyhow::Result<PathBuf> {
+    // First, re-normalise to catch anything stored maliciously.
+    let normalised = normalize_item_path(rel)?;
+    let dest = target_dir.join(&normalised);
+
+    // Canonicalize `target_dir` first (it must exist).  We cannot
+    // canonicalize `dest` because it doesn't exist yet, so we verify
+    // component-by-component that no traversal occurs.
+    //
+    // Belt-and-suspenders: after joining, verify the resulting path
+    // starts with `target_dir`.  On Windows `Path::starts_with` also
+    // handles UNC vs drive-letter edge cases.
+    let canon_target = if target_dir.exists() {
+        std::fs::canonicalize(target_dir)?
+    } else {
+        target_dir.to_path_buf()
+    };
+
+    // Build canonical destination by joining each segment one at a time.
+    let mut check = canon_target.clone();
+    for component in std::path::Path::new(&normalised).components() {
+        match component {
+            std::path::Component::Normal(seg) => check.push(seg),
+            _ => anyhow::bail!("unexpected path component in: {normalised}"),
+        }
+    }
+
+    if !check.starts_with(&canon_target) {
+        anyhow::bail!("path escapes target directory: {normalised}");
+    }
+
+    Ok(dest)
+}
+
+/// Validate manifest item counts against protocol limits.
+fn check_manifest_limits(manifest: &ManifestV1) -> anyhow::Result<()> {
+    if manifest.items.len() > MAX_MANIFEST_ITEMS {
+        anyhow::bail!(
+            "manifest has {} items, exceeding limit of {MAX_MANIFEST_ITEMS}",
+            manifest.items.len()
+        );
+    }
+    let total_chunks: u32 = manifest.items.iter().map(|i| i.chunk_count).sum();
+    if total_chunks > MAX_MANIFEST_CHUNK_HASHES as u32 {
+        anyhow::bail!(
+            "manifest has {total_chunks} total chunk hashes, exceeding limit of {MAX_MANIFEST_CHUNK_HASHES}"
+        );
+    }
+    Ok(())
+}
+
+/// Recursively collect all file paths under `dir`, skipping directories.
+async fn collect_files_recursive(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut result = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&current).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let ft = entry.file_type().await?;
+            if ft.is_dir() {
+                stack.push(entry.path());
+            } else if ft.is_file() {
+                result.push(entry.path());
+            }
+            // skip symlinks for safety
+        }
+    }
+    result.sort();
+    Ok(result)
+}
+
+/// Best-effort MIME type from file extension.
+fn mime_from_extension(filename: &str) -> Option<String> {
+    let ext = filename.rsplit('.').next()?.to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "txt" | "text" => "text/plain",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "js" | "mjs" => "application/javascript",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        "md" | "markdown" => "text/markdown",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "gzip" => "application/gzip",
+        "tar" => "application/x-tar",
+        "7z" => "application/x-7z-compressed",
+        "rar" => "application/vnd.rar",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "mp3" => "audio/mpeg",
+        "ogg" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "mp4" => "video/mp4",
+        "mkv" => "video/x-matroska",
+        "webm" => "video/webm",
+        "avi" => "video/x-msvideo",
+        "mov" => "video/quicktime",
+        "wasm" => "application/wasm",
+        "toml" => "application/toml",
+        "yaml" | "yml" => "application/x-yaml",
+        "rs" => "text/x-rust",
+        "py" => "text/x-python",
+        "ts" | "tsx" => "text/typescript",
+        "exe" => "application/vnd.microsoft.portable-executable",
+        "bin" | "dat" => "application/octet-stream",
+        _ => return None,
+    };
+    Some(mime.to_owned())
 }
 
 #[cfg(test)]
@@ -3131,9 +3562,11 @@ mod tests {
                 content_id: [77u8; 32],
                 size: 123,
                 name: "runtime-test-item".into(),
+                path: None,
                 mime: None,
                 tags: vec!["runtime".into()],
-                chunks: vec![],
+                chunk_count: 0,
+                chunk_list_hash: [0u8; 32],
             }],
             recommended_shares: vec![],
             signature: None,
@@ -3230,9 +3663,11 @@ mod tests {
                 content_id: desc.content_id.0,
                 size: payload.len() as u64,
                 name: "runtime-content.bin".into(),
+                path: None,
                 mime: None,
                 tags: vec!["runtime".into(), "content".into()],
-                chunks: desc.chunks.clone(),
+                chunk_count: desc.chunk_count,
+                chunk_list_hash: desc.chunk_list_hash,
             }],
             recommended_shares: vec![],
             signature: None,
@@ -3363,9 +3798,11 @@ mod tests {
                 content_id: desc_v1.content_id.0,
                 size: payload_v1.len() as u64,
                 name: "churn-v1.bin".into(),
+                path: None,
                 mime: None,
                 tags: vec!["churn".into(), "v1".into()],
-                chunks: desc_v1.chunks.clone(),
+                chunk_count: desc_v1.chunk_count,
+                chunk_list_hash: desc_v1.chunk_list_hash,
             }],
             recommended_shares: vec![],
             signature: None,
@@ -3450,9 +3887,11 @@ mod tests {
                 content_id: desc_v2.content_id.0,
                 size: payload_v2.len() as u64,
                 name: "churn-v2.bin".into(),
+                path: None,
                 mime: None,
                 tags: vec!["churn".into(), "v2".into()],
-                chunks: desc_v2.chunks.clone(),
+                chunk_count: desc_v2.chunk_count,
+                chunk_list_hash: desc_v2.chunk_list_hash,
             }],
             recommended_shares: vec![],
             signature: None,
@@ -3657,9 +4096,11 @@ mod tests {
                     content_id: desc.content_id.0,
                     size: payload.len() as u64,
                     name: format!("soak-item-{seq}.bin"),
+                    path: None,
                     mime: None,
                     tags: vec!["soak".into(), format!("seq-{seq}")],
-                    chunks: desc.chunks.clone(),
+                    chunk_count: desc.chunk_count,
+                    chunk_list_hash: desc.chunk_list_hash,
                 }],
                 recommended_shares: vec![],
                 signature: None,
@@ -4192,9 +4633,11 @@ mod tests {
                     },
                     size: 10,
                     name: format!("movie {title}"),
+                    path: None,
                     mime: None,
                     tags: vec!["movie".into()],
-                    chunks: vec![],
+                    chunk_count: 0,
+                    chunk_list_hash: [0u8; 32],
                 }],
                 recommended_shares: vec![],
                 signature: None,
@@ -4256,9 +4699,11 @@ mod tests {
                     content_id,
                     size: 1,
                     name: "movie trust".into(),
+                    path: None,
                     mime: None,
                     tags: vec!["movie".into()],
-                    chunks: vec![],
+                    chunk_count: 0,
+                    chunk_list_hash: [0u8; 32],
                 }],
                 recommended_shares: vec![],
                 signature: None,
@@ -4321,9 +4766,11 @@ mod tests {
                     content_id: [20 + idx; 32],
                     size: 1,
                     name: format!("movie-{}.mkv", idx + 1),
+                    path: None,
                     mime: None,
                     tags: vec!["movie".into(), "trusted".into()],
-                    chunks: vec![],
+                    chunk_count: 0,
+                    chunk_list_hash: [0u8; 32],
                 }],
                 recommended_shares: vec![],
                 signature: None,
@@ -4423,9 +4870,11 @@ mod tests {
                     content_id,
                     size: 1,
                     name: name.into(),
+                    path: None,
                     mime: None,
                     tags: vec!["movie".into()],
-                    chunks: vec![],
+                    chunk_count: 0,
+                    chunk_list_hash: [0u8; 32],
                 }],
                 recommended_shares: vec![],
                 signature: None,
