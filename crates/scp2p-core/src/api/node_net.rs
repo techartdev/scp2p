@@ -32,7 +32,7 @@ use crate::{
 
 use super::{
     helpers::{
-        build_search_snippet, error_envelope, merge_peer_list, now_unix_secs, peer_key,
+        build_search_snippet, error_envelope, merge_peer_list, now_unix_secs,
         persist_state, request_class, validate_dht_value_for_known_keyspaces,
     },
     NodeHandle, SearchPage, SearchPageQuery, SearchQuery, SearchResult, SearchTrustFilter,
@@ -369,9 +369,10 @@ impl NodeHandle {
             .into_iter()
             .filter_map(|peer| {
                 state
-                    .provider_payloads
-                    .get(&(peer_key(&peer), content_id))
-                    .cloned()
+                    .content_blobs
+                    .read_full(&content_id)
+                    .ok()
+                    .flatten()
                     .map(|content_bytes| ChunkProvider {
                         peer,
                         content_bytes,
@@ -768,21 +769,7 @@ impl NodeHandle {
         chunk_index: u32,
     ) -> anyhow::Result<Option<Vec<u8>>> {
         let state = self.state.read().await;
-        let source = state
-            .provider_payloads
-            .iter()
-            .find(|((_, cid), _)| *cid == content_id)
-            .map(|(_, bytes)| bytes.clone());
-        let Some(bytes) = source else {
-            return Ok(None);
-        };
-        let idx = chunk_index as usize;
-        let start = idx.saturating_mul(crate::content::CHUNK_SIZE);
-        if start >= bytes.len() {
-            return Ok(None);
-        }
-        let end = ((idx + 1) * crate::content::CHUNK_SIZE).min(bytes.len());
-        Ok(Some(bytes[start..end].to_vec()))
+        state.content_blobs.read_chunk(&content_id, chunk_index)
     }
 
     /// Return the chunk hash list for a locally-stored content object.

@@ -95,10 +95,12 @@ impl DesktopAppState {
         let store: Arc<dyn Store> = SqliteStore::open(&db_path)
             .with_context(|| format!("open sqlite state at {}", db_path.display()))?;
 
+        let blob_dir = db_path.parent().map(|p| p.join("content_blobs"));
         let config = NodeConfig {
             bind_quic: request.bind_quic,
             bind_tcp: request.bind_tcp,
             bootstrap_peers: request.bootstrap_peers,
+            blob_dir,
             ..NodeConfig::default()
         };
 

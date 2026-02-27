@@ -184,9 +184,10 @@ Implemented:
   - Native folder picker for download destination
   - Download progress + completion modal with file list
 
-Remaining work:
-- On-disk chunk serving (stream from file instead of holding full payload in RAM)
-  for large files — current approach buffers content in `provider_payloads`
+All section F work is complete. On-disk chunk serving was the last item:
+`ContentBlobStore` abstraction added (`blob_store.rs`); file-backed mode writes
+blobs to `{blob_dir}/{hex(content_id)}.blob` and serves chunks via seek
+(256 KiB per read). In-memory fallback preserved for tests.
 
 ## 4. Relay Expansion Plan
 

@@ -5,6 +5,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 pub mod api;
+pub mod blob_store;
 pub mod capabilities;
 pub mod config;
 pub mod content;
@@ -27,6 +28,7 @@ pub use api::{
     AbuseLimits, BlocklistRules, Node, NodeHandle, SearchPage, SearchPageQuery, SearchQuery,
     SearchResult, SearchTrustFilter, ShareItemInfo, SubscriptionTrustLevel,
 };
+pub use blob_store::ContentBlobStore;
 pub use capabilities::Capabilities;
 pub use config::NodeConfig;
 pub use content::{

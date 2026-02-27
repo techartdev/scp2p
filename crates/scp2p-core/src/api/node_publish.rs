@@ -23,7 +23,7 @@ use crate::{
 use super::{
     helpers::{
         check_manifest_limits, collect_files_recursive, mime_from_extension, normalize_item_path,
-        now_unix_secs, peer_key, persist_state, validate_download_path,
+        now_unix_secs, persist_state, validate_download_path,
     },
     NodeHandle, ShareItemInfo,
 };
@@ -76,9 +76,7 @@ impl NodeHandle {
         let mut state = self.state.write().await;
 
         state.content_catalog.insert(content_id, desc);
-        state
-            .provider_payloads
-            .insert((peer_key(&peer), content_id), content_bytes);
+        state.content_blobs.store(content_id, content_bytes)?;
 
         let mut providers: Providers = state
             .dht

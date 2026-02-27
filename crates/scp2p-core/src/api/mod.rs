@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
+    blob_store::ContentBlobStore,
     config::NodeConfig,
     content::ChunkedContent,
     dht::{Dht, DEFAULT_TTL_SECS},
@@ -166,7 +167,7 @@ struct NodeState {
     search_index: SearchIndex,
     share_weights: HashMap<[u8; 32], f32>,
     content_catalog: HashMap<[u8; 32], ChunkedContent>,
-    provider_payloads: HashMap<(String, [u8; 32]), Vec<u8>>,
+    content_blobs: ContentBlobStore,
     relay: RelayManager,
     relay_scores: HashMap<String, i32>,
     relay_rotation_cursor: usize,
@@ -237,7 +238,7 @@ impl Node {
         store: Arc<dyn Store>,
     ) -> anyhow::Result<NodeHandle> {
         let persisted = store.load_state().await?;
-        let state = NodeState::from_persisted(config, persisted, store);
+        let state = NodeState::from_persisted(config, persisted, store)?;
         Ok(NodeHandle {
             state: Arc::new(RwLock::new(state)),
         })
@@ -249,7 +250,7 @@ impl NodeState {
         runtime_config: NodeConfig,
         persisted: PersistedState,
         store: Arc<dyn Store>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let PersistedState {
             peers,
             subscriptions,
@@ -325,7 +326,12 @@ impl NodeState {
             }
         }
 
-        Self {
+        let content_blobs = match &runtime_config.blob_dir {
+            Some(dir) => ContentBlobStore::on_disk(dir.clone())?,
+            None => ContentBlobStore::in_memory(),
+        };
+
+        Ok(Self {
             runtime_config,
             subscriptions,
             communities,
@@ -337,7 +343,7 @@ impl NodeState {
             search_index,
             share_weights,
             content_catalog,
-            provider_payloads: HashMap::new(),
+            content_blobs,
             relay: RelayManager::default(),
             relay_scores: HashMap::new(),
             relay_rotation_cursor: 0,
@@ -348,7 +354,7 @@ impl NodeState {
             enabled_blocklist_shares: enabled_blocklist_shares.into_iter().collect(),
             blocklist_rules_by_share,
             store,
-        }
+        })
     }
 
     fn to_persisted(&self) -> PersistedState {
