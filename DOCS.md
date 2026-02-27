@@ -244,7 +244,7 @@ The API is currently centered around `Node` and `NodeHandle`.
   - search index snapshot
   - partial download records
   - encrypted node key material
-- Sqlite backend uses normalized tables (`peers`, `subscriptions`, `manifests`, `share_weights`, `partial_downloads`, `metadata`) with legacy snapshot compatibility fallback
+- Sqlite backend uses normalized tables (`peers`, `subscriptions`, `manifests`, `share_weights`, `partial_downloads`, `metadata`) with schema versioning
 
 ## 6. Current limitations
 

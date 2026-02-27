@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -24,6 +24,9 @@ use crate::{
 };
 
 const KEY_KDF_ITERATIONS: u32 = 120_000;
+
+/// Bump when making schema changes; migrations are applied in order.
+const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedState {
@@ -118,6 +121,7 @@ impl SqliteStore {
 
     fn ensure_schema(&self) -> anyhow::Result<()> {
         let conn = self.open_connection()?;
+        // Always create the baseline tables (idempotent).
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS peers (
                 addr_key TEXT PRIMARY KEY,
@@ -145,13 +149,32 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS metadata (
                 key TEXT PRIMARY KEY,
                 payload BLOB NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS scp2p_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                payload BLOB NOT NULL
             );",
         )?;
-        ensure_subscription_trust_column(&conn)?;
+
+        // Read (or initialise) schema version.
+        let current_version: u32 = conn
+            .query_row(
+                "SELECT payload FROM metadata WHERE key = 'schema_version'",
+                [],
+                |row| {
+                    let blob: Vec<u8> = row.get(0)?;
+                    Ok(u32::from_le_bytes(
+                        blob.try_into()
+                            .unwrap_or([0, 0, 0, 0]),
+                    ))
+                },
+            )
+            .unwrap_or(0);
+
+        // Persist the schema version.
+        if current_version != CURRENT_SCHEMA_VERSION {
+            conn.execute(
+                "INSERT INTO metadata(key, payload) VALUES('schema_version', ?1)
+                 ON CONFLICT(key) DO UPDATE SET payload = excluded.payload",
+                params![CURRENT_SCHEMA_VERSION.to_le_bytes().to_vec()],
+            )?;
+        }
         Ok(())
     }
 }
@@ -171,319 +194,323 @@ impl Store for MemoryStore {
 #[async_trait]
 impl Store for SqliteStore {
     async fn load_state(&self) -> anyhow::Result<PersistedState> {
-        self.ensure_schema()?;
-        let conn = self.open_connection()?;
-        let mut state = PersistedState::default();
-
-        {
-            let mut stmt = conn.prepare("SELECT payload FROM peers")?;
-            let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
-            for row in rows {
-                let record: PeerRecord = serde_cbor::from_slice(&row?)?;
-                state.peers.push(record);
-            }
-        }
-
-        {
-            let mut stmt = conn.prepare(
-                "SELECT share_id, share_pubkey, latest_seq, latest_manifest_id, trust_level FROM subscriptions",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, u64>(2)?,
-                    row.get::<_, Option<Vec<u8>>>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })?;
-            for row in rows {
-                let (share_id, share_pubkey, latest_seq, latest_manifest_id, trust_level) = row?;
-                state.subscriptions.push(PersistedSubscription {
-                    share_id: blob_to_array::<32>(&share_id, "subscriptions.share_id")?,
-                    share_pubkey: share_pubkey
-                        .map(|v| blob_to_array::<32>(&v, "subscriptions.share_pubkey"))
-                        .transpose()?,
-                    latest_seq,
-                    latest_manifest_id: latest_manifest_id
-                        .map(|v| blob_to_array::<32>(&v, "subscriptions.latest_manifest_id"))
-                        .transpose()?,
-                    trust_level: parse_trust_level(&trust_level),
-                });
-            }
-        }
-
-        state.communities = conn
-            .query_row(
-                "SELECT payload FROM metadata WHERE key = 'communities'",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .map(|payload| serde_cbor::from_slice(&payload))
-            .transpose()?
-            .unwrap_or_default();
-
-        state.publisher_identities = conn
-            .query_row(
-                "SELECT payload FROM metadata WHERE key = 'publisher_identities'",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .map(|payload| serde_cbor::from_slice(&payload))
-            .transpose()?
-            .unwrap_or_default();
-
-        {
-            let mut stmt = conn.prepare("SELECT manifest_id, payload FROM manifests")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?;
-            for row in rows {
-                let (manifest_id, payload) = row?;
-                let manifest: ManifestV1 = serde_cbor::from_slice(&payload)?;
-                state.manifests.insert(
-                    blob_to_array::<32>(&manifest_id, "manifests.manifest_id")?,
-                    manifest,
-                );
-            }
-        }
-
-        {
-            let mut stmt = conn.prepare("SELECT share_id, weight FROM share_weights")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, f32>(1)?))
-            })?;
-            for row in rows {
-                let (share_id, weight) = row?;
-                state.share_weights.insert(
-                    blob_to_array::<32>(&share_id, "share_weights.share_id")?,
-                    weight,
-                );
-            }
-        }
-
-        {
-            let mut stmt = conn.prepare("SELECT content_id, payload FROM partial_downloads")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?;
-            for row in rows {
-                let (content_id, payload) = row?;
-                let partial: PersistedPartialDownload = serde_cbor::from_slice(&payload)?;
-                state.partial_downloads.insert(
-                    blob_to_array::<32>(&content_id, "partial_downloads.content_id")?,
-                    partial,
-                );
-            }
-        }
-
-        state.search_index = conn
-            .query_row(
-                "SELECT payload FROM metadata WHERE key = 'search_index'",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .map(|payload| serde_cbor::from_slice(&payload))
-            .transpose()?;
-
-        state.share_heads = conn
-            .query_row(
-                "SELECT payload FROM metadata WHERE key = 'share_heads'",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .map(|payload| serde_cbor::from_slice(&payload))
-            .transpose()?
-            .unwrap_or_default();
-
-        state.encrypted_node_key = conn
-            .query_row(
-                "SELECT payload FROM metadata WHERE key = 'encrypted_node_key'",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .map(|payload| serde_cbor::from_slice(&payload))
-            .transpose()?;
-
-        state.enabled_blocklist_shares = conn
-            .query_row(
-                "SELECT payload FROM metadata WHERE key = 'enabled_blocklist_shares'",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .map(|payload| serde_cbor::from_slice(&payload))
-            .transpose()?
-            .unwrap_or_default();
-
-        state.blocklist_rules_by_share = conn
-            .query_row(
-                "SELECT payload FROM metadata WHERE key = 'blocklist_rules_by_share'",
-                [],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .optional()?
-            .map(|payload| serde_cbor::from_slice(&payload))
-            .transpose()?
-            .unwrap_or_default();
-
-        let has_normalized_data = !state.peers.is_empty()
-            || !state.subscriptions.is_empty()
-            || !state.communities.is_empty()
-            || !state.publisher_identities.is_empty()
-            || !state.manifests.is_empty()
-            || !state.share_heads.is_empty()
-            || !state.share_weights.is_empty()
-            || !state.partial_downloads.is_empty()
-            || state.search_index.is_some()
-            || state.encrypted_node_key.is_some()
-            || !state.enabled_blocklist_shares.is_empty()
-            || !state.blocklist_rules_by_share.is_empty();
-        if has_normalized_data {
-            return Ok(state);
-        }
-
-        // Backward-compatible fallback for older single-row snapshot format.
-        let maybe_payload: Option<Vec<u8>> = conn
-            .query_row("SELECT payload FROM scp2p_state WHERE id = 1", [], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        if let Some(payload) = maybe_payload {
-            return Ok(serde_cbor::from_slice(&payload)?);
-        }
-        Ok(state)
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = SqliteStore { path };
+            store.ensure_schema()?;
+            let conn = store.open_connection()?;
+            load_state_sync(&conn)
+        })
+        .await?
     }
 
     async fn save_state(&self, state: &PersistedState) -> anyhow::Result<()> {
-        self.ensure_schema()?;
-        let mut conn = self.open_connection()?;
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM peers", [])?;
-        tx.execute("DELETE FROM subscriptions", [])?;
-        tx.execute("DELETE FROM manifests", [])?;
-        tx.execute("DELETE FROM share_weights", [])?;
-        tx.execute("DELETE FROM partial_downloads", [])?;
-        tx.execute("DELETE FROM metadata", [])?;
-
-        for peer in &state.peers {
-            let addr_key = format!(
-                "{}:{}:{:?}",
-                peer.addr.ip, peer.addr.port, peer.addr.transport
-            );
-            tx.execute(
-                "INSERT INTO peers(addr_key, payload) VALUES(?1, ?2)",
-                params![addr_key, serde_cbor::to_vec(peer)?],
-            )?;
-        }
-
-        for sub in &state.subscriptions {
-            tx.execute(
-                "INSERT INTO subscriptions(share_id, share_pubkey, latest_seq, latest_manifest_id, trust_level)
-                 VALUES(?1, ?2, ?3, ?4, ?5)",
-                params![
-                    sub.share_id.to_vec(),
-                    sub.share_pubkey.map(|v| v.to_vec()),
-                    sub.latest_seq,
-                    sub.latest_manifest_id.map(|v| v.to_vec()),
-                    trust_level_str(sub.trust_level),
-                ],
-            )?;
-        }
-        if !state.communities.is_empty() {
-            tx.execute(
-                "INSERT INTO metadata(key, payload) VALUES('communities', ?1)",
-                params![serde_cbor::to_vec(&state.communities)?],
-            )?;
-        }
-        if !state.publisher_identities.is_empty() {
-            tx.execute(
-                "INSERT INTO metadata(key, payload) VALUES('publisher_identities', ?1)",
-                params![serde_cbor::to_vec(&state.publisher_identities)?],
-            )?;
-        }
-
-        for (manifest_id, manifest) in &state.manifests {
-            tx.execute(
-                "INSERT INTO manifests(manifest_id, payload) VALUES(?1, ?2)",
-                params![manifest_id.to_vec(), serde_cbor::to_vec(manifest)?],
-            )?;
-        }
-
-        for (share_id, weight) in &state.share_weights {
-            tx.execute(
-                "INSERT INTO share_weights(share_id, weight) VALUES(?1, ?2)",
-                params![share_id.to_vec(), weight],
-            )?;
-        }
-
-        for (content_id, partial) in &state.partial_downloads {
-            tx.execute(
-                "INSERT INTO partial_downloads(content_id, payload) VALUES(?1, ?2)",
-                params![content_id.to_vec(), serde_cbor::to_vec(partial)?],
-            )?;
-        }
-
-        if let Some(snapshot) = &state.search_index {
-            tx.execute(
-                "INSERT INTO metadata(key, payload) VALUES('search_index', ?1)",
-                params![serde_cbor::to_vec(snapshot)?],
-            )?;
-        }
-        if !state.share_heads.is_empty() {
-            tx.execute(
-                "INSERT INTO metadata(key, payload) VALUES('share_heads', ?1)",
-                params![serde_cbor::to_vec(&state.share_heads)?],
-            )?;
-        }
-        if let Some(encrypted_key) = &state.encrypted_node_key {
-            tx.execute(
-                "INSERT INTO metadata(key, payload) VALUES('encrypted_node_key', ?1)",
-                params![serde_cbor::to_vec(encrypted_key)?],
-            )?;
-        }
-        if !state.enabled_blocklist_shares.is_empty() {
-            tx.execute(
-                "INSERT INTO metadata(key, payload) VALUES('enabled_blocklist_shares', ?1)",
-                params![serde_cbor::to_vec(&state.enabled_blocklist_shares)?],
-            )?;
-        }
-        if !state.blocklist_rules_by_share.is_empty() {
-            tx.execute(
-                "INSERT INTO metadata(key, payload) VALUES('blocklist_rules_by_share', ?1)",
-                params![serde_cbor::to_vec(&state.blocklist_rules_by_share)?],
-            )?;
-        }
-
-        // Legacy compatibility snapshot (can be removed in a later migration window).
-        let payload = serde_cbor::to_vec(state)?;
-        tx.execute(
-            "INSERT INTO scp2p_state(id, payload) VALUES(1, ?1)
-             ON CONFLICT(id) DO UPDATE SET payload = excluded.payload",
-            params![payload],
-        )?;
-        tx.commit()?;
-        Ok(())
+        let path = self.path.clone();
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let store = SqliteStore { path };
+            store.ensure_schema()?;
+            let mut conn = store.open_connection()?;
+            save_state_sync(&mut conn, &state)
+        })
+        .await?
     }
 }
 
-fn ensure_subscription_trust_column(conn: &Connection) -> anyhow::Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(subscriptions)")?;
-    let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-    for column in columns {
-        if column? == "trust_level" {
-            return Ok(());
+/// All SQLite reads happen here, on a blocking thread.
+fn load_state_sync(conn: &Connection) -> anyhow::Result<PersistedState> {
+    let mut state = PersistedState::default();
+
+    {
+        let mut stmt = conn.prepare("SELECT payload FROM peers")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        for row in rows {
+            let record: PeerRecord = serde_cbor::from_slice(&row?)?;
+            state.peers.push(record);
         }
     }
-    conn.execute(
-        "ALTER TABLE subscriptions ADD COLUMN trust_level TEXT NOT NULL DEFAULT 'normal'",
-        [],
+
+    {
+        let mut stmt = conn.prepare(
+            "SELECT share_id, share_pubkey, latest_seq, latest_manifest_id, trust_level FROM subscriptions",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (share_id, share_pubkey, latest_seq, latest_manifest_id, trust_level) = row?;
+            state.subscriptions.push(PersistedSubscription {
+                share_id: blob_to_array::<32>(&share_id, "subscriptions.share_id")?,
+                share_pubkey: share_pubkey
+                    .map(|v| blob_to_array::<32>(&v, "subscriptions.share_pubkey"))
+                    .transpose()?,
+                latest_seq,
+                latest_manifest_id: latest_manifest_id
+                    .map(|v| blob_to_array::<32>(&v, "subscriptions.latest_manifest_id"))
+                    .transpose()?,
+                trust_level: parse_trust_level(&trust_level),
+            });
+        }
+    }
+
+    state.communities = load_metadata_cbor(conn, "communities")?.unwrap_or_default();
+    state.publisher_identities =
+        load_metadata_cbor(conn, "publisher_identities")?.unwrap_or_default();
+
+    {
+        let mut stmt = conn.prepare("SELECT manifest_id, payload FROM manifests")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (manifest_id, payload) = row?;
+            let manifest: ManifestV1 = serde_cbor::from_slice(&payload)?;
+            state.manifests.insert(
+                blob_to_array::<32>(&manifest_id, "manifests.manifest_id")?,
+                manifest,
+            );
+        }
+    }
+
+    {
+        let mut stmt = conn.prepare("SELECT share_id, weight FROM share_weights")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, f32>(1)?))
+        })?;
+        for row in rows {
+            let (share_id, weight) = row?;
+            state.share_weights.insert(
+                blob_to_array::<32>(&share_id, "share_weights.share_id")?,
+                weight,
+            );
+        }
+    }
+
+    {
+        let mut stmt = conn.prepare("SELECT content_id, payload FROM partial_downloads")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (content_id, payload) = row?;
+            let partial: PersistedPartialDownload = serde_cbor::from_slice(&payload)?;
+            state.partial_downloads.insert(
+                blob_to_array::<32>(&content_id, "partial_downloads.content_id")?,
+                partial,
+            );
+        }
+    }
+
+    state.search_index = load_metadata_cbor(conn, "search_index")?;
+    state.share_heads = load_metadata_cbor(conn, "share_heads")?.unwrap_or_default();
+    state.encrypted_node_key = load_metadata_cbor(conn, "encrypted_node_key")?;
+    state.enabled_blocklist_shares =
+        load_metadata_cbor(conn, "enabled_blocklist_shares")?.unwrap_or_default();
+    state.blocklist_rules_by_share =
+        load_metadata_cbor(conn, "blocklist_rules_by_share")?.unwrap_or_default();
+
+    Ok(state)
+}
+
+/// Helper to load a single CBOR-encoded metadata value.
+fn load_metadata_cbor<T: serde::de::DeserializeOwned>(
+    conn: &Connection,
+    key: &str,
+) -> anyhow::Result<Option<T>> {
+    conn.query_row(
+        "SELECT payload FROM metadata WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()?
+    .map(|payload| serde_cbor::from_slice(&payload).map_err(Into::into))
+    .transpose()
+}
+
+/// All SQLite writes happen here, on a blocking thread.
+/// Uses UPSERT (INSERT … ON CONFLICT DO UPDATE) so only changed rows are
+/// written.  Stale rows that no longer exist in `state` are deleted by
+/// comparing keys.
+fn save_state_sync(conn: &mut Connection, state: &PersistedState) -> anyhow::Result<()> {
+    let tx = conn.transaction()?;
+
+    // --- peers: UPSERT + prune stale ---
+    let mut live_peer_keys: HashSet<String> = HashSet::new();
+    for peer in &state.peers {
+        let addr_key = format!(
+            "{}:{}:{:?}",
+            peer.addr.ip, peer.addr.port, peer.addr.transport
+        );
+        tx.execute(
+            "INSERT INTO peers(addr_key, payload) VALUES(?1, ?2)
+             ON CONFLICT(addr_key) DO UPDATE SET payload = excluded.payload",
+            params![addr_key, serde_cbor::to_vec(peer)?],
+        )?;
+        live_peer_keys.insert(addr_key);
+    }
+    delete_stale_text_keys(&tx, "peers", "addr_key", &live_peer_keys)?;
+
+    // --- subscriptions: UPSERT + prune stale ---
+    let mut live_sub_keys: HashSet<Vec<u8>> = HashSet::new();
+    for sub in &state.subscriptions {
+        tx.execute(
+            "INSERT INTO subscriptions(share_id, share_pubkey, latest_seq, latest_manifest_id, trust_level)
+             VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(share_id) DO UPDATE SET
+               share_pubkey = excluded.share_pubkey,
+               latest_seq = excluded.latest_seq,
+               latest_manifest_id = excluded.latest_manifest_id,
+               trust_level = excluded.trust_level",
+            params![
+                sub.share_id.to_vec(),
+                sub.share_pubkey.map(|v| v.to_vec()),
+                sub.latest_seq,
+                sub.latest_manifest_id.map(|v| v.to_vec()),
+                trust_level_str(sub.trust_level),
+            ],
+        )?;
+        live_sub_keys.insert(sub.share_id.to_vec());
+    }
+    delete_stale_blob_keys(&tx, "subscriptions", "share_id", &live_sub_keys)?;
+
+    // --- metadata blobs (communities, publisher_identities, etc.) ---
+    upsert_metadata_cbor(&tx, "communities", &state.communities)?;
+    upsert_metadata_cbor(&tx, "publisher_identities", &state.publisher_identities)?;
+
+    // --- manifests: UPSERT + prune stale ---
+    let mut live_manifest_keys: HashSet<Vec<u8>> = HashSet::new();
+    for (manifest_id, manifest) in &state.manifests {
+        tx.execute(
+            "INSERT INTO manifests(manifest_id, payload) VALUES(?1, ?2)
+             ON CONFLICT(manifest_id) DO UPDATE SET payload = excluded.payload",
+            params![manifest_id.to_vec(), serde_cbor::to_vec(manifest)?],
+        )?;
+        live_manifest_keys.insert(manifest_id.to_vec());
+    }
+    delete_stale_blob_keys(&tx, "manifests", "manifest_id", &live_manifest_keys)?;
+
+    // --- share_weights: UPSERT + prune stale ---
+    let mut live_weight_keys: HashSet<Vec<u8>> = HashSet::new();
+    for (share_id, weight) in &state.share_weights {
+        tx.execute(
+            "INSERT INTO share_weights(share_id, weight) VALUES(?1, ?2)
+             ON CONFLICT(share_id) DO UPDATE SET weight = excluded.weight",
+            params![share_id.to_vec(), weight],
+        )?;
+        live_weight_keys.insert(share_id.to_vec());
+    }
+    delete_stale_blob_keys(&tx, "share_weights", "share_id", &live_weight_keys)?;
+
+    // --- partial_downloads: UPSERT + prune stale ---
+    let mut live_partial_keys: HashSet<Vec<u8>> = HashSet::new();
+    for (content_id, partial) in &state.partial_downloads {
+        tx.execute(
+            "INSERT INTO partial_downloads(content_id, payload) VALUES(?1, ?2)
+             ON CONFLICT(content_id) DO UPDATE SET payload = excluded.payload",
+            params![content_id.to_vec(), serde_cbor::to_vec(partial)?],
+        )?;
+        live_partial_keys.insert(content_id.to_vec());
+    }
+    delete_stale_blob_keys(&tx, "partial_downloads", "content_id", &live_partial_keys)?;
+
+    // --- remaining metadata ---
+    upsert_metadata_cbor_opt(&tx, "search_index", &state.search_index)?;
+    upsert_metadata_cbor(&tx, "share_heads", &state.share_heads)?;
+    upsert_metadata_cbor_opt(&tx, "encrypted_node_key", &state.encrypted_node_key)?;
+    upsert_metadata_cbor(&tx, "enabled_blocklist_shares", &state.enabled_blocklist_shares)?;
+    upsert_metadata_cbor(&tx, "blocklist_rules_by_share", &state.blocklist_rules_by_share)?;
+
+    tx.commit()?;
+    Ok(())
+}
+
+/// UPSERT a CBOR value into the metadata table, or delete the row if the value
+/// is empty/default.
+fn upsert_metadata_cbor<T: Serialize>(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    value: &T,
+) -> anyhow::Result<()> {
+    let bytes = serde_cbor::to_vec(value)?;
+    tx.execute(
+        "INSERT INTO metadata(key, payload) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET payload = excluded.payload",
+        params![key, bytes],
     )?;
+    Ok(())
+}
+
+/// Like `upsert_metadata_cbor` but for `Option<T>` — deletes the row when `None`.
+fn upsert_metadata_cbor_opt<T: Serialize>(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    value: &Option<T>,
+) -> anyhow::Result<()> {
+    match value {
+        Some(v) => {
+            let bytes = serde_cbor::to_vec(v)?;
+            tx.execute(
+                "INSERT INTO metadata(key, payload) VALUES(?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET payload = excluded.payload",
+                params![key, bytes],
+            )?;
+        }
+        None => {
+            tx.execute("DELETE FROM metadata WHERE key = ?1", params![key])?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete rows whose TEXT primary-key is not in `live_keys`.
+fn delete_stale_text_keys(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    pk_col: &str,
+    live_keys: &HashSet<String>,
+) -> anyhow::Result<()> {
+    let mut stmt = tx.prepare(&format!("SELECT {pk_col} FROM {table}"))?;
+    let existing: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    for key in existing {
+        if !live_keys.contains(&key) {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE {pk_col} = ?1"),
+                params![key],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete rows whose BLOB primary-key is not in `live_keys`.
+fn delete_stale_blob_keys(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    pk_col: &str,
+    live_keys: &HashSet<Vec<u8>>,
+) -> anyhow::Result<()> {
+    let mut stmt = tx.prepare(&format!("SELECT {pk_col} FROM {table}"))?;
+    let existing: Vec<Vec<u8>> = stmt
+        .query_map([], |row| row.get::<_, Vec<u8>>(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    for key in existing {
+        if !live_keys.contains(&key) {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE {pk_col} = ?1"),
+                params![key],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -665,27 +692,6 @@ mod tests {
         assert_eq!(loaded.blocklist_rules_by_share.len(), 1);
 
         let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn persisted_subscription_legacy_defaults_trust_level() {
-        #[derive(Serialize)]
-        struct LegacySubscription {
-            share_id: [u8; 32],
-            share_pubkey: Option<[u8; 32]>,
-            latest_seq: u64,
-            latest_manifest_id: Option<[u8; 32]>,
-        }
-
-        let legacy = LegacySubscription {
-            share_id: [3u8; 32],
-            share_pubkey: None,
-            latest_seq: 1,
-            latest_manifest_id: None,
-        };
-        let encoded = serde_cbor::to_vec(&legacy).expect("encode");
-        let decoded: PersistedSubscription = serde_cbor::from_slice(&encoded).expect("decode");
-        assert_eq!(decoded.trust_level, SubscriptionTrustLevel::Normal);
     }
 
     #[test]
