@@ -4,7 +4,7 @@ import { Dashboard } from "@/pages/Dashboard";
 import { Discover } from "@/pages/Discover";
 import { Communities } from "@/pages/Communities";
 import { SearchPage } from "@/pages/Search";
-import { Publish } from "@/pages/Publish";
+import { MyShares } from "@/pages/MyShares";
 import { Settings } from "@/pages/Settings";
 import * as cmd from "@/lib/commands";
 import type { RuntimeStatus, PageId } from "@/lib/types";
@@ -53,8 +53,8 @@ export default function App() {
         return <Communities />;
       case "search":
         return <SearchPage />;
-      case "publish":
-        return <Publish />;
+      case "my-shares":
+        return <MyShares />;
       case "settings":
         return <Settings />;
       default:

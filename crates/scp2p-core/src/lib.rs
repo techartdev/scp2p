@@ -25,8 +25,8 @@ pub mod transport_net;
 pub mod wire;
 
 pub use api::{
-    AbuseLimits, BlocklistRules, Node, NodeHandle, SearchPage, SearchPageQuery, SearchQuery,
-    SearchResult, SearchTrustFilter, ShareItemInfo, SubscriptionTrustLevel,
+    AbuseLimits, BlocklistRules, Node, NodeHandle, OwnedShareRecord, SearchPage, SearchPageQuery,
+    SearchQuery, SearchResult, SearchTrustFilter, ShareItemInfo, SubscriptionTrustLevel,
 };
 pub use blob_store::ContentBlobStore;
 pub use capabilities::Capabilities;

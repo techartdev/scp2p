@@ -7,9 +7,9 @@
 use crate::{
     app_state::DesktopAppState,
     dto::{
-        CommunityBrowseView, CommunityView, DesktopClientConfig, PeerView, PublicShareView,
-        PublishResultView, PublishVisibility, RuntimeStatus, SearchResultsView, ShareItemView,
-        StartNodeRequest, SubscriptionView,
+        CommunityBrowseView, CommunityView, DesktopClientConfig, OwnedShareView, PeerView,
+        PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus, SearchResultsView,
+        ShareItemView, StartNodeRequest, SubscriptionView,
     },
 };
 
@@ -180,5 +180,30 @@ pub async fn download_share_items(
 ) -> anyhow::Result<Vec<String>> {
     app_state
         .download_share_items(&share_id_hex, &content_ids_hex, &target_dir)
+        .await
+}
+
+// ── My Shares ──────────────────────────────────────────────────────────────
+
+pub async fn list_my_shares(
+    app_state: &DesktopAppState,
+) -> anyhow::Result<Vec<OwnedShareView>> {
+    app_state.list_my_shares().await
+}
+
+pub async fn delete_my_share(
+    app_state: &DesktopAppState,
+    share_id_hex: String,
+) -> anyhow::Result<Vec<OwnedShareView>> {
+    app_state.delete_my_share(&share_id_hex).await
+}
+
+pub async fn update_my_share_visibility(
+    app_state: &DesktopAppState,
+    share_id_hex: String,
+    visibility: PublishVisibility,
+) -> anyhow::Result<Vec<OwnedShareView>> {
+    app_state
+        .update_my_share_visibility(&share_id_hex, visibility)
         .await
 }

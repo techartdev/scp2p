@@ -267,9 +267,9 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
               to browse shares, or{" "}
               <button
                 className="text-accent hover:underline font-medium"
-                onClick={() => onNavigate("publish")}
+                onClick={() => onNavigate("my-shares")}
               >
-                Publish
+                My Shares
               </button>{" "}
               to share your own content.
             </p>

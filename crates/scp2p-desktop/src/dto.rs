@@ -129,6 +129,22 @@ pub struct PublishResultView {
     pub community_ids_hex: Vec<String>,
 }
 
+/// View of a locally-owned published share (returned by `list_my_shares`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnedShareView {
+    pub share_id_hex: String,
+    pub share_pubkey_hex: String,
+    /// The Ed25519 signing key (keep confidential; used to prove authorship).
+    pub share_secret_hex: String,
+    pub latest_seq: u64,
+    pub manifest_id_hex: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub visibility: PublishVisibility,
+    pub item_count: usize,
+    pub community_ids_hex: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShareItemView {
     pub content_id_hex: String,

@@ -12,6 +12,7 @@ import type {
   PublishResultView,
   PublishVisibility,
   ShareItemView,
+  OwnedShareView,
 } from "./types";
 
 // ── Node lifecycle ──────────────────────────────────────────────────────
@@ -185,4 +186,23 @@ export async function downloadShareItems(
     contentIdsHex,
     targetDir,
   });
+}
+
+// ── My Shares ───────────────────────────────────────────────────────────
+
+export async function listMyShares(): Promise<OwnedShareView[]> {
+  return invoke("list_my_shares");
+}
+
+export async function deleteMyShare(
+  shareIdHex: string
+): Promise<OwnedShareView[]> {
+  return invoke("delete_my_share", { shareIdHex });
+}
+
+export async function updateMyShareVisibility(
+  shareIdHex: string,
+  visibility: PublishVisibility
+): Promise<OwnedShareView[]> {
+  return invoke("update_my_share_visibility", { shareIdHex, visibility });
 }

@@ -3,7 +3,7 @@ import {
   Compass,
   Globe,
   Search,
-  Upload,
+  Package,
   Settings,
   Radio,
 } from "lucide-react";
@@ -41,9 +41,9 @@ const navItems: NavItem[] = [
     icon: <Search className="h-4 w-4" />,
   },
   {
-    id: "publish",
-    label: "Publish",
-    icon: <Upload className="h-4 w-4" />,
+    id: "my-shares",
+    label: "My Shares",
+    icon: <Package className="h-4 w-4" />,
   },
   {
     id: "communities",

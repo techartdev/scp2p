@@ -12,9 +12,9 @@ use ed25519_dalek::SigningKey;
 use rand::{rngs::OsRng, RngCore};
 use scp2p_core::{
     describe_content, transport_net::tcp_connect_session, BoxedStream, Capabilities,
-    DirectRequestTransport, ItemV1, ManifestV1, Node, NodeConfig, NodeHandle, PeerAddr,
-    PeerConnector, PeerRecord, PersistedSubscription, PublicShareSummary, SearchPageQuery,
-    ShareVisibility, SqliteStore, Store, TransportProtocol,
+    DirectRequestTransport, ItemV1, ManifestV1, Node, NodeConfig, NodeHandle, OwnedShareRecord,
+    PeerAddr, PeerConnector, PeerRecord, PersistedSubscription, PublicShareSummary,
+    SearchPageQuery, ShareVisibility, SqliteStore, Store, TransportProtocol,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -23,9 +23,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 
 use crate::dto::{
-    CommunityBrowseView, CommunityParticipantView, CommunityView, DesktopClientConfig, PeerView,
-    PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus, SearchResultView,
-    SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
+    CommunityBrowseView, CommunityParticipantView, CommunityView, DesktopClientConfig,
+    OwnedShareView, PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
+    SearchResultView, SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
 };
 
 #[derive(Clone, Default)]
@@ -722,6 +722,43 @@ impl DesktopAppState {
         })
     }
 
+    // ── My Shares management ───────────────────────────────────────────────────
+
+    /// List all shares that this node has published.
+    pub async fn list_my_shares(&self) -> anyhow::Result<Vec<OwnedShareView>> {
+        let node = self.node_handle().await?;
+        let records = node.list_owned_shares().await;
+        Ok(records.into_iter().map(owned_share_view).collect())
+    }
+
+    /// Delete (unpublish) a locally-published share by its hex share ID.
+    pub async fn delete_my_share(
+        &self,
+        share_id_hex: &str,
+    ) -> anyhow::Result<Vec<OwnedShareView>> {
+        let node = self.node_handle().await?;
+        let share_id = parse_hex_32(share_id_hex, "share_id")?;
+        node.delete_published_share(scp2p_core::ShareId(share_id))
+            .await?;
+        self.list_my_shares().await
+    }
+
+    /// Toggle the visibility of a locally-published share.
+    pub async fn update_my_share_visibility(
+        &self,
+        share_id_hex: &str,
+        visibility: PublishVisibility,
+    ) -> anyhow::Result<Vec<OwnedShareView>> {
+        let node = self.node_handle().await?;
+        let share_id = parse_hex_32(share_id_hex, "share_id")?;
+        node.update_share_visibility(
+            scp2p_core::ShareId(share_id),
+            share_visibility(visibility),
+        )
+        .await?;
+        self.list_my_shares().await
+    }
+
     pub async fn browse_share_items(
         &self,
         share_id_hex: &str,
@@ -807,6 +844,25 @@ fn public_share_view(peer: &PeerAddr, share: PublicShareSummary) -> PublicShareV
         latest_seq: share.latest_seq,
         title: share.title,
         description: share.description,
+    }
+}
+
+fn owned_share_view(record: OwnedShareRecord) -> OwnedShareView {
+    let visibility = match record.visibility {
+        ShareVisibility::Public => PublishVisibility::Public,
+        ShareVisibility::Private => PublishVisibility::Private,
+    };
+    OwnedShareView {
+        share_id_hex: hex::encode(record.share_id),
+        share_pubkey_hex: hex::encode(record.share_pubkey),
+        share_secret_hex: hex::encode(record.share_secret),
+        latest_seq: record.latest_seq,
+        manifest_id_hex: hex::encode(record.manifest_id),
+        title: record.title,
+        description: record.description,
+        visibility,
+        item_count: record.item_count,
+        community_ids_hex: record.community_ids.iter().map(hex::encode).collect(),
     }
 }
 

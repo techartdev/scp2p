@@ -10,7 +10,7 @@ pub mod dto;
 
 pub use app_state::DesktopAppState;
 pub use dto::{
-    CommunityBrowseView, CommunityParticipantView, CommunityView, DesktopClientConfig, PeerView,
-    PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus, SearchResultView,
-    SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
+    CommunityBrowseView, CommunityParticipantView, CommunityView, DesktopClientConfig,
+    OwnedShareView, PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
+    SearchResultView, SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
 };

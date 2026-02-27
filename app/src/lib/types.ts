@@ -96,6 +96,21 @@ export interface ShareItemView {
   mime: string | null;
 }
 
+/// Full record for a share this node has published.
+export interface OwnedShareView {
+  share_id_hex: string;
+  share_pubkey_hex: string;
+  /// Raw Ed25519 signing key — keep confidential.
+  share_secret_hex: string;
+  latest_seq: number;
+  manifest_id_hex: string;
+  title: string | null;
+  description: string | null;
+  visibility: PublishVisibility;
+  item_count: number;
+  community_ids_hex: string[];
+}
+
 // ── Navigation ──────────────────────────────────────────────────────────
 
 export type PageId =
@@ -103,5 +118,5 @@ export type PageId =
   | "discover"
   | "communities"
   | "search"
-  | "publish"
+  | "my-shares"
   | "settings";

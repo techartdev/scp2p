@@ -34,9 +34,9 @@ export function Modal({ open, onClose, title, children, footer }: ModalProps) {
         onClick={onClose}
       />
       {/* Modal */}
-      <div className="relative bg-surface-raised border border-border rounded-2xl shadow-2xl w-full max-w-lg mx-4 animate-slide-up">
+      <div className="relative bg-surface-raised border border-border rounded-2xl shadow-2xl w-full max-w-lg mx-4 max-h-[85vh] flex flex-col animate-slide-up">
         {/* Header */}
-        <div className="flex items-center justify-between px-6 py-4 border-b border-border">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-border shrink-0">
           <h2 className="text-sm font-semibold text-text-primary">{title}</h2>
           <button
             onClick={onClose}
@@ -46,10 +46,10 @@ export function Modal({ open, onClose, title, children, footer }: ModalProps) {
           </button>
         </div>
         {/* Body */}
-        <div className="px-6 py-4">{children}</div>
+        <div className="px-6 py-4 overflow-y-auto">{children}</div>
         {/* Footer */}
         {footer && (
-          <div className="px-6 py-3 border-t border-border flex items-center justify-end gap-2">
+          <div className="px-6 py-3 border-t border-border flex items-center justify-end gap-2 shrink-0">
             {footer}
           </div>
         )}

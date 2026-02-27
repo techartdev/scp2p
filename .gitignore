@@ -7,6 +7,7 @@ Cargo.lock
 *.db-shm
 *.db-wal
 scp2p-desktop-config.cbor
+**/content_blobs/
 
 # ── Node / Frontend ─────────────────────────────────────────────────────
 app/node_modules/

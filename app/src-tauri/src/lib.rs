@@ -5,9 +5,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use scp2p_desktop::{
-    commands, CommunityBrowseView, CommunityView, DesktopAppState, DesktopClientConfig, PeerView,
-    PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus, SearchResultsView,
-    ShareItemView, StartNodeRequest, SubscriptionView,
+    commands, CommunityBrowseView, CommunityView, DesktopAppState, DesktopClientConfig, OwnedShareView,
+    PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
+    SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
 };
 
 struct AppState(DesktopAppState);
@@ -255,6 +255,38 @@ async fn download_share_items(
         .map_err(|e| format!("{e:#}"))
 }
 
+// ── My Shares ──────────────────────────────────────────────────────
+
+#[tauri::command]
+async fn list_my_shares(
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<OwnedShareView>, String> {
+    commands::list_my_shares(&state.0)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn delete_my_share(
+    state: tauri::State<'_, AppState>,
+    share_id_hex: String,
+) -> Result<Vec<OwnedShareView>, String> {
+    commands::delete_my_share(&state.0, share_id_hex)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn update_my_share_visibility(
+    state: tauri::State<'_, AppState>,
+    share_id_hex: String,
+    visibility: PublishVisibility,
+) -> Result<Vec<OwnedShareView>, String> {
+    commands::update_my_share_visibility(&state.0, share_id_hex, visibility)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 // ── App entry ───────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -286,6 +318,9 @@ pub fn run() {
             publish_folder,
             browse_share_items,
             download_share_items,
+            list_my_shares,
+            delete_my_share,
+            update_my_share_visibility,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SCP2P application");

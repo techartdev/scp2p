@@ -150,6 +150,23 @@ pub struct ShareItemInfo {
     pub mime: Option<String>,
 }
 
+/// Full record for a locally published share, including the signing secret.
+/// Returned by [`NodeHandle::list_owned_shares`].
+#[derive(Debug, Clone)]
+pub struct OwnedShareRecord {
+    pub share_id: [u8; 32],
+    pub share_pubkey: [u8; 32],
+    /// Raw Ed25519 signing-key bytes (32 bytes).  Keep this confidential.
+    pub share_secret: [u8; 32],
+    pub latest_seq: u64,
+    pub manifest_id: [u8; 32],
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub visibility: ShareVisibility,
+    pub item_count: usize,
+    pub community_ids: Vec<[u8; 32]>,
+}
+
 #[derive(Clone)]
 pub struct NodeHandle {
     state: Arc<RwLock<NodeState>>,
@@ -587,6 +604,91 @@ impl NodeHandle {
             .published_share_heads
             .get(&share_id.0)
             .cloned()
+    }
+
+    /// Return all publisher identities that have a current published share head,
+    /// together with the signing secret so the caller can display the share keys.
+    pub async fn list_owned_shares(&self) -> Vec<OwnedShareRecord> {
+        let state = self.state.read().await;
+        let mut records = Vec::new();
+        for (_label, secret) in &state.publisher_identities {
+            let signing_key = SigningKey::from_bytes(secret);
+            let verifying_key = signing_key.verifying_key();
+            let share_id = ShareId::from_pubkey(&verifying_key);
+            let Some(head) = state.published_share_heads.get(&share_id.0) else {
+                continue;
+            };
+            let Some(manifest) = state.manifest_cache.get(&head.latest_manifest_id) else {
+                continue;
+            };
+            records.push(OwnedShareRecord {
+                share_id: share_id.0,
+                share_pubkey: verifying_key.to_bytes(),
+                share_secret: *secret,
+                latest_seq: head.latest_seq,
+                manifest_id: head.latest_manifest_id,
+                title: manifest.title.clone(),
+                description: manifest.description.clone(),
+                visibility: manifest.visibility,
+                item_count: manifest.items.len(),
+                community_ids: manifest.communities.clone(),
+            });
+        }
+        records
+    }
+
+    /// Remove the published share head (and its manifest) for the given `share_id`.
+    /// The publisher identity key is retained so the share can be re-published later.
+    pub async fn delete_published_share(&self, share_id: ShareId) -> anyhow::Result<()> {
+        {
+            let mut state = self.state.write().await;
+            if let Some(head) = state.published_share_heads.remove(&share_id.0) {
+                state.manifest_cache.remove(&head.latest_manifest_id);
+            }
+        }
+        persist_state(self).await
+    }
+
+    /// Re-publish the share with a new visibility setting, bumping the sequence number.
+    pub async fn update_share_visibility(
+        &self,
+        share_id: ShareId,
+        new_visibility: ShareVisibility,
+    ) -> anyhow::Result<()> {
+        let (manifest, keypair) = {
+            let state = self.state.read().await;
+            let head = state
+                .published_share_heads
+                .get(&share_id.0)
+                .ok_or_else(|| anyhow::anyhow!("share not found in published heads"))?
+                .clone();
+            let manifest = state
+                .manifest_cache
+                .get(&head.latest_manifest_id)
+                .ok_or_else(|| anyhow::anyhow!("manifest not found in cache"))?
+                .clone();
+            // Find the matching signing key among known publisher identities.
+            let keypair = state
+                .publisher_identities
+                .values()
+                .find_map(|secret| {
+                    let sk = SigningKey::from_bytes(secret);
+                    let vk = sk.verifying_key();
+                    if ShareId::from_pubkey(&vk).0 == share_id.0 {
+                        Some(ShareKeypair::new(sk))
+                    } else {
+                        None
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("no signing key for share"))?;
+            (manifest, keypair)
+        };
+        let mut new_manifest = manifest;
+        new_manifest.seq = new_manifest.seq.saturating_add(1);
+        new_manifest.visibility = new_visibility;
+        new_manifest.signature = None;
+        self.publish_share(new_manifest, &keypair).await?;
+        Ok(())
     }
 
     pub async fn list_local_community_public_shares(
