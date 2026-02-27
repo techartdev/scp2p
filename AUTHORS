@@ -1,0 +1,17 @@
+# SCP2P Authors & Contributors
+#
+# This file lists the copyright holders and contributors to the SCP2P project.
+# It does not necessarily list every individual commit author; rather it
+# identifies the individuals and organisations that hold copyright over the
+# work and have made significant contributions.
+#
+# For the authoritative list of contributors, see the Git history:
+#   git log --format='%aN <%aE>' | sort -u
+#
+# SPDX-License-Identifier: MPL-2.0
+
+# Project creator and canonical maintainer
+Vanyo Vanev <https://github.com/techartdev>
+
+# Organisation
+Tech Art Ltd
