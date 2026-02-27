@@ -128,6 +128,17 @@ impl Dht {
     }
 }
 
+/// Compute the Kademlia bucket index for `node` relative to `local`.
+///
+/// Returns the position (0-based from MSB) of the first bit set in the
+/// XOR distance.  Bucket 0 is the *most distant* bucket (highest-order bit
+/// differs), while higher indices correspond to *closer* nodes.  This is the
+/// MSB-first convention used by many Kademlia implementations (e.g. libp2p) and
+/// is effectively `leading_zeros(distance)`.  Some references number buckets
+/// from the LSB instead; those produce `255 - bucket_index` for equivalent
+/// distances.
+///
+/// Returns `None` when `local == node` (distance is zero).
 fn bucket_index(local: &NodeId, node: &NodeId) -> Option<usize> {
     let distance = local.xor_distance(node);
     for (byte_idx, byte) in distance.iter().copied().enumerate() {

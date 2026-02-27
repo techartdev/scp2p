@@ -20,11 +20,15 @@ use crate::{
 pub const HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
 pub const HANDSHAKE_MAX_CLOCK_SKEW_SECS: u64 = 5 * 60;
 
+/// Current wire-protocol version.  Bump when breaking changes land.
+pub const PROTOCOL_VERSION: u16 = 1;
+
 #[derive(Debug, Clone)]
 pub struct AuthenticatedSession {
     pub remote_node_pubkey: [u8; 32],
     pub remote_capabilities: Capabilities,
     pub remote_nonce: [u8; 32],
+    pub remote_protocol_version: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,11 +38,18 @@ struct HandshakeHello {
     pub nonce: [u8; 32],
     pub echoed_nonce: Option<[u8; 32]>,
     pub timestamp_unix_secs: u64,
+    /// Wire-protocol version advertised by the sender.
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: u16,
     pub signature: Vec<u8>,
 }
 
+fn default_protocol_version() -> u16 {
+    1
+}
+
 #[derive(Serialize)]
-struct HandshakeSigningTuple([u8; 32], Capabilities, [u8; 32], Option<[u8; 32]>, u64);
+struct HandshakeSigningTuple([u8; 32], Capabilities, [u8; 32], Option<[u8; 32]>, u64, u16);
 
 pub async fn handshake_initiator<S>(
     io: &mut S,
@@ -68,6 +79,7 @@ where
         remote_node_pubkey: server.node_pubkey,
         remote_capabilities: server.capabilities,
         remote_nonce: server.nonce,
+        remote_protocol_version: server.protocol_version,
     })
 }
 
@@ -101,6 +113,7 @@ where
         remote_node_pubkey: client.node_pubkey,
         remote_capabilities: client.capabilities,
         remote_nonce: client.nonce,
+        remote_protocol_version: client.protocol_version,
     })
 }
 
@@ -133,6 +146,7 @@ fn signed_hello_at(
         nonce,
         echoed_nonce,
         timestamp_unix_secs,
+        PROTOCOL_VERSION,
     );
     let signature = signing_key.sign(&serde_cbor::to_vec(&signable)?);
     Ok(HandshakeHello {
@@ -141,6 +155,7 @@ fn signed_hello_at(
         nonce,
         echoed_nonce,
         timestamp_unix_secs,
+        protocol_version: PROTOCOL_VERSION,
         signature: signature.to_bytes().to_vec(),
     })
 }
@@ -161,6 +176,7 @@ fn verify_hello(hello: &HandshakeHello) -> anyhow::Result<()> {
         hello.nonce,
         hello.echoed_nonce,
         hello.timestamp_unix_secs,
+        hello.protocol_version,
     );
     let mut sig_arr = [0u8; 64];
     sig_arr.copy_from_slice(&hello.signature);

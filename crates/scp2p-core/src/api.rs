@@ -449,11 +449,18 @@ impl NodeHandle {
             .bootstrap_peers
             .iter()
             .map(|entry| {
-                let socket: SocketAddr = entry.parse()?;
+                let (transport, addr_part) = if let Some(rest) = entry.strip_prefix("quic://") {
+                    (TransportProtocol::Quic, rest)
+                } else if let Some(rest) = entry.strip_prefix("tcp://") {
+                    (TransportProtocol::Tcp, rest)
+                } else {
+                    (TransportProtocol::Tcp, entry.as_str())
+                };
+                let socket: SocketAddr = addr_part.parse()?;
                 Ok(PeerAddr {
                     ip: socket.ip(),
                     port: socket.port(),
-                    transport: TransportProtocol::Tcp,
+                    transport,
                     pubkey_hint: None,
                 })
             })
@@ -497,17 +504,23 @@ impl NodeHandle {
             anyhow::bail!("publisher label must not be empty");
         }
 
-        let mut state = self.state.write().await;
-        let secret = match state.publisher_identities.get(label).copied() {
-            Some(secret) => secret,
-            None => {
-                let mut rng = rand::rngs::OsRng;
-                let secret = SigningKey::generate(&mut rng).to_bytes();
-                state.publisher_identities.insert(label.to_string(), secret);
-                persist_state_locked(&state).await?;
-                secret
+        let mut needs_persist = false;
+        let secret = {
+            let mut state = self.state.write().await;
+            match state.publisher_identities.get(label).copied() {
+                Some(secret) => secret,
+                None => {
+                    let mut rng = rand::rngs::OsRng;
+                    let secret = SigningKey::generate(&mut rng).to_bytes();
+                    state.publisher_identities.insert(label.to_string(), secret);
+                    needs_persist = true;
+                    secret
+                }
             }
         };
+        if needs_persist {
+            persist_state(self).await?;
+        }
         Ok(ShareKeypair::new(SigningKey::from_bytes(&secret)))
     }
 
@@ -655,20 +668,24 @@ impl NodeHandle {
     }
 
     pub async fn record_peer_seen(&self, peer_addr: PeerAddr) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        state.peer_db.upsert_seen(peer_addr, now_unix_secs()?);
-        persist_state_locked(&state).await?;
-        Ok(())
+        {
+            let mut state = self.state.write().await;
+            state.peer_db.upsert_seen(peer_addr, now_unix_secs()?);
+        }
+        persist_state(self).await
     }
 
     pub async fn apply_pex_offer(&self, offer: PexOffer) -> anyhow::Result<usize> {
-        let mut state = self.state.write().await;
-        let now = now_unix_secs()?;
-        for addr in offer.peers {
-            state.peer_db.upsert_seen(addr, now);
-        }
-        persist_state_locked(&state).await?;
-        Ok(state.peer_db.total_known_peers())
+        let count = {
+            let mut state = self.state.write().await;
+            let now = now_unix_secs()?;
+            for addr in offer.peers {
+                state.peer_db.upsert_seen(addr, now);
+            }
+            state.peer_db.total_known_peers()
+        };
+        persist_state(self).await?;
+        Ok(count)
     }
 
     pub async fn build_pex_offer(&self, req: PexRequest) -> anyhow::Result<PexOffer> {
@@ -735,8 +752,8 @@ impl NodeHandle {
                 req.ttl_secs.max(DEFAULT_TTL_SECS),
                 now,
             )?;
-            persist_state_locked(&state).await?;
         }
+        persist_state(self).await?;
         replicate_store_to_closest(
             transport,
             self,
@@ -947,9 +964,9 @@ impl NodeHandle {
                     .dht
                     .store(value.key, value.value.clone(), DEFAULT_TTL_SECS, now)?;
             }
-            persist_state_locked(&state).await?;
             values
         };
+        persist_state(self).await?;
 
         let mut republished = 0usize;
         for value in values {
@@ -1199,10 +1216,11 @@ impl NodeHandle {
     }
 
     pub async fn set_share_weight(&self, share_id: ShareId, weight: f32) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        state.share_weights.insert(share_id.0, weight.max(0.0));
-        persist_state_locked(&state).await?;
-        Ok(())
+        {
+            let mut state = self.state.write().await;
+            state.share_weights.insert(share_id.0, weight.max(0.0));
+        }
+        persist_state(self).await
     }
 
     pub async fn subscribe(&self, share_id: ShareId) -> anyhow::Result<()> {
@@ -1222,15 +1240,16 @@ impl NodeHandle {
         }
         let mut state = self.state.write().await;
         state.communities.insert(share_id.0, share_pubkey);
-        persist_state_locked(&state).await?;
-        Ok(())
+        drop(state);
+        persist_state(self).await
     }
 
     pub async fn leave_community(&self, share_id: ShareId) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        state.communities.remove(&share_id.0);
-        persist_state_locked(&state).await?;
-        Ok(())
+        {
+            let mut state = self.state.write().await;
+            state.communities.remove(&share_id.0);
+        }
+        persist_state(self).await
     }
 
     pub async fn subscribe_with_pubkey(
@@ -1257,13 +1276,14 @@ impl NodeHandle {
         share_id: ShareId,
         trust_level: SubscriptionTrustLevel,
     ) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        let Some(sub) = state.subscriptions.get_mut(&share_id.0) else {
-            anyhow::bail!("subscription not found");
-        };
-        sub.trust_level = trust_level;
-        persist_state_locked(&state).await?;
-        Ok(())
+        {
+            let mut state = self.state.write().await;
+            let Some(sub) = state.subscriptions.get_mut(&share_id.0) else {
+                anyhow::bail!("subscription not found");
+            };
+            sub.trust_level = trust_level;
+        }
+        persist_state(self).await
     }
 
     pub async fn set_blocklist_rules(
@@ -1271,37 +1291,41 @@ impl NodeHandle {
         blocklist_share_id: ShareId,
         rules: BlocklistRules,
     ) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        state
-            .blocklist_rules_by_share
-            .insert(blocklist_share_id.0, rules);
-        persist_state_locked(&state).await?;
-        Ok(())
+        {
+            let mut state = self.state.write().await;
+            state
+                .blocklist_rules_by_share
+                .insert(blocklist_share_id.0, rules);
+        }
+        persist_state(self).await
     }
 
     pub async fn clear_blocklist_rules(&self, blocklist_share_id: ShareId) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        state.blocklist_rules_by_share.remove(&blocklist_share_id.0);
-        state.enabled_blocklist_shares.remove(&blocklist_share_id.0);
-        persist_state_locked(&state).await?;
-        Ok(())
+        {
+            let mut state = self.state.write().await;
+            state.blocklist_rules_by_share.remove(&blocklist_share_id.0);
+            state.enabled_blocklist_shares.remove(&blocklist_share_id.0);
+        }
+        persist_state(self).await
     }
 
     pub async fn enable_blocklist_share(&self, blocklist_share_id: ShareId) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        if !state.subscriptions.contains_key(&blocklist_share_id.0) {
-            anyhow::bail!("blocklist share must be subscribed before enabling");
+        {
+            let mut state = self.state.write().await;
+            if !state.subscriptions.contains_key(&blocklist_share_id.0) {
+                anyhow::bail!("blocklist share must be subscribed before enabling");
+            }
+            state.enabled_blocklist_shares.insert(blocklist_share_id.0);
         }
-        state.enabled_blocklist_shares.insert(blocklist_share_id.0);
-        persist_state_locked(&state).await?;
-        Ok(())
+        persist_state(self).await
     }
 
     pub async fn disable_blocklist_share(&self, blocklist_share_id: ShareId) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        state.enabled_blocklist_shares.remove(&blocklist_share_id.0);
-        persist_state_locked(&state).await?;
-        Ok(())
+        {
+            let mut state = self.state.write().await;
+            state.enabled_blocklist_shares.remove(&blocklist_share_id.0);
+        }
+        persist_state(self).await
     }
 
     async fn subscribe_with_options(
@@ -1310,27 +1334,29 @@ impl NodeHandle {
         share_pubkey: Option<[u8; 32]>,
         trust_level: SubscriptionTrustLevel,
     ) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        state
-            .subscriptions
-            .entry(share_id.0)
-            .or_insert(SubscriptionState {
-                share_pubkey,
-                latest_seq: 0,
-                latest_manifest_id: None,
-                trust_level,
-            });
-        persist_state_locked(&state).await?;
-        Ok(())
+        {
+            let mut state = self.state.write().await;
+            state
+                .subscriptions
+                .entry(share_id.0)
+                .or_insert(SubscriptionState {
+                    share_pubkey,
+                    latest_seq: 0,
+                    latest_manifest_id: None,
+                    trust_level,
+                });
+        }
+        persist_state(self).await
     }
 
     pub async fn unsubscribe(&self, share_id: ShareId) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        state.subscriptions.remove(&share_id.0);
-        state.enabled_blocklist_shares.remove(&share_id.0);
-        state.blocklist_rules_by_share.remove(&share_id.0);
-        persist_state_locked(&state).await?;
-        Ok(())
+        {
+            let mut state = self.state.write().await;
+            state.subscriptions.remove(&share_id.0);
+            state.enabled_blocklist_shares.remove(&share_id.0);
+            state.blocklist_rules_by_share.remove(&share_id.0);
+        }
+        persist_state(self).await
     }
 
     pub async fn publish_share(
@@ -1351,16 +1377,19 @@ impl NodeHandle {
             publisher,
         )?;
 
-        let mut state = self.state.write().await;
-        state.manifest_cache.insert(manifest_id, manifest);
-        state.published_share_heads.insert(share_id.0, head.clone());
-        state.dht.store(
-            share_head_key(&share_id),
-            serde_cbor::to_vec(&head)?,
-            DEFAULT_TTL_SECS,
-            now_unix_secs()?,
-        )?;
-        persist_state_locked(&state).await?;
+        let manifest_id = {
+            let mut state = self.state.write().await;
+            state.manifest_cache.insert(manifest_id, manifest);
+            state.published_share_heads.insert(share_id.0, head.clone());
+            state.dht.store(
+                share_head_key(&share_id),
+                serde_cbor::to_vec(&head)?,
+                DEFAULT_TTL_SECS,
+                now_unix_secs()?,
+            )?;
+            manifest_id
+        };
+        persist_state(self).await?;
 
         Ok(manifest_id)
     }
@@ -1459,8 +1488,8 @@ impl NodeHandle {
                 sub.latest_manifest_id = Some(head.latest_manifest_id);
             }
         }
-        persist_state_locked(&state).await?;
-        Ok(())
+        drop(state);
+        persist_state(self).await
     }
 
     pub async fn sync_subscriptions_over_dht<T: RequestTransport + ?Sized>(
@@ -1522,7 +1551,8 @@ impl NodeHandle {
                 state
                     .manifest_cache
                     .insert(head.latest_manifest_id, fetched.clone());
-                persist_state_locked(&state).await?;
+                drop(state);
+                persist_state(self).await?;
                 fetched
             };
             manifest.verify()?;
@@ -1530,21 +1560,23 @@ impl NodeHandle {
                 anyhow::bail!("manifest share_id mismatch while syncing subscription");
             }
 
-            let mut state = self.state.write().await;
-            for item in &manifest.items {
-                let content = ChunkedContent {
-                    content_id: ContentId(item.content_id),
-                    chunks: item.chunks.clone(),
-                };
-                state.content_catalog.insert(item.content_id, content);
-            }
-            state.search_index.index_manifest(&manifest);
+            {
+                let mut state = self.state.write().await;
+                for item in &manifest.items {
+                    let content = ChunkedContent {
+                        content_id: ContentId(item.content_id),
+                        chunks: item.chunks.clone(),
+                    };
+                    state.content_catalog.insert(item.content_id, content);
+                }
+                state.search_index.index_manifest(&manifest);
 
-            if let Some(sub) = state.subscriptions.get_mut(&share_id) {
-                sub.latest_seq = head.latest_seq;
-                sub.latest_manifest_id = Some(head.latest_manifest_id);
+                if let Some(sub) = state.subscriptions.get_mut(&share_id) {
+                    sub.latest_seq = head.latest_seq;
+                    sub.latest_manifest_id = Some(head.latest_manifest_id);
+                }
             }
-            persist_state_locked(&state).await?;
+            persist_state(self).await?;
         }
         Ok(())
     }
@@ -1649,17 +1681,19 @@ impl NodeHandle {
         target_path: String,
         total_chunks: u32,
     ) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        state.partial_downloads.insert(
-            content_id,
-            PersistedPartialDownload {
+        {
+            let mut state = self.state.write().await;
+            state.partial_downloads.insert(
                 content_id,
-                target_path,
-                total_chunks,
-                completed_chunks: vec![],
-            },
-        );
-        persist_state_locked(&state).await
+                PersistedPartialDownload {
+                    content_id,
+                    target_path,
+                    total_chunks,
+                    completed_chunks: vec![],
+                },
+            );
+        }
+        persist_state(self).await
     }
 
     pub async fn mark_partial_chunk_complete(
@@ -1667,19 +1701,23 @@ impl NodeHandle {
         content_id: [u8; 32],
         chunk_index: u32,
     ) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        if let Some(partial) = state.partial_downloads.get_mut(&content_id) {
-            if !partial.completed_chunks.contains(&chunk_index) {
-                partial.completed_chunks.push(chunk_index);
+        {
+            let mut state = self.state.write().await;
+            if let Some(partial) = state.partial_downloads.get_mut(&content_id) {
+                if !partial.completed_chunks.contains(&chunk_index) {
+                    partial.completed_chunks.push(chunk_index);
+                }
             }
         }
-        persist_state_locked(&state).await
+        persist_state(self).await
     }
 
     pub async fn clear_partial_download(&self, content_id: [u8; 32]) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        state.partial_downloads.remove(&content_id);
-        persist_state_locked(&state).await
+        {
+            let mut state = self.state.write().await;
+            state.partial_downloads.remove(&content_id);
+        }
+        persist_state(self).await
     }
 
     pub async fn set_encrypted_node_key(
@@ -1687,9 +1725,11 @@ impl NodeHandle {
         key_material: &[u8],
         passphrase: &str,
     ) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        state.encrypted_node_key = Some(encrypt_secret(key_material, passphrase)?);
-        persist_state_locked(&state).await
+        {
+            let mut state = self.state.write().await;
+            state.encrypted_node_key = Some(encrypt_secret(key_material, passphrase)?);
+        }
+        persist_state(self).await
     }
 
     pub async fn decrypt_node_key(&self, passphrase: &str) -> anyhow::Result<Option<Vec<u8>>> {
@@ -1739,16 +1779,16 @@ impl NodeHandle {
                 completed_chunks: vec![],
             },
         );
-        persist_state_locked(&state).await?;
-
         drop(state);
+        persist_state(self).await?;
 
         let bytes = download_swarm(content_id, &content.chunks, &providers)?;
         std::fs::write(target_path, bytes)?;
-        let mut state = self.state.write().await;
-        state.partial_downloads.remove(&content_id);
-        persist_state_locked(&state).await?;
-        Ok(())
+        {
+            let mut state = self.state.write().await;
+            state.partial_downloads.remove(&content_id);
+        }
+        persist_state(self).await
     }
 
     pub async fn fetch_manifest_from_peers<C: PeerConnector>(
@@ -1760,10 +1800,12 @@ impl NodeHandle {
     ) -> anyhow::Result<ManifestV1> {
         let manifest = fetch_manifest_with_retry(connector, peers, manifest_id, policy).await?;
         manifest.verify()?;
-        let mut state = self.state.write().await;
-        state.manifest_cache.insert(manifest_id, manifest.clone());
-        state.search_index.index_manifest(&manifest);
-        persist_state_locked(&state).await?;
+        {
+            let mut state = self.state.write().await;
+            state.manifest_cache.insert(manifest_id, manifest.clone());
+            state.search_index.index_manifest(&manifest);
+        }
+        persist_state(self).await?;
         Ok(manifest)
     }
 
@@ -1775,32 +1817,35 @@ impl NodeHandle {
         target_path: &str,
         policy: &FetchPolicy,
     ) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        let content = state
-            .content_catalog
-            .get(&content_id)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("unknown content metadata"))?;
-        state.partial_downloads.insert(
-            content_id,
-            PersistedPartialDownload {
+        let content = {
+            let mut state = self.state.write().await;
+            let content = state
+                .content_catalog
+                .get(&content_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unknown content metadata"))?;
+            state.partial_downloads.insert(
                 content_id,
-                target_path: target_path.to_owned(),
-                total_chunks: content.chunks.len() as u32,
-                completed_chunks: vec![],
-            },
-        );
-        persist_state_locked(&state).await?;
-        drop(state);
+                PersistedPartialDownload {
+                    content_id,
+                    target_path: target_path.to_owned(),
+                    total_chunks: content.chunks.len() as u32,
+                    completed_chunks: vec![],
+                },
+            );
+            content
+        };
+        persist_state(self).await?;
 
         let bytes =
             download_swarm_over_network(connector, peers, content_id, &content.chunks, policy)
                 .await?;
         std::fs::write(target_path, bytes)?;
-        let mut state = self.state.write().await;
-        state.partial_downloads.remove(&content_id);
-        persist_state_locked(&state).await?;
-        Ok(())
+        {
+            let mut state = self.state.write().await;
+            state.partial_downloads.remove(&content_id);
+        }
+        persist_state(self).await
     }
 
     async fn serve_wire_stream<S>(
@@ -2463,8 +2508,14 @@ async fn replicate_store_to_closest<T: RequestTransport + ?Sized>(
     Ok(stored)
 }
 
-async fn persist_state_locked(state: &NodeState) -> anyhow::Result<()> {
-    state.store.save_state(&state.to_persisted()).await
+/// Persist current state: snapshot under read-lock, drop lock, then write.
+/// This avoids holding the `RwLock` across async I/O.
+async fn persist_state(handle: &NodeHandle) -> anyhow::Result<()> {
+    let (snapshot, store) = {
+        let state = handle.state.read().await;
+        (state.to_persisted(), state.store.clone())
+    };
+    store.save_state(&snapshot).await
 }
 
 fn error_envelope(message_type: u16, req_id: u32, message: &str) -> Envelope {
@@ -2606,6 +2657,32 @@ mod tests {
         );
         assert_eq!(peers[0].port, 7301);
         assert_eq!(peers[0].transport, crate::peer::TransportProtocol::Tcp);
+    }
+
+    #[tokio::test]
+    async fn configured_bootstrap_peers_with_transport_prefix() {
+        let handle = Node::start(NodeConfig {
+            bootstrap_peers: vec![
+                "quic://10.0.0.1:9000".to_string(),
+                "tcp://10.0.0.2:9001".to_string(),
+                "10.0.0.3:9002".to_string(),
+            ],
+            ..NodeConfig::default()
+        })
+        .await
+        .expect("start");
+        let peers = handle
+            .configured_bootstrap_peers()
+            .await
+            .expect("configured peers");
+        assert_eq!(peers.len(), 3);
+        assert_eq!(peers[0].transport, crate::peer::TransportProtocol::Quic);
+        assert_eq!(peers[0].port, 9000);
+        assert_eq!(peers[1].transport, crate::peer::TransportProtocol::Tcp);
+        assert_eq!(peers[1].port, 9001);
+        // bare address defaults to TCP
+        assert_eq!(peers[2].transport, crate::peer::TransportProtocol::Tcp);
+        assert_eq!(peers[2].port, 9002);
     }
 
     #[tokio::test]
