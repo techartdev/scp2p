@@ -1,11 +1,9 @@
 import {
   LayoutDashboard,
-  Users,
+  Compass,
   Globe,
-  Bookmark,
   Search,
   Upload,
-  Package,
   Settings,
   Radio,
 } from "lucide-react";
@@ -32,20 +30,9 @@ const navItems: NavItem[] = [
     section: "Overview",
   },
   {
-    id: "peers",
-    label: "Peers",
-    icon: <Users className="h-4 w-4" />,
-    section: "Network",
-  },
-  {
-    id: "communities",
-    label: "Communities",
-    icon: <Globe className="h-4 w-4" />,
-  },
-  {
-    id: "subscriptions",
-    label: "Subscriptions",
-    icon: <Bookmark className="h-4 w-4" />,
+    id: "discover",
+    label: "Discover",
+    icon: <Compass className="h-4 w-4" />,
     section: "Content",
   },
   {
@@ -59,9 +46,10 @@ const navItems: NavItem[] = [
     icon: <Upload className="h-4 w-4" />,
   },
   {
-    id: "share-browser",
-    label: "Share Browser",
-    icon: <Package className="h-4 w-4" />,
+    id: "communities",
+    label: "Communities",
+    icon: <Globe className="h-4 w-4" />,
+    section: "Network",
   },
   {
     id: "settings",

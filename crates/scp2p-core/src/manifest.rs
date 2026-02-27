@@ -40,12 +40,14 @@ pub struct ItemV1 {
     pub mime: Option<String>,
     pub tags: Vec<String>,
     /// Number of 256 KiB chunks that constitute this item.
+    #[serde(default)]
     pub chunk_count: u32,
     /// BLAKE3 hash over the concatenation of all chunk hashes.
     ///
     /// Chunk hashes are fetched on demand via `GetChunkHashes`;
     /// the receiver verifies `BLAKE3(chunk_hashes) == chunk_list_hash`
     /// to authenticate them against the signed manifest.
+    #[serde(default)]
     pub chunk_list_hash: [u8; 32],
 }
 

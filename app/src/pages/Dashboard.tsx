@@ -9,6 +9,8 @@ import {
   Wifi,
   HardDrive,
   AlertTriangle,
+  Clock,
+  Compass,
 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -16,12 +18,27 @@ import { StatusDot } from "@/components/ui/StatusDot";
 import { Badge } from "@/components/ui/Badge";
 import { PageHeader, PageContent } from "@/components/layout/Layout";
 import * as cmd from "@/lib/commands";
-import type { RuntimeStatus, PeerView, SubscriptionView, CommunityView, PageId } from "@/lib/types";
+import type {
+  RuntimeStatus,
+  PeerView,
+  SubscriptionView,
+  CommunityView,
+  PageId,
+} from "@/lib/types";
 
 interface DashboardProps {
   status: RuntimeStatus | null;
   onRefresh: () => void;
   onNavigate: (page: PageId) => void;
+}
+
+function timeAgo(unixSecs: number): string {
+  const now = Math.floor(Date.now() / 1000);
+  const diff = now - unixSecs;
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  return `${Math.floor(diff / 86400)}d ago`;
 }
 
 export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
@@ -83,6 +100,10 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
   };
 
   const running = status?.running ?? false;
+  const recentPeers = peers.filter((p) => {
+    const now = Math.floor(Date.now() / 1000);
+    return now - p.last_seen_unix < 300;
+  });
 
   return (
     <PageContent>
@@ -173,7 +194,6 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
             </Badge>
           )}
         </div>
-        {/* Warnings */}
         {status?.warnings && status.warnings.length > 0 && (
           <div className="mt-3 pt-3 border-t border-border">
             {status.warnings.map((w, i) => (
@@ -191,17 +211,24 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
 
       {/* Stats grid */}
       <div className="grid grid-cols-3 gap-4 mb-6">
-        <Card hover onClick={() => onNavigate("peers")}>
+        <Card>
           <CardHeader
             title="Peers"
-            subtitle="Connected nodes"
+            subtitle="Network nodes"
             icon={<Users className="h-4 w-4" />}
           />
-          <p className="text-3xl font-bold text-text-primary">
-            {running ? peers.length : "—"}
-          </p>
+          <div className="flex items-baseline gap-2">
+            <p className="text-3xl font-bold text-text-primary">
+              {running ? peers.length : "—"}
+            </p>
+            {running && recentPeers.length > 0 && (
+              <span className="text-xs text-success">
+                {recentPeers.length} online
+              </span>
+            )}
+          </div>
         </Card>
-        <Card hover onClick={() => onNavigate("subscriptions")}>
+        <Card hover onClick={() => onNavigate("discover")}>
           <CardHeader
             title="Subscriptions"
             subtitle="Synced catalogs"
@@ -223,39 +250,75 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
         </Card>
       </div>
 
-      {/* Recent peers */}
+      {/* Quick actions when running but empty */}
+      {running && peers.length === 0 && subs.length === 0 && (
+        <Card className="mb-6">
+          <div className="flex items-center gap-4 text-sm text-text-secondary">
+            <Compass className="h-5 w-5 text-accent shrink-0" />
+            <p>
+              Your node is running. Peers on the same LAN will be discovered
+              automatically. Go to{" "}
+              <button
+                className="text-accent hover:underline font-medium"
+                onClick={() => onNavigate("discover")}
+              >
+                Discover
+              </button>{" "}
+              to browse shares, or{" "}
+              <button
+                className="text-accent hover:underline font-medium"
+                onClick={() => onNavigate("publish")}
+              >
+                Publish
+              </button>{" "}
+              to share your own content.
+            </p>
+          </div>
+        </Card>
+      )}
+
+      {/* Peers detail */}
       {running && peers.length > 0 && (
         <Card>
           <CardHeader
-            title="Recent Peers"
-            subtitle={`${peers.length} known peer(s)`}
-            action={
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => onNavigate("peers")}
-              >
-                View All
-              </Button>
-            }
+            title="Peers"
+            subtitle={`${peers.length} known · ${recentPeers.length} online`}
+            icon={<Users className="h-4 w-4" />}
           />
-          <div className="space-y-2">
-            {peers.slice(0, 5).map((peer) => (
-              <div
-                key={peer.addr}
-                className="flex items-center justify-between px-3 py-2 rounded-xl bg-surface border border-border-subtle"
-              >
-                <div className="flex items-center gap-3">
-                  <StatusDot status="online" size="sm" label="" />
-                  <span className="text-xs font-mono text-text-secondary selectable">
-                    {peer.addr}
-                  </span>
+          <div className="space-y-1.5">
+            {peers.map((peer) => {
+              const now = Math.floor(Date.now() / 1000);
+              const isRecent = now - peer.last_seen_unix < 300;
+              return (
+                <div
+                  key={peer.addr}
+                  className="flex items-center justify-between px-3 py-2 rounded-xl bg-surface border border-border-subtle"
+                >
+                  <div className="flex items-center gap-3">
+                    <StatusDot
+                      status={isRecent ? "online" : "offline"}
+                      size="sm"
+                      label=""
+                    />
+                    <span className="text-xs font-mono text-text-primary selectable">
+                      {peer.addr}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <span className="text-[10px] text-text-muted flex items-center gap-1">
+                      <Clock className="h-3 w-3" />
+                      {timeAgo(peer.last_seen_unix)}
+                    </span>
+                    <Badge
+                      variant={peer.transport === "Tcp" ? "cyan" : "accent"}
+                      size="sm"
+                    >
+                      {peer.transport}
+                    </Badge>
+                  </div>
                 </div>
-                <Badge variant="default" size="sm">
-                  {peer.transport}
-                </Badge>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Card>
       )}

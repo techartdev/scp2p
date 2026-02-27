@@ -1,12 +1,10 @@
 import { useState, useEffect, useCallback } from "react";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Dashboard } from "@/pages/Dashboard";
-import { Peers } from "@/pages/Peers";
+import { Discover } from "@/pages/Discover";
 import { Communities } from "@/pages/Communities";
-import { Subscriptions } from "@/pages/Subscriptions";
 import { SearchPage } from "@/pages/Search";
 import { Publish } from "@/pages/Publish";
-import { ShareBrowser } from "@/pages/ShareBrowser";
 import { Settings } from "@/pages/Settings";
 import * as cmd from "@/lib/commands";
 import type { RuntimeStatus, PageId } from "@/lib/types";
@@ -49,18 +47,14 @@ export default function App() {
             onNavigate={setPage}
           />
         );
-      case "peers":
-        return <Peers />;
+      case "discover":
+        return <Discover />;
       case "communities":
         return <Communities />;
-      case "subscriptions":
-        return <Subscriptions />;
       case "search":
         return <SearchPage />;
       case "publish":
         return <Publish />;
-      case "share-browser":
-        return <ShareBrowser />;
       case "settings":
         return <Settings />;
       default:

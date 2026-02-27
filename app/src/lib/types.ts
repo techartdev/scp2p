@@ -100,10 +100,8 @@ export interface ShareItemView {
 
 export type PageId =
   | "dashboard"
-  | "peers"
+  | "discover"
   | "communities"
-  | "subscriptions"
   | "search"
   | "publish"
-  | "share-browser"
   | "settings";
