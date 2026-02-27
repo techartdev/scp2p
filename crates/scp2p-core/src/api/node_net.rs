@@ -17,7 +17,7 @@ use crate::{
     manifest::{ManifestV1, ShareVisibility},
     net_fetch::{
         download_swarm_over_network, fetch_chunk_hashes_with_retry, fetch_manifest_with_retry,
-        FetchPolicy, PeerConnector, RequestTransport,
+        FetchPolicy, PeerConnector, ProgressCallback, RequestTransport,
     },
     peer::PeerAddr,
     store::{decrypt_secret, encrypt_secret, PersistedPartialDownload},
@@ -381,6 +381,7 @@ impl NodeHandle {
         target_path: &str,
         policy: &FetchPolicy,
         self_addr: Option<PeerAddr>,
+        on_progress: Option<&ProgressCallback>,
     ) -> anyhow::Result<()> {
         let content = {
             let mut state = self.state.write().await;
@@ -438,7 +439,7 @@ impl NodeHandle {
         };
 
         let bytes =
-            download_swarm_over_network(connector, &all_peers, content_id, &chunk_hashes, policy)
+            download_swarm_over_network(connector, &all_peers, content_id, &chunk_hashes, policy, on_progress)
                 .await?;
         std::fs::write(target_path, &bytes)?;
 

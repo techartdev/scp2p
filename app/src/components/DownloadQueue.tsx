@@ -27,6 +27,11 @@ export interface DownloadJob {
   items: DownloadItem[];
   completedItems: string[];
   completedPaths: string[];
+  /** Byte-level progress from backend chunk events. */
+  bytesDownloaded: number;
+  /** Chunk-level progress from backend. */
+  chunksCompleted: number;
+  chunksTotal: number;
   status: "queued" | "downloading" | "complete" | "error";
   error?: string;
   startedAt?: number;
@@ -84,7 +89,7 @@ function JobRow({
   onRemove: (id: string) => void;
 }) {
   const totalSize = job.items.reduce((a, i) => a + i.size, 0);
-  const completedSize = job.items
+  const completedSize = job.bytesDownloaded > 0 ? job.bytesDownloaded : job.items
     .filter((i) => job.completedItems.includes(i.contentId))
     .reduce((a, i) => a + i.size, 0);
 
@@ -127,7 +132,7 @@ function JobRow({
         {/* Progress bar */}
         {(job.status === "downloading" || job.status === "queued") && (
           <div className="mt-1">
-            <ProgressBar value={job.completedItems.length} max={job.items.length} />
+            <ProgressBar value={completedSize} max={totalSize} />
           </div>
         )}
 

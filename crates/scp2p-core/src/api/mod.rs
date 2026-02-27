@@ -528,6 +528,18 @@ impl NodeHandle {
             .collect()
     }
 
+    /// Return the cached manifest title and description for a given manifest ID.
+    pub async fn cached_manifest_meta(
+        &self,
+        manifest_id: &[u8; 32],
+    ) -> (Option<String>, Option<String>) {
+        let state = self.state.read().await;
+        match state.manifest_cache.get(manifest_id) {
+            Some(m) => (m.title.clone(), m.description.clone()),
+            None => (None, None),
+        }
+    }
+
     pub async fn communities(&self) -> Vec<PersistedCommunity> {
         let state = self.state.read().await;
         state

@@ -150,6 +150,11 @@ pub struct FetchPolicy {
     pub parallel_chunks: usize,
 }
 
+/// Callback invoked after each chunk is verified and stored.
+///
+/// Arguments: `(completed_chunks, total_chunks, bytes_so_far)`.
+pub type ProgressCallback = Box<dyn Fn(u32, u32, u64) + Send + Sync>;
+
 impl Default for FetchPolicy {
     fn default() -> Self {
         Self {
@@ -288,6 +293,7 @@ pub async fn download_swarm_over_network<T: RequestTransport + ?Sized>(
     content_id: [u8; 32],
     chunk_hashes: &[[u8; 32]],
     policy: &FetchPolicy,
+    on_progress: Option<&ProgressCallback>,
 ) -> anyhow::Result<Vec<u8>> {
     if peers.is_empty() {
         anyhow::bail!("no peers available for content download");
@@ -300,6 +306,7 @@ pub async fn download_swarm_over_network<T: RequestTransport + ?Sized>(
 
     let mut completed: Vec<Option<Vec<u8>>> = vec![None; total_chunks];
     let mut completed_count = 0usize;
+    let mut completed_bytes = 0u64;
 
     let mut stats: HashMap<String, PeerRuntimeStats> = peers
         .iter()
@@ -393,8 +400,13 @@ pub async fn download_swarm_over_network<T: RequestTransport + ?Sized>(
                     s.consecutive_failures = 0;
                     s.backoff_until = None;
                 }
+                let chunk_len = bytes.len() as u64;
                 completed[res.chunk_idx] = Some(bytes);
                 completed_count += 1;
+                completed_bytes += chunk_len;
+                if let Some(cb) = &on_progress {
+                    cb(completed_count as u32, total_chunks as u32, completed_bytes);
+                }
             }
             Ok(_) => {
                 // Hash mismatch — penalise peer, retry chunk
@@ -873,7 +885,7 @@ mod tests {
             ..FetchPolicy::default()
         };
         let out =
-            download_swarm_over_network(&transport, &[peer_a, peer_b], cid, &desc.chunks, &policy)
+            download_swarm_over_network(&transport, &[peer_a, peer_b], cid, &desc.chunks, &policy, None)
                 .await
                 .expect("download");
         assert_eq!(out, bytes);
@@ -938,11 +950,11 @@ mod tests {
         let single_chunk = vec![desc.chunks[0]];
         let p = FetchPolicy::default();
         let _ =
-            download_swarm_over_network(&pool, std::slice::from_ref(&peer), cid, &single_chunk, &p)
+            download_swarm_over_network(&pool, std::slice::from_ref(&peer), cid, &single_chunk, &p, None)
                 .await
                 .expect("download1");
         let _ =
-            download_swarm_over_network(&pool, std::slice::from_ref(&peer), cid, &single_chunk, &p)
+            download_swarm_over_network(&pool, std::slice::from_ref(&peer), cid, &single_chunk, &p, None)
                 .await
                 .expect("download2");
 
@@ -1059,6 +1071,7 @@ mod tests {
             cid,
             &desc.chunks,
             &policy,
+            None,
         )
         .await
         .expect("parallel download");
@@ -1129,6 +1142,7 @@ mod tests {
             cid,
             &desc.chunks,
             &policy,
+            None,
         )
         .await
         .expect("download with retries");

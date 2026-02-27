@@ -35,6 +35,8 @@ export interface SubscriptionView {
   latest_seq: number;
   latest_manifest_id_hex: string | null;
   trust_level: string;
+  title: string | null;
+  description: string | null;
 }
 
 export interface CommunityView {

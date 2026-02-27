@@ -9,6 +9,8 @@ use scp2p_desktop::{
     PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
     SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
 };
+use serde::Serialize;
+use tauri::Emitter;
 
 struct AppState(DesktopAppState);
 
@@ -243,14 +245,34 @@ async fn browse_share_items(
         .map_err(|e| format!("{e:#}"))
 }
 
+#[derive(Clone, Serialize)]
+struct DownloadProgress {
+    content_id_hex: String,
+    completed_chunks: u32,
+    total_chunks: u32,
+    bytes_downloaded: u64,
+}
+
 #[tauri::command]
 async fn download_share_items(
+    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     share_id_hex: String,
     content_ids_hex: Vec<String>,
     target_dir: String,
 ) -> Result<Vec<String>, String> {
-    commands::download_share_items(&state.0, share_id_hex, content_ids_hex, target_dir)
+    let progress_cb: scp2p_core::ProgressCallback = {
+        let app = app.clone();
+        Box::new(move |completed_chunks, total_chunks, bytes_downloaded| {
+            let _ = app.emit("download-progress", DownloadProgress {
+                content_id_hex: String::new(),
+                completed_chunks,
+                total_chunks,
+                bytes_downloaded,
+            });
+        })
+    };
+    commands::download_share_items(&state.0, share_id_hex, content_ids_hex, target_dir, Some(&progress_cb))
         .await
         .map_err(|e| format!("{e:#}"))
 }

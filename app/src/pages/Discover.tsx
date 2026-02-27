@@ -27,6 +27,7 @@ import {
   GripHorizontal,
 } from "lucide-react";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -161,8 +162,8 @@ function mergeEntries(
     map.set(s.share_id_hex, {
       share_id_hex: s.share_id_hex,
       share_pubkey_hex: s.share_pubkey_hex,
-      title: null,
-      description: null,
+      title: s.title ?? null,
+      description: s.description ?? null,
       source: "subscription",
       latest_seq: s.latest_seq,
       trust_level: s.trust_level,
@@ -512,6 +513,31 @@ export function Discover() {
 
   /* ── Download queue logic ──────────────────────────────────────────── */
 
+  // Listen to backend chunk-level progress events
+  useEffect(() => {
+    const unlisten = listen<{
+      completed_chunks: number;
+      total_chunks: number;
+      bytes_downloaded: number;
+    }>("download-progress", (event) => {
+      setDownloadJobs((prev) =>
+        prev.map((j) =>
+          j.status === "downloading"
+            ? {
+                ...j,
+                chunksCompleted: event.payload.completed_chunks,
+                chunksTotal: event.payload.total_chunks,
+                bytesDownloaded: event.payload.bytes_downloaded,
+              }
+            : j
+        )
+      );
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   const processQueue = useCallback(async (jobs: DownloadJob[]) => {
     if (processingRef.current) return;
     const next = jobs.find((j) => j.status === "queued");
@@ -528,52 +554,49 @@ export function Discover() {
       )
     );
 
-    // Download items one at a time for per-file progress
-    for (const item of next.items) {
-      try {
-        const paths = await cmd.downloadShareItems(
-          next.shareId,
-          [item.contentId],
-          next.targetDir
-        );
-        setDownloadJobs((prev) =>
-          prev.map((j) =>
-            j.id === next.id
-              ? {
-                  ...j,
-                  completedItems: [...j.completedItems, item.contentId],
-                  completedPaths: [...j.completedPaths, ...paths],
-                }
-              : j
-          )
-        );
-      } catch (e) {
-        setDownloadJobs((prev) =>
-          prev.map((j) =>
-            j.id === next.id
-              ? { ...j, status: "error" as const, error: String(e), completedAt: Date.now() }
-              : j
-          )
-        );
-        processingRef.current = false;
-        return;
-      }
-    }
-
-    // Mark complete
-    setDownloadJobs((prev) => {
-      const updated = prev.map((j) =>
-        j.id === next.id
-          ? { ...j, status: "complete" as const, completedAt: Date.now() }
-          : j
+    // Download all items at once — backend emits chunk-level progress events
+    try {
+      const contentIds = next.items.map((i) => i.contentId);
+      const paths = await cmd.downloadShareItems(
+        next.shareId,
+        contentIds,
+        next.targetDir
       );
-      // Kick off next queued job
-      setTimeout(() => {
-        processingRef.current = false;
-        processQueue(updated);
-      }, 0);
-      return updated;
-    });
+
+      // Mark complete
+      setDownloadJobs((prev) => {
+        const updated = prev.map((j) =>
+          j.id === next.id
+            ? {
+                ...j,
+                status: "complete" as const,
+                completedAt: Date.now(),
+                completedItems: contentIds,
+                completedPaths: paths,
+                bytesDownloaded: j.items.reduce((a, i) => a + i.size, 0),
+              }
+            : j
+        );
+        setTimeout(() => {
+          processingRef.current = false;
+          processQueue(updated);
+        }, 0);
+        return updated;
+      });
+    } catch (e) {
+      setDownloadJobs((prev) => {
+        const updated = prev.map((j) =>
+          j.id === next.id
+            ? { ...j, status: "error" as const, error: String(e), completedAt: Date.now() }
+            : j
+        );
+        setTimeout(() => {
+          processingRef.current = false;
+          processQueue(updated);
+        }, 0);
+        return updated;
+      });
+    }
   }, []);
 
   // Process queue whenever jobs change
@@ -609,6 +632,9 @@ export function Discover() {
         completedItems: [],
         completedPaths: [],
         status: "queued",
+        bytesDownloaded: 0,
+        chunksCompleted: 0,
+        chunksTotal: 0,
       };
 
       setDownloadJobs((prev) => [...prev, job]);

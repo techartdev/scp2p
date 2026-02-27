@@ -13,7 +13,7 @@ use rand::{rngs::OsRng, RngCore};
 use scp2p_core::{
     describe_content, transport_net::tcp_connect_session, BoxedStream, Capabilities,
     DirectRequestTransport, FetchPolicy, ItemV1, ManifestV1, Node, NodeConfig, NodeHandle,
-    OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord, PersistedSubscription,
+    OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord,
     PublicShareSummary, SearchPageQuery, ShareItemInfo, ShareVisibility, SqliteStore, Store,
     TransportProtocol,
 };
@@ -194,12 +194,24 @@ impl DesktopAppState {
 
     pub async fn subscription_views(&self) -> anyhow::Result<Vec<SubscriptionView>> {
         let node = self.node_handle().await?;
-        Ok(node
-            .subscriptions()
-            .await
-            .into_iter()
-            .map(subscription_view)
-            .collect())
+        let subs = node.subscriptions().await;
+        let mut views = Vec::with_capacity(subs.len());
+        for sub in subs {
+            let (title, description) = match sub.latest_manifest_id {
+                Some(mid) => node.cached_manifest_meta(&mid).await,
+                None => (None, None),
+            };
+            views.push(SubscriptionView {
+                share_id_hex: hex::encode(sub.share_id),
+                share_pubkey_hex: sub.share_pubkey.map(hex::encode),
+                latest_seq: sub.latest_seq,
+                latest_manifest_id_hex: sub.latest_manifest_id.map(hex::encode),
+                trust_level: sub.trust_level,
+                title,
+                description,
+            });
+        }
+        Ok(views)
     }
 
     pub async fn community_views(&self) -> anyhow::Result<Vec<CommunityView>> {
@@ -474,6 +486,7 @@ impl DesktopAppState {
             target_path,
             &scp2p_core::FetchPolicy::default(),
             self_addr,
+            None,
         )
         .await
     }
@@ -784,6 +797,7 @@ impl DesktopAppState {
         share_id_hex: &str,
         content_ids_hex: &[String],
         target_dir: &str,
+        on_progress: Option<&scp2p_core::ProgressCallback>,
     ) -> anyhow::Result<Vec<String>> {
         let node = self.node_handle().await?;
         let share_id = parse_hex_32(share_id_hex, "share_id")?;
@@ -840,6 +854,7 @@ impl DesktopAppState {
                 &dest.to_string_lossy(),
                 &policy,
                 self_addr.clone(),
+                on_progress,
             )
             .await?;
             downloaded.push(dest.to_string_lossy().to_string());
@@ -853,16 +868,6 @@ fn peer_view(record: PeerRecord) -> PeerView {
         addr: format!("{}:{}", record.addr.ip, record.addr.port),
         transport: format!("{:?}", record.addr.transport),
         last_seen_unix: record.last_seen_unix,
-    }
-}
-
-fn subscription_view(sub: PersistedSubscription) -> SubscriptionView {
-    SubscriptionView {
-        share_id_hex: hex::encode(sub.share_id),
-        share_pubkey_hex: sub.share_pubkey.map(hex::encode),
-        latest_seq: sub.latest_seq,
-        latest_manifest_id_hex: sub.latest_manifest_id.map(hex::encode),
-        trust_level: sub.trust_level,
     }
 }
 

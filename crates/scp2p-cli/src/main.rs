@@ -408,6 +408,7 @@ async fn main() -> anyhow::Result<()> {
                 &out,
                 &FetchPolicy::default(),
                 None,
+                None,
             )
             .await?;
             println!(
@@ -563,6 +564,7 @@ async fn main() -> anyhow::Result<()> {
                     item.content_id,
                     &dest.to_string_lossy(),
                     &policy,
+                    None,
                     None,
                 )
                 .await?;

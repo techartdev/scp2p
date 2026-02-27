@@ -71,6 +71,8 @@ pub struct SubscriptionView {
     pub latest_seq: u64,
     pub latest_manifest_id_hex: Option<String>,
     pub trust_level: SubscriptionTrustLevel,
+    pub title: Option<String>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -45,7 +45,7 @@ pub use manifest::{
 };
 pub use net_fetch::{
     download_swarm_over_network, fetch_manifest_with_retry, BoxedStream, DirectRequestTransport,
-    FetchPolicy, PeerConnector, RequestTransport, SessionPoolTransport,
+    FetchPolicy, PeerConnector, ProgressCallback, RequestTransport, SessionPoolTransport,
 };
 pub use peer::{PeerAddr, TransportProtocol};
 pub use peer_db::{PeerDb, PeerRecord, PEX_FRESHNESS_WINDOW_SECS, PEX_MAX_PEERS};

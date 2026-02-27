@@ -177,9 +177,10 @@ pub async fn download_share_items(
     share_id_hex: String,
     content_ids_hex: Vec<String>,
     target_dir: String,
+    on_progress: Option<&scp2p_core::ProgressCallback>,
 ) -> anyhow::Result<Vec<String>> {
     app_state
-        .download_share_items(&share_id_hex, &content_ids_hex, &target_dir)
+        .download_share_items(&share_id_hex, &content_ids_hex, &target_dir, on_progress)
         .await
 }
 

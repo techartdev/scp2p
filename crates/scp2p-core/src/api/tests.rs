@@ -753,6 +753,7 @@ async fn tcp_runtime_serves_chunk_data_for_network_download() {
             target.to_str().expect("utf8 path"),
             &FetchPolicy::default(),
             None,
+            None,
         )
         .await
         .expect("download over network");
@@ -909,6 +910,7 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
             target_v1.to_str().expect("utf8 path"),
             &FetchPolicy::default(),
             None,
+            None,
         )
         .await
         .expect("download v1");
@@ -1009,6 +1011,7 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
             desc_v2.content_id.0,
             target_v2.to_str().expect("utf8 path"),
             &FetchPolicy::default(),
+            None,
             None,
         )
         .await
@@ -1225,6 +1228,7 @@ async fn multi_node_churn_soak_is_configurable() {
                         desc.content_id.0,
                         target.to_str().expect("utf8 path"),
                         &FetchPolicy::default(),
+                        None,
                         None,
                     )
                     .await
@@ -2567,6 +2571,7 @@ async fn download_from_peers_self_seeds_after_completion() {
             target.to_str().expect("utf8 path"),
             &FetchPolicy::default(),
             Some(client_self_addr.clone()),
+            None,
         )
         .await
         .expect("download with self-seed");
