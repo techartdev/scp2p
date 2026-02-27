@@ -3,13 +3,13 @@
 use crate::{
     peer::PeerAddr,
     relay::RelayLimits,
-    wire::{
-        RelayConnect, RelayPayloadKind as WireRelayPayloadKind, RelayRegistered, RelayStream,
-    },
+    wire::{RelayConnect, RelayPayloadKind as WireRelayPayloadKind, RelayRegistered, RelayStream},
 };
 
 use super::{
-    helpers::{now_unix_secs, persist_state, relay_payload_kind_to_internal, relay_payload_kind_to_wire, relay_peer_key},
+    helpers::{
+        now_unix_secs, relay_payload_kind_to_internal, relay_payload_kind_to_wire, relay_peer_key,
+    },
     AbuseLimits, NodeHandle,
 };
 

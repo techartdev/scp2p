@@ -19,8 +19,8 @@ use crate::{
     wire::{
         CommunityPublicShareList, CommunityStatus, Envelope, FindNode, FindNodeResult, FindValue,
         FindValueResult, GetCommunityStatus, ListCommunityPublicShares, ListPublicShares, MsgType,
-        Providers, PublicShareList, Store as WireStore, WirePayload, FLAG_RESPONSE,
-        RelayPayloadKind as WireRelayPayloadKind,
+        Providers, PublicShareList, RelayPayloadKind as WireRelayPayloadKind, Store as WireStore,
+        WirePayload, FLAG_RESPONSE,
     },
 };
 
@@ -51,9 +51,7 @@ pub(super) fn relay_payload_kind_to_internal(
     }
 }
 
-pub(super) fn relay_payload_kind_to_wire(
-    kind: RelayInternalPayloadKind,
-) -> WireRelayPayloadKind {
+pub(super) fn relay_payload_kind_to_wire(kind: RelayInternalPayloadKind) -> WireRelayPayloadKind {
     match kind {
         RelayInternalPayloadKind::Control => WireRelayPayloadKind::Control,
         RelayInternalPayloadKind::Content => WireRelayPayloadKind::Content,

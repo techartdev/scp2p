@@ -1,12 +1,18 @@
 use super::*;
 use crate::{
     capabilities::Capabilities,
+    ids::NodeId,
     manifest::ItemV1,
-    net_fetch::{BoxedStream, PeerConnector, RequestTransport},
+    net_fetch::{BoxedStream, FetchPolicy, PeerConnector, RequestTransport},
     peer::TransportProtocol,
+    relay::RelayLimits,
     store::MemoryStore,
     transport_net::tcp_connect_session,
-    wire::{FindNodeResult, FindValueResult, MsgType},
+    wire::{
+        CommunityStatus, Envelope, FindNode, FindNodeResult, FindValueResult, MsgType, Providers,
+        PublicShareList, RelayConnect, RelayPayloadKind as WireRelayPayloadKind, RelayRegister,
+        RelayRegistered, RelayStream, Store as WireStore, WirePayload, FLAG_ERROR, FLAG_RESPONSE,
+    },
 };
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
@@ -465,8 +471,8 @@ async fn dht_iterative_find_share_head_verifies_signature_with_known_pubkey() {
         pubkey_hint: Some([15u8; 32]),
     };
 
-    let head = ShareHead::new_signed(share_id.0, 3, [42u8; 32], 1_700_000_000, &share)
-        .expect("sign head");
+    let head =
+        ShareHead::new_signed(share_id.0, 3, [42u8; 32], 1_700_000_000, &share).expect("sign head");
     transport
         .register(&peer, move |request| {
             let typed = request.decode_typed()?;
@@ -517,8 +523,8 @@ async fn dht_iterative_find_share_head_rejects_tampered_signature_with_known_pub
         pubkey_hint: Some([16u8; 32]),
     };
 
-    let mut head = ShareHead::new_signed(share_id.0, 4, [43u8; 32], 1_700_000_001, &share)
-        .expect("sign head");
+    let mut head =
+        ShareHead::new_signed(share_id.0, 4, [43u8; 32], 1_700_000_001, &share).expect("sign head");
     head.sig[0] ^= 0x01;
     transport
         .register(&peer, move |request| {

@@ -214,8 +214,7 @@ pub async fn fetch_chunk_hashes_with_retry<T: RequestTransport + ?Sized>(
                     }
                     let actual_hash = compute_chunk_list_hash(&hashes);
                     if actual_hash != expected_chunk_list_hash {
-                        last_err =
-                            Some(anyhow::anyhow!("chunk_list_hash verification failed"));
+                        last_err = Some(anyhow::anyhow!("chunk_list_hash verification failed"));
                         continue;
                     }
                     return Ok(hashes);

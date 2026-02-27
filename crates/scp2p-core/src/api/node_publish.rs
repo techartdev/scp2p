@@ -6,9 +6,9 @@ use anyhow::Context as _;
 
 use crate::{
     content::describe_content,
-    dht::{DEFAULT_TTL_SECS, K},
+    dht::DEFAULT_TTL_SECS,
     dht_keys::{content_provider_key, share_head_key},
-    ids::{ContentId, ShareId},
+    ids::ShareId,
     manifest::{ItemV1, ManifestV1, ShareHead, ShareKeypair, ShareVisibility},
     peer::PeerAddr,
     wire::Providers,

@@ -6,7 +6,6 @@ use ed25519_dalek::VerifyingKey;
 
 use crate::{
     content::ChunkedContent,
-    dht::{DEFAULT_TTL_SECS, K},
     dht_keys::{content_provider_key, share_head_key},
     ids::{ContentId, ShareId},
     manifest::ManifestV1,
@@ -20,8 +19,8 @@ use crate::{
     transport::{read_envelope, write_envelope},
     wire::{
         ChunkData, CommunityPublicShareList, CommunityStatus, Envelope, FindNode, FindNodeResult,
-        FindValueResult, MsgType, PublicShareList, RelayRegister, Store as WireStore, WirePayload,
-        Providers, FLAG_RESPONSE,
+        FindValueResult, MsgType, Providers, PublicShareList, RelayRegister, Store as WireStore,
+        WirePayload, FLAG_RESPONSE,
     },
 };
 
@@ -66,8 +65,7 @@ impl NodeHandle {
                 continue;
             }
 
-            let Some(manifest) = state.manifest_cache.get(&head.latest_manifest_id).cloned()
-            else {
+            let Some(manifest) = state.manifest_cache.get(&head.latest_manifest_id).cloned() else {
                 continue;
             };
             manifest.verify()?;
@@ -488,7 +486,7 @@ impl NodeHandle {
         }
     }
 
-    async fn handle_incoming_envelope(
+    pub(super) async fn handle_incoming_envelope(
         &self,
         envelope: Envelope,
         remote_peer: Option<&PeerAddr>,

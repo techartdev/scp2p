@@ -1,11 +1,6 @@
 //! DHT operations on `NodeHandle`: local and iterative find/store, republish loops.
 
-use std::{
-    collections::HashSet,
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 use ed25519_dalek::SigningKey;
 use rand::RngCore;
@@ -26,9 +21,8 @@ use crate::{
 
 use super::{
     helpers::{
-        merge_peer_list, now_unix_secs, peer_key, persist_state, query_find_node,
-        query_find_value, replicate_store_to_closest, sort_peers_for_target,
-        validate_dht_value_for_known_keyspaces,
+        merge_peer_list, now_unix_secs, peer_key, persist_state, query_find_node, query_find_value,
+        replicate_store_to_closest, sort_peers_for_target, validate_dht_value_for_known_keyspaces,
     },
     NodeHandle,
 };
