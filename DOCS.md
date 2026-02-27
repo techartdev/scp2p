@@ -143,8 +143,18 @@ The API is currently centered around `Node` and `NodeHandle`.
 - `NodeHandle::set_abuse_limits(limits)`
 
 ### Transport/session primitives (spec section 3 foundations)
-- `handshake_initiator(...)`
-- `handshake_responder(...)`
+
+The handshake uses a **3-message** mutual-authentication flow:
+
+1. **ClientHello →** initiator sends pubkey, capabilities, nonce (no echoed nonce).
+2. **ServerHello ←** responder sends pubkey, capabilities, nonce, echoing the client's nonce.
+3. **ClientAck  →** initiator echoes the server's nonce, proving both sides are channel-bound.
+
+All three messages are Ed25519-signed `HandshakeHello` structs.  Frame lengths
+use a 4-byte **big-endian** (network byte order) prefix.
+
+- `handshake_initiator(...)` — performs steps 1-3 on the client side.
+- `handshake_responder(...)` — performs steps 1-3 on the server side.
 - `read_envelope(...)` / `write_envelope(...)`
 - `dispatch_envelope(...)`
 - `run_message_loop(...)`

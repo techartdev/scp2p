@@ -51,6 +51,13 @@ fn default_protocol_version() -> u16 {
 #[derive(Serialize)]
 struct HandshakeSigningTuple([u8; 32], Capabilities, [u8; 32], Option<[u8; 32]>, u64, u16);
 
+/// Perform the initiator (client) side of the 3-message handshake:
+///
+/// 1. **ClientHello** → send our pubkey, capabilities, nonce (no echoed nonce).
+/// 2. **ServerHello** ← receive server's pubkey, capabilities, nonce, and
+///    verify it echoes our nonce.
+/// 3. **ClientAck**   → send acknowledgement echoing the server's nonce,
+///    proving we observed message 2.
 pub async fn handshake_initiator<S>(
     io: &mut S,
     local_signing_key: &SigningKey,
@@ -61,28 +68,46 @@ pub async fn handshake_initiator<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let client = signed_hello(local_signing_key, capabilities, local_nonce, None)?;
-    write_handshake_hello(io, &client).await?;
+    // Step 1 – ClientHello
+    let client_hello = signed_hello(local_signing_key, capabilities.clone(), local_nonce, None)?;
+    write_handshake_hello(io, &client_hello).await?;
 
-    let server = read_handshake_hello(io).await?;
-    verify_hello(&server)?;
-    if server.echoed_nonce != Some(local_nonce) {
+    // Step 2 – ServerHello
+    let server_hello = read_handshake_hello(io).await?;
+    verify_hello(&server_hello)?;
+    if server_hello.echoed_nonce != Some(local_nonce) {
         anyhow::bail!("server handshake does not bind initiator nonce");
     }
     if let Some(expected) = expected_remote_pubkey {
-        if server.node_pubkey != expected {
+        if server_hello.node_pubkey != expected {
             anyhow::bail!("remote pubkey mismatch");
         }
     }
 
+    // Step 3 – ClientAck (echo server nonce)
+    let ack = signed_hello(
+        local_signing_key,
+        capabilities,
+        local_nonce,
+        Some(server_hello.nonce),
+    )?;
+    write_handshake_hello(io, &ack).await?;
+
     Ok(AuthenticatedSession {
-        remote_node_pubkey: server.node_pubkey,
-        remote_capabilities: server.capabilities,
-        remote_nonce: server.nonce,
-        remote_protocol_version: server.protocol_version,
+        remote_node_pubkey: server_hello.node_pubkey,
+        remote_capabilities: server_hello.capabilities,
+        remote_nonce: server_hello.nonce,
+        remote_protocol_version: server_hello.protocol_version,
     })
 }
 
+/// Perform the responder (server) side of the 3-message handshake:
+///
+/// 1. **ClientHello** ← read initiator's pubkey, capabilities, nonce.
+/// 2. **ServerHello** → send our pubkey, capabilities, nonce, echoing the
+///    client's nonce.
+/// 3. **ClientAck**   ← read the initiator's acknowledgement and verify it
+///    echoes our nonce, proving the initiator observed message 2.
 pub async fn handshake_responder<S>(
     io: &mut S,
     local_signing_key: &SigningKey,
@@ -93,27 +118,39 @@ pub async fn handshake_responder<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let client = read_handshake_hello(io).await?;
-    verify_hello(&client)?;
+    // Step 1 – ClientHello
+    let client_hello = read_handshake_hello(io).await?;
+    verify_hello(&client_hello)?;
     if let Some(expected) = expected_remote_pubkey {
-        if client.node_pubkey != expected {
+        if client_hello.node_pubkey != expected {
             anyhow::bail!("remote pubkey mismatch");
         }
     }
 
-    let server = signed_hello(
+    // Step 2 – ServerHello (echo client nonce)
+    let server_hello = signed_hello(
         local_signing_key,
         capabilities,
         local_nonce,
-        Some(client.nonce),
+        Some(client_hello.nonce),
     )?;
-    write_handshake_hello(io, &server).await?;
+    write_handshake_hello(io, &server_hello).await?;
+
+    // Step 3 – ClientAck (verify it echoes our nonce)
+    let ack = read_handshake_hello(io).await?;
+    verify_hello(&ack)?;
+    if ack.node_pubkey != client_hello.node_pubkey {
+        anyhow::bail!("client ack pubkey does not match initial hello");
+    }
+    if ack.echoed_nonce != Some(local_nonce) {
+        anyhow::bail!("client ack does not bind responder nonce");
+    }
 
     Ok(AuthenticatedSession {
-        remote_node_pubkey: client.node_pubkey,
-        remote_capabilities: client.capabilities,
-        remote_nonce: client.nonce,
-        remote_protocol_version: client.protocol_version,
+        remote_node_pubkey: client_hello.node_pubkey,
+        remote_capabilities: client_hello.capabilities,
+        remote_nonce: client_hello.nonce,
+        remote_protocol_version: client_hello.protocol_version,
     })
 }
 
@@ -225,22 +262,27 @@ where
     Envelope::decode_with_limits(&encoded, MAX_ENVELOPE_BYTES, MAX_ENVELOPE_PAYLOAD_BYTES)
 }
 
+/// Write a length-prefixed frame.  The 4-byte length prefix is big-endian
+/// (network byte order), followed by the raw payload bytes.
 async fn write_frame<S>(io: &mut S, data: &[u8]) -> anyhow::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
     let len = u32::try_from(data.len()).context("frame too large for u32 length prefix")?;
-    io.write_u32(len).await?;
+    io.write_u32(len).await?; // big-endian by tokio default
     io.write_all(data).await?;
     io.flush().await?;
     Ok(())
 }
 
+/// Read a length-prefixed frame.  Expects a 4-byte big-endian length
+/// followed by that many payload bytes.  Rejects frames larger than
+/// `max_len`.
 async fn read_frame<S>(io: &mut S, max_len: usize) -> anyhow::Result<Vec<u8>>
 where
     S: AsyncRead + Unpin,
 {
-    let len = io.read_u32().await? as usize;
+    let len = io.read_u32().await? as usize; // big-endian by tokio default
     if len > max_len {
         anyhow::bail!("frame exceeds max size");
     }
@@ -781,5 +823,116 @@ mod tests {
             .expect_err("should reject oversized frame");
         assert!(err.to_string().contains("frame exceeds max size"));
         send.await.expect("join");
+    }
+
+    /// Verify that the responder rejects a ClientAck whose echoed_nonce does
+    /// not match the server's local nonce (3-message binding).
+    #[tokio::test]
+    async fn responder_rejects_wrong_ack_nonce() {
+        let mut rng = StdRng::seed_from_u64(77);
+        let client_key = SigningKey::generate(&mut rng);
+        let server_key = SigningKey::generate(&mut rng);
+        let client_nonce = [10u8; 32];
+        let server_nonce = [20u8; 32];
+
+        let (mut client_io, mut server_io) = tokio::io::duplex(8192);
+
+        // Drive the client side manually: send hello, read server hello, send
+        // an ack with the *wrong* echoed nonce.
+        let client_task = tokio::spawn(async move {
+            // Step 1 – send valid ClientHello
+            let hello = signed_hello(&client_key, Capabilities::default(), client_nonce, None)
+                .expect("client hello");
+            write_handshake_hello(&mut client_io, &hello)
+                .await
+                .expect("send hello");
+
+            // Step 2 – read ServerHello (don't bother verifying fully here)
+            let _server = read_handshake_hello(&mut client_io)
+                .await
+                .expect("read server hello");
+
+            // Step 3 – send ack with WRONG echoed nonce
+            let bad_ack = signed_hello(
+                &client_key,
+                Capabilities::default(),
+                client_nonce,
+                Some([0xFFu8; 32]), // wrong nonce
+            )
+            .expect("bad ack");
+            write_handshake_hello(&mut client_io, &bad_ack)
+                .await
+                .expect("send bad ack");
+        });
+
+        let err = handshake_responder(
+            &mut server_io,
+            &server_key,
+            Capabilities::default(),
+            server_nonce,
+            None,
+        )
+        .await
+        .expect_err("responder must reject wrong ack nonce");
+        assert!(err
+            .to_string()
+            .contains("client ack does not bind responder nonce"));
+
+        client_task.await.expect("client task");
+    }
+
+    /// Verify the responder rejects a ClientAck from a different pubkey than
+    /// the original ClientHello.
+    #[tokio::test]
+    async fn responder_rejects_ack_pubkey_mismatch() {
+        let mut rng = StdRng::seed_from_u64(88);
+        let client_key = SigningKey::generate(&mut rng);
+        let imposter_key = SigningKey::generate(&mut rng);
+        let server_key = SigningKey::generate(&mut rng);
+        let client_nonce = [11u8; 32];
+        let server_nonce = [22u8; 32];
+
+        let (mut client_io, mut server_io) = tokio::io::duplex(8192);
+
+        let client_task = tokio::spawn(async move {
+            // Step 1 – valid ClientHello
+            let hello = signed_hello(&client_key, Capabilities::default(), client_nonce, None)
+                .expect("client hello");
+            write_handshake_hello(&mut client_io, &hello)
+                .await
+                .expect("send hello");
+
+            // Step 2 – read ServerHello
+            let server = read_handshake_hello(&mut client_io)
+                .await
+                .expect("read server hello");
+
+            // Step 3 – send ack signed by a *different* key
+            let bad_ack = signed_hello(
+                &imposter_key,
+                Capabilities::default(),
+                client_nonce,
+                Some(server.nonce),
+            )
+            .expect("imposter ack");
+            write_handshake_hello(&mut client_io, &bad_ack)
+                .await
+                .expect("send imposter ack");
+        });
+
+        let err = handshake_responder(
+            &mut server_io,
+            &server_key,
+            Capabilities::default(),
+            server_nonce,
+            None,
+        )
+        .await
+        .expect_err("responder must reject ack from different pubkey");
+        assert!(err
+            .to_string()
+            .contains("client ack pubkey does not match initial hello"));
+
+        client_task.await.expect("client task");
     }
 }
