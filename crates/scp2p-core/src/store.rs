@@ -29,6 +29,10 @@ const KEY_KDF_ITERATIONS: u32 = 120_000;
 pub struct PersistedState {
     pub peers: Vec<PeerRecord>,
     pub subscriptions: Vec<PersistedSubscription>,
+    #[serde(default)]
+    pub communities: Vec<PersistedCommunity>,
+    #[serde(default)]
+    pub publisher_identities: Vec<PersistedPublisherIdentity>,
     pub manifests: HashMap<[u8; 32], ManifestV1>,
     pub share_heads: HashMap<[u8; 32], ShareHead>,
     pub share_weights: HashMap<[u8; 32], f32>,
@@ -49,6 +53,18 @@ pub struct PersistedSubscription {
     pub latest_manifest_id: Option<[u8; 32]>,
     #[serde(default)]
     pub trust_level: SubscriptionTrustLevel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedCommunity {
+    pub share_id: [u8; 32],
+    pub share_pubkey: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedPublisherIdentity {
+    pub label: String,
+    pub share_secret: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -197,6 +213,28 @@ impl Store for SqliteStore {
             }
         }
 
+        state.communities = conn
+            .query_row(
+                "SELECT payload FROM metadata WHERE key = 'communities'",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|payload| serde_cbor::from_slice(&payload))
+            .transpose()?
+            .unwrap_or_default();
+
+        state.publisher_identities = conn
+            .query_row(
+                "SELECT payload FROM metadata WHERE key = 'publisher_identities'",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|payload| serde_cbor::from_slice(&payload))
+            .transpose()?
+            .unwrap_or_default();
+
         {
             let mut stmt = conn.prepare("SELECT manifest_id, payload FROM manifests")?;
             let rows = stmt.query_map([], |row| {
@@ -296,6 +334,8 @@ impl Store for SqliteStore {
 
         let has_normalized_data = !state.peers.is_empty()
             || !state.subscriptions.is_empty()
+            || !state.communities.is_empty()
+            || !state.publisher_identities.is_empty()
             || !state.manifests.is_empty()
             || !state.share_heads.is_empty()
             || !state.share_weights.is_empty()
@@ -353,6 +393,18 @@ impl Store for SqliteStore {
                     sub.latest_manifest_id.map(|v| v.to_vec()),
                     trust_level_str(sub.trust_level),
                 ],
+            )?;
+        }
+        if !state.communities.is_empty() {
+            tx.execute(
+                "INSERT INTO metadata(key, payload) VALUES('communities', ?1)",
+                params![serde_cbor::to_vec(&state.communities)?],
+            )?;
+        }
+        if !state.publisher_identities.is_empty() {
+            tx.execute(
+                "INSERT INTO metadata(key, payload) VALUES('publisher_identities', ?1)",
+                params![serde_cbor::to_vec(&state.publisher_identities)?],
             )?;
         }
 

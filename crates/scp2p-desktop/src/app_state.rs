@@ -5,9 +5,10 @@ use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use rand::{rngs::OsRng, RngCore};
 use scp2p_core::{
-    transport_net::tcp_connect_session, BoxedStream, Capabilities, DirectRequestTransport, Node,
-    NodeConfig, NodeHandle, PeerAddr, PeerConnector, PeerRecord, PersistedSubscription,
-    SearchPageQuery, SqliteStore, Store, TransportProtocol,
+    describe_content, transport_net::tcp_connect_session, BoxedStream, Capabilities,
+    DirectRequestTransport, ItemV1, ManifestV1, Node, NodeConfig, NodeHandle, PeerAddr,
+    PeerConnector, PeerRecord, PersistedSubscription, PublicShareSummary, SearchPageQuery,
+    ShareVisibility, SqliteStore, Store, TransportProtocol,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -16,8 +17,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 
 use crate::dto::{
-    DesktopClientConfig, PeerView, RuntimeStatus, SearchResultView, SearchResultsView,
-    StartNodeRequest, SubscriptionView,
+    CommunityBrowseView, CommunityParticipantView, CommunityView, DesktopClientConfig, PeerView,
+    PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus, SearchResultView,
+    SearchResultsView, StartNodeRequest, SubscriptionView,
 };
 
 #[derive(Clone, Default)]
@@ -31,6 +33,7 @@ struct RuntimeState {
     state_db_path: Option<PathBuf>,
     tcp_service_task: Option<JoinHandle<anyhow::Result<()>>>,
     lan_discovery_task: Option<JoinHandle<anyhow::Result<()>>>,
+    last_public_shares: Vec<PublicShareView>,
 }
 
 const LAN_DISCOVERY_PORT: u16 = 46123;
@@ -126,6 +129,7 @@ impl DesktopAppState {
             task.abort();
         }
         state.node = None;
+        state.last_public_shares.clear();
         RuntimeStatus {
             running: false,
             state_db_path: state
@@ -189,6 +193,29 @@ impl DesktopAppState {
             .collect())
     }
 
+    pub async fn community_views(&self) -> anyhow::Result<Vec<CommunityView>> {
+        let node = self.node_handle().await?;
+        Ok(node
+            .communities()
+            .await
+            .into_iter()
+            .map(community_view)
+            .collect())
+    }
+
+    pub async fn join_community(
+        &self,
+        share_id_hex: &str,
+        share_pubkey_hex: &str,
+    ) -> anyhow::Result<Vec<CommunityView>> {
+        let node = self.node_handle().await?;
+        let share_id = parse_hex_32(share_id_hex, "community share_id")?;
+        let share_pubkey = parse_hex_32(share_pubkey_hex, "community share_pubkey")?;
+        node.join_community(scp2p_core::ShareId(share_id), share_pubkey)
+            .await?;
+        self.community_views().await
+    }
+
     pub async fn subscribe_share(
         &self,
         share_id_hex: &str,
@@ -242,6 +269,277 @@ impl DesktopAppState {
         })
     }
 
+    pub async fn browse_public_shares(&self) -> anyhow::Result<Vec<PublicShareView>> {
+        let node = self.node_handle().await?;
+        let peers = self.sync_peer_targets(&node).await?;
+        if peers.is_empty() {
+            let mut state = self.inner.write().await;
+            state.last_public_shares.clear();
+            return Ok(Vec::new());
+        }
+
+        let mut rng = OsRng;
+        let transport = DirectRequestTransport::new(DesktopSessionConnector {
+            signing_key: SigningKey::generate(&mut rng),
+            capabilities: Capabilities::default(),
+        });
+        let mut first_err = None;
+        let mut views = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for peer in peers {
+            match node
+                .fetch_public_shares_from_peer(&transport, &peer, 64)
+                .await
+            {
+                Ok(shares) => {
+                    for share in shares {
+                        if seen.insert(share.share_id) {
+                            views.push(public_share_view(&peer, share));
+                        }
+                    }
+                }
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        if views.is_empty() {
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+        }
+        views.sort_by(|a, b| {
+            b.latest_seq
+                .cmp(&a.latest_seq)
+                .then(a.title.cmp(&b.title))
+                .then(a.share_id_hex.cmp(&b.share_id_hex))
+        });
+        let mut state = self.inner.write().await;
+        state.last_public_shares = views.clone();
+        Ok(views)
+    }
+
+    pub async fn browse_community(
+        &self,
+        share_id_hex: &str,
+    ) -> anyhow::Result<CommunityBrowseView> {
+        let node = self.node_handle().await?;
+        let share_id = parse_hex_32(share_id_hex, "community share_id")?;
+        let community = node
+            .communities()
+            .await
+            .into_iter()
+            .find(|community| community.share_id == share_id)
+            .ok_or_else(|| anyhow::anyhow!("community is not joined"))?;
+        let peers = self.sync_peer_targets(&node).await?;
+        if peers.is_empty() {
+            return Ok(CommunityBrowseView {
+                community_share_id_hex: hex::encode(community.share_id),
+                participants: Vec::new(),
+                public_shares: Vec::new(),
+            });
+        }
+
+        let mut rng = OsRng;
+        let transport = DirectRequestTransport::new(DesktopSessionConnector {
+            signing_key: SigningKey::generate(&mut rng),
+            capabilities: Capabilities::default(),
+        });
+        let mut participants = Vec::new();
+        let mut public_shares = Vec::new();
+        let mut seen_shares = std::collections::HashSet::new();
+        let mut first_err = None;
+        for peer in peers {
+            match node
+                .fetch_community_status_from_peer(
+                    &transport,
+                    &peer,
+                    scp2p_core::ShareId(community.share_id),
+                    community.share_pubkey,
+                )
+                .await
+            {
+                Ok(true) => {
+                    participants.push(CommunityParticipantView {
+                        community_share_id_hex: hex::encode(community.share_id),
+                        peer_addr: format!("{}:{}", peer.ip, peer.port),
+                        transport: format!("{:?}", peer.transport),
+                    });
+                    match node
+                        .fetch_community_public_shares_from_peer(
+                            &transport,
+                            &peer,
+                            scp2p_core::ShareId(community.share_id),
+                            community.share_pubkey,
+                            64,
+                        )
+                        .await
+                    {
+                        Ok(shares) => {
+                            for share in shares {
+                                if seen_shares.insert(share.share_id) {
+                                    public_shares.push(public_share_view(&peer, share));
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            if first_err.is_none() {
+                                first_err = Some(err);
+                            }
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        participants.sort_by(|a, b| a.peer_addr.cmp(&b.peer_addr));
+        public_shares.sort_by(|a, b| {
+            b.latest_seq
+                .cmp(&a.latest_seq)
+                .then(a.title.cmp(&b.title))
+                .then(a.share_id_hex.cmp(&b.share_id_hex))
+        });
+        if participants.is_empty() && public_shares.is_empty() {
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+        }
+        Ok(CommunityBrowseView {
+            community_share_id_hex: hex::encode(community.share_id),
+            participants,
+            public_shares,
+        })
+    }
+
+    pub async fn subscribe_public_share(
+        &self,
+        one_based_index: usize,
+    ) -> anyhow::Result<Vec<SubscriptionView>> {
+        if one_based_index == 0 {
+            anyhow::bail!("public share index must be >= 1");
+        }
+        let selected = {
+            let state = self.inner.read().await;
+            state
+                .last_public_shares
+                .get(one_based_index - 1)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("public share index is out of range"))?
+        };
+        let node = self.node_handle().await?;
+        let share_id = parse_hex_32(&selected.share_id_hex, "share_id")?;
+        let share_pubkey = parse_hex_32(&selected.share_pubkey_hex, "share_pubkey")?;
+        node.subscribe_with_pubkey(scp2p_core::ShareId(share_id), Some(share_pubkey))
+            .await?;
+        self.subscription_views().await
+    }
+
+    pub async fn download_content(
+        &self,
+        content_id_hex: &str,
+        target_path: &str,
+    ) -> anyhow::Result<()> {
+        let node = self.node_handle().await?;
+        let content_id = parse_hex_32(content_id_hex, "content_id")?;
+        let peers = self.sync_peer_targets(&node).await?;
+        let mut rng = OsRng;
+        let connector = DesktopSessionConnector {
+            signing_key: SigningKey::generate(&mut rng),
+            capabilities: Capabilities::default(),
+        };
+        node.download_from_peers(
+            &connector,
+            &peers,
+            content_id,
+            target_path,
+            &scp2p_core::FetchPolicy::default(),
+        )
+        .await
+    }
+
+    pub async fn publish_text_share(
+        &self,
+        title: &str,
+        item_name: &str,
+        item_text: &str,
+        visibility: PublishVisibility,
+        community_ids_hex: &[String],
+    ) -> anyhow::Result<PublishResultView> {
+        let node = self.node_handle().await?;
+        let runtime = node.runtime_config().await;
+        let bind_tcp = runtime
+            .bind_tcp
+            .ok_or_else(|| anyhow::anyhow!("tcp bind must be enabled to publish"))?;
+        let peer_records = node.peer_records().await;
+        let advertise_ip = resolve_advertise_ip(bind_tcp, &peer_records)?;
+        let provider = PeerAddr {
+            ip: advertise_ip,
+            port: bind_tcp.port(),
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: None,
+        };
+
+        let payload = item_text.as_bytes().to_vec();
+        let content = describe_content(&payload);
+        node.register_local_provider_content(provider.clone(), payload)
+            .await?;
+
+        let share = node.ensure_publisher_identity("default").await?;
+        let now = now_unix_secs()?;
+        let communities = resolve_joined_communities(&node, community_ids_hex).await?;
+        let next_seq = node
+            .published_share_head(share.share_id())
+            .await
+            .map(|head| head.latest_seq.saturating_add(1))
+            .unwrap_or(1);
+        let manifest = ManifestV1 {
+            version: 1,
+            share_pubkey: share.verifying_key().to_bytes(),
+            share_id: share.share_id().0,
+            seq: next_seq,
+            created_at: now,
+            expires_at: None,
+            title: Some(title.trim().to_string()),
+            description: Some("published from scp2p-desktop".to_string()),
+            visibility: share_visibility(visibility),
+            communities: communities
+                .iter()
+                .map(|community| community.share_id)
+                .collect(),
+            items: vec![ItemV1 {
+                content_id: content.content_id.0,
+                size: item_text.len() as u64,
+                name: item_name.trim().to_string(),
+                mime: Some("text/plain".to_string()),
+                tags: vec!["desktop".to_string(), "lan".to_string()],
+                chunks: content.chunks,
+            }],
+            recommended_shares: vec![],
+            signature: None,
+        };
+        let manifest_id = node.publish_share(manifest, &share).await?;
+
+        Ok(PublishResultView {
+            share_id_hex: hex::encode(share.share_id().0),
+            share_pubkey_hex: hex::encode(share.verifying_key().to_bytes()),
+            share_secret_hex: hex::encode(share.signing_key.to_bytes()),
+            manifest_id_hex: hex::encode(manifest_id),
+            provider_addr: format!("{}:{}", provider.ip, provider.port),
+            visibility,
+            community_ids_hex: communities
+                .iter()
+                .map(|community| hex::encode(community.share_id))
+                .collect(),
+        })
+    }
+
     pub async fn save_client_config(
         &self,
         path: impl Into<PathBuf>,
@@ -276,6 +574,16 @@ impl DesktopAppState {
             .clone()
             .context("node is not running")
     }
+
+    async fn sync_peer_targets(&self, node: &NodeHandle) -> anyhow::Result<Vec<PeerAddr>> {
+        let mut peers = node.configured_bootstrap_peers().await?;
+        for record in node.peer_records().await {
+            if !peers.iter().any(|peer| peer == &record.addr) {
+                peers.push(record.addr);
+            }
+        }
+        Ok(peers)
+    }
 }
 
 fn peer_view(record: PeerRecord) -> PeerView {
@@ -296,6 +604,13 @@ fn subscription_view(sub: PersistedSubscription) -> SubscriptionView {
     }
 }
 
+fn community_view(community: scp2p_core::PersistedCommunity) -> CommunityView {
+    CommunityView {
+        share_id_hex: hex::encode(community.share_id),
+        share_pubkey_hex: hex::encode(community.share_pubkey),
+    }
+}
+
 fn search_result_view(result: scp2p_core::SearchResult) -> SearchResultView {
     SearchResultView {
         share_id_hex: hex::encode(result.share_id.0),
@@ -304,6 +619,52 @@ fn search_result_view(result: scp2p_core::SearchResult) -> SearchResultView {
         snippet: result.snippet,
         score: result.score,
     }
+}
+
+fn public_share_view(peer: &PeerAddr, share: PublicShareSummary) -> PublicShareView {
+    PublicShareView {
+        source_peer_addr: format!("{}:{}", peer.ip, peer.port),
+        share_id_hex: hex::encode(share.share_id),
+        share_pubkey_hex: hex::encode(share.share_pubkey),
+        latest_seq: share.latest_seq,
+        title: share.title,
+        description: share.description,
+    }
+}
+
+fn share_visibility(visibility: PublishVisibility) -> ShareVisibility {
+    match visibility {
+        PublishVisibility::Private => ShareVisibility::Private,
+        PublishVisibility::Public => ShareVisibility::Public,
+    }
+}
+
+async fn resolve_joined_communities(
+    node: &NodeHandle,
+    community_ids_hex: &[String],
+) -> anyhow::Result<Vec<scp2p_core::PersistedCommunity>> {
+    if community_ids_hex.is_empty() {
+        return Ok(Vec::new());
+    }
+    let joined = node.communities().await;
+    let mut resolved = Vec::new();
+    for share_id_hex in community_ids_hex {
+        let share_id = parse_hex_32(share_id_hex, "community share_id")?;
+        let community = joined
+            .iter()
+            .find(|community| community.share_id == share_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("community {} is not joined", share_id_hex.trim()))?;
+        if !resolved
+            .iter()
+            .any(|existing: &scp2p_core::PersistedCommunity| {
+                existing.share_id == community.share_id
+            })
+        {
+            resolved.push(community);
+        }
+    }
+    Ok(resolved)
 }
 
 fn parse_hex_32(input: &str, label: &str) -> anyhow::Result<[u8; 32]> {
@@ -357,6 +718,32 @@ async fn start_lan_discovery(
             }
         }
     }
+}
+
+fn resolve_advertise_ip(
+    bind_tcp: std::net::SocketAddr,
+    peers: &[PeerRecord],
+) -> anyhow::Result<std::net::IpAddr> {
+    if !bind_tcp.ip().is_unspecified() {
+        return Ok(bind_tcp.ip());
+    }
+
+    if let Some(peer) = peers.first() {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        let _ = socket.connect(std::net::SocketAddr::new(peer.addr.ip, peer.addr.port));
+        let local = socket.local_addr()?;
+        if !local.ip().is_unspecified() {
+            return Ok(local.ip());
+        }
+    }
+
+    Ok("127.0.0.1".parse().expect("loopback ip"))
+}
+
+fn now_unix_secs() -> anyhow::Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs())
 }
 
 #[cfg(test)]

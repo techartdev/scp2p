@@ -542,6 +542,8 @@ mod tests {
             expires_at: None,
             title: Some("m".into()),
             description: None,
+            visibility: crate::manifest::ShareVisibility::Private,
+            communities: vec![],
             items: vec![],
             recommended_shares: vec![],
             signature: None,

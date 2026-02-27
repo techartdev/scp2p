@@ -25,8 +25,9 @@ mod windows_app {
     };
 
     use scp2p_desktop::{
-        commands, DesktopAppState, DesktopClientConfig, PeerView, RuntimeStatus, SearchResultsView,
-        StartNodeRequest, SubscriptionView,
+        commands, CommunityBrowseView, CommunityView, DesktopAppState, DesktopClientConfig,
+        PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
+        SearchResultsView, StartNodeRequest, SubscriptionView,
     };
 
     const ID_DB_PATH: isize = 1001;
@@ -35,8 +36,18 @@ mod windows_app {
     const ID_BOOTSTRAP: isize = 1004;
     const ID_STATUS: isize = 1005;
     const ID_SUBSCRIPTION: isize = 1006;
-    const ID_SEARCH: isize = 1007;
-    const ID_DATA: isize = 1008;
+    const ID_PUBLIC_INDEX: isize = 1007;
+    const ID_COMMUNITY_ID: isize = 1008;
+    const ID_COMMUNITY_PUBKEY: isize = 1009;
+    const ID_SEARCH: isize = 1010;
+    const ID_DATA: isize = 1011;
+    const ID_DOWNLOAD_CONTENT: isize = 1012;
+    const ID_DOWNLOAD_PATH: isize = 1013;
+    const ID_PUBLISH_TITLE: isize = 1014;
+    const ID_PUBLISH_NAME: isize = 1015;
+    const ID_PUBLISH_TEXT: isize = 1016;
+    const ID_PUBLISH_VISIBILITY: isize = 1017;
+    const ID_PUBLISH_COMMUNITIES: isize = 1018;
 
     const ID_START: isize = 1101;
     const ID_STOP: isize = 1102;
@@ -47,6 +58,12 @@ mod windows_app {
     const ID_UNSUBSCRIBE: isize = 1107;
     const ID_SYNC: isize = 1108;
     const ID_SEARCH_BTN: isize = 1109;
+    const ID_DOWNLOAD_BTN: isize = 1110;
+    const ID_PUBLISH_BTN: isize = 1111;
+    const ID_BROWSE_PUBLIC: isize = 1112;
+    const ID_SUBSCRIBE_PUBLIC: isize = 1113;
+    const ID_JOIN_COMMUNITY: isize = 1114;
+    const ID_BROWSE_COMMUNITY: isize = 1115;
 
     const WINDOW_CLASS: &str = "SCP2PDesktopWindow";
     const CONFIG_FILE: &str = "scp2p-desktop-config.cbor";
@@ -58,7 +75,17 @@ mod windows_app {
         bind_tcp: HWND,
         bootstrap: HWND,
         subscription: HWND,
+        public_index: HWND,
+        community_id: HWND,
+        community_pubkey: HWND,
         search: HWND,
+        download_content: HWND,
+        download_path: HWND,
+        publish_title: HWND,
+        publish_name: HWND,
+        publish_text: HWND,
+        publish_visibility: HWND,
+        publish_communities: HWND,
         status: HWND,
         data: HWND,
     }
@@ -112,8 +139,8 @@ mod windows_app {
                 WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                 100,
                 100,
+                1100,
                 980,
-                760,
                 None,
                 None,
                 Some(hinstance),
@@ -126,7 +153,6 @@ mod windows_app {
                 DispatchMessageW(&msg);
             }
         }
-
         Ok(())
     }
 
@@ -181,7 +207,7 @@ mod windows_app {
 
         unsafe {
             make_label(hwnd, instance, "State DB", b(10, 12, 120, 20), label_style)?;
-            let db_path = make_edit(hwnd, instance, ID_DB_PATH, b(140, 10, 800, 24), edit_style)?;
+            let db_path = make_edit(hwnd, instance, ID_DB_PATH, b(140, 10, 920, 24), edit_style)?;
 
             make_label(hwnd, instance, "Bind QUIC", b(10, 46, 120, 20), label_style)?;
             let bind_quic = make_edit(
@@ -206,77 +232,260 @@ mod windows_app {
                 hwnd,
                 instance,
                 ID_BOOTSTRAP,
-                b(140, 78, 800, 120),
+                b(140, 78, 920, 100),
                 multi_style,
             )?;
 
-            let _ = make_button(hwnd, instance, ID_LOAD, "Load Config", b(140, 212, 110, 30))?;
-            let _ = make_button(hwnd, instance, ID_SAVE, "Save Config", b(260, 212, 110, 30))?;
-            let _ = make_button(hwnd, instance, ID_START, "Start Node", b(380, 212, 110, 30))?;
-            let _ = make_button(hwnd, instance, ID_STOP, "Stop Node", b(500, 212, 110, 30))?;
-            let _ = make_button(hwnd, instance, ID_REFRESH, "Refresh", b(620, 212, 110, 30))?;
+            let _ = make_button(hwnd, instance, ID_LOAD, "Load Config", b(140, 190, 110, 30))?;
+            let _ = make_button(hwnd, instance, ID_SAVE, "Save Config", b(260, 190, 110, 30))?;
+            let _ = make_button(hwnd, instance, ID_START, "Start Node", b(380, 190, 110, 30))?;
+            let _ = make_button(hwnd, instance, ID_STOP, "Stop Node", b(500, 190, 110, 30))?;
+            let _ = make_button(hwnd, instance, ID_REFRESH, "Refresh", b(620, 190, 110, 30))?;
             let _ = make_button(
                 hwnd,
                 instance,
                 ID_SUBSCRIBE,
                 "Subscribe",
-                b(740, 212, 110, 30),
-            )?;
-
-            make_label(hwnd, instance, "Share ID", b(10, 256, 120, 20), label_style)?;
-            let subscription = make_edit(
-                hwnd,
-                instance,
-                ID_SUBSCRIPTION,
-                b(140, 254, 580, 24),
-                edit_style,
+                b(740, 190, 110, 30),
             )?;
             let _ = make_button(
                 hwnd,
                 instance,
                 ID_UNSUBSCRIBE,
                 "Unsubscribe",
-                b(740, 252, 110, 30),
+                b(860, 190, 110, 30),
             )?;
-            let _ = make_button(hwnd, instance, ID_SYNC, "Sync Now", b(860, 252, 80, 30))?;
+            let _ = make_button(hwnd, instance, ID_SYNC, "Sync Now", b(980, 190, 80, 30))?;
 
-            make_label(hwnd, instance, "Search", b(10, 292, 120, 20), label_style)?;
-            let search = make_edit(hwnd, instance, ID_SEARCH, b(140, 290, 580, 24), edit_style)?;
+            make_label(hwnd, instance, "Share ID", b(10, 230, 120, 20), label_style)?;
+            let subscription = make_edit(
+                hwnd,
+                instance,
+                ID_SUBSCRIPTION,
+                b(140, 228, 920, 24),
+                edit_style,
+            )?;
+
+            make_label(hwnd, instance, "Public #", b(10, 264, 120, 20), label_style)?;
+            let public_index = make_edit(
+                hwnd,
+                instance,
+                ID_PUBLIC_INDEX,
+                b(140, 262, 100, 24),
+                edit_style,
+            )?;
+            let _ = make_button(
+                hwnd,
+                instance,
+                ID_BROWSE_PUBLIC,
+                "Browse Public",
+                b(250, 260, 120, 30),
+            )?;
+            let _ = make_button(
+                hwnd,
+                instance,
+                ID_SUBSCRIBE_PUBLIC,
+                "Subscribe Public",
+                b(380, 260, 130, 30),
+            )?;
+
+            make_label(
+                hwnd,
+                instance,
+                "Community ID",
+                b(10, 298, 120, 20),
+                label_style,
+            )?;
+            let community_id = make_edit(
+                hwnd,
+                instance,
+                ID_COMMUNITY_ID,
+                b(140, 296, 920, 24),
+                edit_style,
+            )?;
+            make_label(
+                hwnd,
+                instance,
+                "Community Pubkey",
+                b(10, 332, 120, 20),
+                label_style,
+            )?;
+            let community_pubkey = make_edit(
+                hwnd,
+                instance,
+                ID_COMMUNITY_PUBKEY,
+                b(140, 330, 700, 24),
+                edit_style,
+            )?;
+            let _ = make_button(
+                hwnd,
+                instance,
+                ID_JOIN_COMMUNITY,
+                "Join Community",
+                b(850, 328, 100, 30),
+            )?;
+            let _ = make_button(
+                hwnd,
+                instance,
+                ID_BROWSE_COMMUNITY,
+                "Browse Community",
+                b(960, 328, 100, 30),
+            )?;
+
+            make_label(hwnd, instance, "Search", b(10, 366, 120, 20), label_style)?;
+            let search = make_edit(hwnd, instance, ID_SEARCH, b(140, 364, 800, 24), edit_style)?;
             let _ = make_button(
                 hwnd,
                 instance,
                 ID_SEARCH_BTN,
                 "Search",
-                b(740, 288, 110, 30),
+                b(950, 362, 110, 30),
+            )?;
+
+            make_label(
+                hwnd,
+                instance,
+                "Download Content",
+                b(10, 400, 120, 20),
+                label_style,
+            )?;
+            let download_content = make_edit(
+                hwnd,
+                instance,
+                ID_DOWNLOAD_CONTENT,
+                b(140, 398, 800, 24),
+                edit_style,
+            )?;
+            let _ = make_button(
+                hwnd,
+                instance,
+                ID_DOWNLOAD_BTN,
+                "Download",
+                b(950, 396, 110, 30),
+            )?;
+
+            make_label(
+                hwnd,
+                instance,
+                "Output Path",
+                b(10, 434, 120, 20),
+                label_style,
+            )?;
+            let download_path = make_edit(
+                hwnd,
+                instance,
+                ID_DOWNLOAD_PATH,
+                b(140, 432, 920, 24),
+                edit_style,
+            )?;
+
+            make_label(
+                hwnd,
+                instance,
+                "Publish Title",
+                b(10, 468, 120, 20),
+                label_style,
+            )?;
+            let publish_title = make_edit(
+                hwnd,
+                instance,
+                ID_PUBLISH_TITLE,
+                b(140, 466, 600, 24),
+                edit_style,
+            )?;
+            make_label(
+                hwnd,
+                instance,
+                "Visibility",
+                b(760, 468, 80, 20),
+                label_style,
+            )?;
+            let publish_visibility = make_edit(
+                hwnd,
+                instance,
+                ID_PUBLISH_VISIBILITY,
+                b(850, 466, 210, 24),
+                edit_style,
+            )?;
+            make_label(
+                hwnd,
+                instance,
+                "Publish Communities",
+                b(10, 502, 120, 20),
+                label_style,
+            )?;
+            let publish_communities = make_edit(
+                hwnd,
+                instance,
+                ID_PUBLISH_COMMUNITIES,
+                b(140, 500, 920, 24),
+                edit_style,
+            )?;
+
+            make_label(
+                hwnd,
+                instance,
+                "Item Name",
+                b(10, 536, 120, 20),
+                label_style,
+            )?;
+            let publish_name = make_edit(
+                hwnd,
+                instance,
+                ID_PUBLISH_NAME,
+                b(140, 534, 800, 24),
+                edit_style,
+            )?;
+            let _ = make_button(
+                hwnd,
+                instance,
+                ID_PUBLISH_BTN,
+                "Publish",
+                b(950, 532, 110, 30),
+            )?;
+
+            make_label(
+                hwnd,
+                instance,
+                "Publish Text",
+                b(10, 570, 120, 20),
+                label_style,
+            )?;
+            let publish_text = make_edit(
+                hwnd,
+                instance,
+                ID_PUBLISH_TEXT,
+                b(140, 568, 920, 80),
+                multi_style,
             )?;
 
             make_label(
                 hwnd,
                 instance,
                 "Runtime Status",
-                b(10, 326, 140, 20),
+                b(10, 658, 140, 20),
                 label_style,
             )?;
             let status = make_edit(
                 hwnd,
                 instance,
                 ID_STATUS,
-                b(10, 352, 930, 130),
+                b(10, 684, 1050, 120),
                 readonly_multi_style,
             )?;
 
             make_label(
                 hwnd,
                 instance,
-                "Peers / Subs / Search",
-                b(10, 492, 180, 20),
+                "Peers / Subs / Communities / Public / Search / Publish",
+                b(10, 814, 360, 20),
                 label_style,
             )?;
             let data = make_edit(
                 hwnd,
                 instance,
                 ID_DATA,
-                b(10, 518, 930, 190),
+                b(10, 840, 1050, 84),
                 readonly_multi_style,
             )?;
 
@@ -287,13 +496,24 @@ mod windows_app {
                     bind_tcp,
                     bootstrap,
                     subscription,
+                    public_index,
+                    community_id,
+                    community_pubkey,
                     search,
+                    download_content,
+                    download_path,
+                    publish_title,
+                    publish_name,
+                    publish_text,
+                    publish_visibility,
+                    publish_communities,
                     status,
                     data,
                 });
             });
         }
 
+        set_text(ui_handles()?.publish_visibility, "private")?;
         load_config_into_ui(hwnd)?;
         refresh_status(hwnd)?;
         Ok(())
@@ -303,13 +523,19 @@ mod windows_app {
         match (wparam.0 & 0xffff) as isize {
             ID_LOAD => load_config_into_ui(hwnd),
             ID_SAVE => save_config_from_ui(hwnd),
-            ID_START => start_node_from_ui(hwnd),
-            ID_STOP => stop_node(hwnd),
+            ID_START => start_node_from_ui(),
+            ID_STOP => stop_node(),
             ID_REFRESH => refresh_status(hwnd),
-            ID_SUBSCRIBE => subscribe_share(hwnd),
-            ID_UNSUBSCRIBE => unsubscribe_share(hwnd),
-            ID_SYNC => sync_now(hwnd),
-            ID_SEARCH_BTN => search_catalogs(hwnd),
+            ID_SUBSCRIBE => subscribe_share(),
+            ID_UNSUBSCRIBE => unsubscribe_share(),
+            ID_SYNC => sync_now(),
+            ID_BROWSE_PUBLIC => browse_public_shares(),
+            ID_SUBSCRIBE_PUBLIC => subscribe_public_share(),
+            ID_JOIN_COMMUNITY => join_community(),
+            ID_BROWSE_COMMUNITY => browse_community(),
+            ID_SEARCH_BTN => search_catalogs(),
+            ID_DOWNLOAD_BTN => download_content(),
+            ID_PUBLISH_BTN => publish_text_share(),
             _ => Ok(()),
         }
     }
@@ -335,7 +561,7 @@ mod windows_app {
         refresh_status(hwnd)
     }
 
-    fn start_node_from_ui(_hwnd: HWND) -> anyhow::Result<()> {
+    fn start_node_from_ui() -> anyhow::Result<()> {
         let app = app()?;
         let config = read_config_from_ui()?;
         let request = StartNodeRequest {
@@ -351,7 +577,7 @@ mod windows_app {
         refresh_snapshot()
     }
 
-    fn stop_node(_hwnd: HWND) -> anyhow::Result<()> {
+    fn stop_node() -> anyhow::Result<()> {
         let app = app()?;
         let status = app.runtime.block_on(commands::stop_node(&app.app_state))?;
         set_status_text(&format_status(&app.config_path, &status))?;
@@ -367,7 +593,7 @@ mod windows_app {
         refresh_snapshot()
     }
 
-    fn subscribe_share(_hwnd: HWND) -> anyhow::Result<()> {
+    fn subscribe_share() -> anyhow::Result<()> {
         let app = app()?;
         let share_id = get_text(ui_handles()?.subscription)?;
         let subs = app
@@ -376,7 +602,7 @@ mod windows_app {
         set_data_text(&format_subscriptions_only(&subs))
     }
 
-    fn unsubscribe_share(_hwnd: HWND) -> anyhow::Result<()> {
+    fn unsubscribe_share() -> anyhow::Result<()> {
         let app = app()?;
         let share_id = get_text(ui_handles()?.subscription)?;
         let subs = app
@@ -385,13 +611,53 @@ mod windows_app {
         set_data_text(&format_subscriptions_only(&subs))
     }
 
-    fn sync_now(_hwnd: HWND) -> anyhow::Result<()> {
+    fn sync_now() -> anyhow::Result<()> {
         let app = app()?;
         let subs = app.runtime.block_on(commands::sync_now(&app.app_state))?;
         set_data_text(&format_subscriptions_only(&subs))
     }
 
-    fn search_catalogs(_hwnd: HWND) -> anyhow::Result<()> {
+    fn browse_public_shares() -> anyhow::Result<()> {
+        let app = app()?;
+        let shares = app
+            .runtime
+            .block_on(commands::browse_public_shares(&app.app_state))?;
+        set_data_text(&format_public_shares(&shares))
+    }
+
+    fn subscribe_public_share() -> anyhow::Result<()> {
+        let app = app()?;
+        let index_text = get_text(ui_handles()?.public_index)?;
+        let index = index_text.trim().parse::<usize>()?;
+        let subs = app
+            .runtime
+            .block_on(commands::subscribe_public_share(&app.app_state, index))?;
+        set_data_text(&format_subscriptions_only(&subs))
+    }
+
+    fn join_community() -> anyhow::Result<()> {
+        let app = app()?;
+        let ui = ui_handles()?;
+        let share_id = get_text(ui.community_id)?;
+        let share_pubkey = get_text(ui.community_pubkey)?;
+        let communities = app.runtime.block_on(commands::join_community(
+            &app.app_state,
+            share_id,
+            share_pubkey,
+        ))?;
+        set_data_text(&format_communities(&communities))
+    }
+
+    fn browse_community() -> anyhow::Result<()> {
+        let app = app()?;
+        let share_id = get_text(ui_handles()?.community_id)?;
+        let browse = app
+            .runtime
+            .block_on(commands::browse_community(&app.app_state, share_id))?;
+        set_data_text(&format_community_browse(&browse))
+    }
+
+    fn search_catalogs() -> anyhow::Result<()> {
         let app = app()?;
         let query = get_text(ui_handles()?.search)?;
         let results = app
@@ -400,19 +666,59 @@ mod windows_app {
         set_data_text(&format_search_results(&results))
     }
 
+    fn download_content() -> anyhow::Result<()> {
+        let app = app()?;
+        let ui = ui_handles()?;
+        let content_id = get_text(ui.download_content)?;
+        let output_path = get_text(ui.download_path)?;
+        app.runtime.block_on(commands::download_content(
+            &app.app_state,
+            content_id.clone(),
+            output_path.clone(),
+        ))?;
+        set_data_text(&format!(
+            "Download complete.\r\ncontent_id={}\r\nout={}\r\n",
+            content_id, output_path
+        ))
+    }
+
+    fn publish_text_share() -> anyhow::Result<()> {
+        let app = app()?;
+        let ui = ui_handles()?;
+        let title = get_text(ui.publish_title)?;
+        let item_name = get_text(ui.publish_name)?;
+        let item_text = get_text(ui.publish_text)?;
+        let visibility = parse_publish_visibility(&get_text(ui.publish_visibility)?)?;
+        let communities = parse_line_tokens(&get_text(ui.publish_communities)?);
+        let result = app.runtime.block_on(commands::publish_text_share(
+            &app.app_state,
+            title,
+            item_name,
+            item_text,
+            visibility,
+            communities,
+        ))?;
+        set_data_text(&format_publish_result(&result))
+    }
+
     fn refresh_snapshot() -> anyhow::Result<()> {
         let app = app()?;
         let peers = match app.runtime.block_on(commands::list_peers(&app.app_state)) {
             Ok(peers) => peers,
             Err(_) => {
-                set_data_text("Start the node to inspect peers, subscriptions, and search.\r\n")?;
+                set_data_text(
+                    "Start the node to inspect peers, subscriptions, search, and publish.\r\n",
+                )?;
                 return Ok(());
             }
         };
         let subs = app
             .runtime
             .block_on(commands::list_subscriptions(&app.app_state))?;
-        set_data_text(&format_snapshot(&peers, &subs))
+        let communities = app
+            .runtime
+            .block_on(commands::list_communities(&app.app_state))?;
+        set_data_text(&format_snapshot(&peers, &subs, &communities))
     }
 
     fn app() -> anyhow::Result<&'static AppContext> {
@@ -487,7 +793,11 @@ mod windows_app {
         lines.join("\r\n")
     }
 
-    fn format_snapshot(peers: &[PeerView], subscriptions: &[SubscriptionView]) -> String {
+    fn format_snapshot(
+        peers: &[PeerView],
+        subscriptions: &[SubscriptionView],
+        communities: &[CommunityView],
+    ) -> String {
         let mut lines = vec!["Known peers:".to_string()];
         if peers.is_empty() {
             lines.push("  <none>".to_string());
@@ -515,11 +825,22 @@ mod windows_app {
                 )
             }));
         }
+        lines.push("Communities:".to_string());
+        if communities.is_empty() {
+            lines.push("  <none>".to_string());
+        } else {
+            lines.extend(communities.iter().map(|community| {
+                format!(
+                    "  {} pubkey={}",
+                    community.share_id_hex, community.share_pubkey_hex
+                )
+            }));
+        }
         lines.join("\r\n")
     }
 
     fn format_subscriptions_only(subscriptions: &[SubscriptionView]) -> String {
-        format_snapshot(&[], subscriptions)
+        format_snapshot(&[], subscriptions, &[])
     }
 
     fn format_search_results(results: &SearchResultsView) -> String {
@@ -544,6 +865,107 @@ mod windows_app {
         lines.join("\r\n")
     }
 
+    fn format_public_shares(shares: &[PublicShareView]) -> String {
+        let mut lines = vec![format!("Public shares: {}", shares.len())];
+        if shares.is_empty() {
+            lines.push("  <none>".to_string());
+        } else {
+            lines.extend(shares.iter().enumerate().map(|(idx, share)| {
+                format!(
+                    "  {}. peer={} share={} seq={} title={} desc={}",
+                    idx + 1,
+                    share.source_peer_addr,
+                    share.share_id_hex,
+                    share.latest_seq,
+                    share.title.clone().unwrap_or_else(|| "<none>".to_string()),
+                    share
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| "<none>".to_string())
+                )
+            }));
+        }
+        lines.join("\r\n")
+    }
+
+    fn format_communities(communities: &[CommunityView]) -> String {
+        let mut lines = vec![format!("Communities: {}", communities.len())];
+        if communities.is_empty() {
+            lines.push("  <none>".to_string());
+        } else {
+            lines.extend(communities.iter().map(|community| {
+                format!(
+                    "  {} pubkey={}",
+                    community.share_id_hex, community.share_pubkey_hex
+                )
+            }));
+        }
+        lines.join("\r\n")
+    }
+
+    fn format_community_browse(browse: &CommunityBrowseView) -> String {
+        let mut lines = vec![format!("Community: {}", browse.community_share_id_hex)];
+        lines.push(format!("Participants: {}", browse.participants.len()));
+        if browse.participants.is_empty() {
+            lines.push("  <none>".to_string());
+        } else {
+            lines.extend(browse.participants.iter().map(|participant| {
+                format!(
+                    "  peer={} [{}]",
+                    participant.peer_addr, participant.transport
+                )
+            }));
+        }
+        lines.push(format!(
+            "Community public shares: {}",
+            browse.public_shares.len()
+        ));
+        if browse.public_shares.is_empty() {
+            lines.push("  <none>".to_string());
+        } else {
+            lines.extend(browse.public_shares.iter().enumerate().map(|(idx, share)| {
+                format!(
+                    "  {}. peer={} share={} seq={} title={} desc={}",
+                    idx + 1,
+                    share.source_peer_addr,
+                    share.share_id_hex,
+                    share.latest_seq,
+                    share.title.clone().unwrap_or_else(|| "<none>".to_string()),
+                    share
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| "<none>".to_string())
+                )
+            }));
+        }
+        lines.join("\r\n")
+    }
+
+    fn format_publish_result(result: &PublishResultView) -> String {
+        format!(
+            "Published share.\r\nvisibility={:?}\r\ncommunities={}\r\nshare_id={}\r\nshare_pubkey={}\r\nshare_secret={}\r\nmanifest_id={}\r\nprovider={}\r\n",
+            result.visibility,
+            if result.community_ids_hex.is_empty() {
+                "<none>".to_string()
+            } else {
+                result.community_ids_hex.join(", ")
+            },
+            result.share_id_hex,
+            result.share_pubkey_hex,
+            result.share_secret_hex,
+            result.manifest_id_hex,
+            result.provider_addr,
+        )
+    }
+
+    fn parse_publish_visibility(text: &str) -> anyhow::Result<PublishVisibility> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "" | "private" => Ok(PublishVisibility::Private),
+            "public" => Ok(PublishVisibility::Public),
+            other => anyhow::bail!("invalid visibility '{other}', expected private or public"),
+        }
+    }
+
     fn parse_optional_socket(text: &str) -> anyhow::Result<Option<std::net::SocketAddr>> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -553,6 +975,10 @@ mod windows_app {
     }
 
     fn parse_bootstrap_lines(text: &str) -> Vec<String> {
+        parse_line_tokens(text)
+    }
+
+    fn parse_line_tokens(text: &str) -> Vec<String> {
         text.split(['\n', ',', ';'])
             .map(str::trim)
             .filter(|entry| !entry.is_empty())
@@ -597,11 +1023,42 @@ mod windows_app {
             let _ = MoveWindow(ui.db_path, field_x, 10, field_width, 24, true);
             let _ = MoveWindow(ui.bind_quic, field_x, 44, 240, 24, true);
             let _ = MoveWindow(ui.bind_tcp, field_x + 360, 44, 240, 24, true);
-            let _ = MoveWindow(ui.bootstrap, field_x, 78, field_width, 120, true);
-            let _ = MoveWindow(ui.subscription, field_x, 254, field_width - 220, 24, true);
-            let _ = MoveWindow(ui.search, field_x, 290, field_width - 220, 24, true);
-            let _ = MoveWindow(ui.status, margin, 352, width - 2 * margin, 130, true);
-            let _ = MoveWindow(ui.data, margin, 518, width - 2 * margin, height - 528, true);
+            let _ = MoveWindow(ui.bootstrap, field_x, 78, field_width, 100, true);
+            let _ = MoveWindow(ui.subscription, field_x, 228, field_width, 24, true);
+            let _ = MoveWindow(ui.public_index, field_x, 262, 100, 24, true);
+            let _ = MoveWindow(ui.community_id, field_x, 296, field_width, 24, true);
+            let _ = MoveWindow(
+                ui.community_pubkey,
+                field_x,
+                330,
+                field_width - 220,
+                24,
+                true,
+            );
+            let _ = MoveWindow(ui.search, field_x, 364, field_width - 120, 24, true);
+            let _ = MoveWindow(
+                ui.download_content,
+                field_x,
+                398,
+                field_width - 120,
+                24,
+                true,
+            );
+            let _ = MoveWindow(ui.download_path, field_x, 432, field_width, 24, true);
+            let _ = MoveWindow(ui.publish_title, field_x, 466, field_width - 320, 24, true);
+            let _ = MoveWindow(
+                ui.publish_visibility,
+                width - margin - 210,
+                466,
+                210,
+                24,
+                true,
+            );
+            let _ = MoveWindow(ui.publish_communities, field_x, 500, field_width, 24, true);
+            let _ = MoveWindow(ui.publish_name, field_x, 534, field_width - 120, 24, true);
+            let _ = MoveWindow(ui.publish_text, field_x, 568, field_width, 80, true);
+            let _ = MoveWindow(ui.status, margin, 684, width - 2 * margin, 120, true);
+            let _ = MoveWindow(ui.data, margin, 840, width - 2 * margin, height - 850, true);
         }
     }
 

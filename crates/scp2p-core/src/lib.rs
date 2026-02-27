@@ -32,7 +32,9 @@ pub use dht::{
 };
 pub use dht_keys::{content_provider_key, manifest_loc_key, share_head_key};
 pub use ids::{ContentId, ManifestId, NodeId, ShareId};
-pub use manifest::{ItemV1, ManifestV1, ShareHead, ShareKeypair};
+pub use manifest::{
+    ItemV1, ManifestV1, PublicShareSummary, ShareHead, ShareKeypair, ShareVisibility,
+};
 pub use net_fetch::{
     download_swarm_over_network, fetch_manifest_with_retry, BoxedStream, DirectRequestTransport,
     FetchPolicy, PeerConnector, RequestTransport, SessionPoolTransport,
@@ -40,8 +42,9 @@ pub use net_fetch::{
 pub use peer::{PeerAddr, TransportProtocol};
 pub use peer_db::{PeerDb, PeerRecord, PEX_FRESHNESS_WINDOW_SECS, PEX_MAX_PEERS};
 pub use store::{
-    decrypt_secret, encrypt_secret, EncryptedSecret, MemoryStore, PersistedPartialDownload,
-    PersistedState, PersistedSubscription, SqliteStore, Store,
+    decrypt_secret, encrypt_secret, EncryptedSecret, MemoryStore, PersistedCommunity,
+    PersistedPartialDownload, PersistedPublisherIdentity, PersistedState, PersistedSubscription,
+    SqliteStore, Store,
 };
 
 pub use transfer::{download_swarm, ChunkProvider};

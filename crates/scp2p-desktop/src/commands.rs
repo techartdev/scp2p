@@ -1,7 +1,8 @@
 use crate::{
     app_state::DesktopAppState,
     dto::{
-        DesktopClientConfig, PeerView, RuntimeStatus, SearchResultsView, StartNodeRequest,
+        CommunityBrowseView, CommunityView, DesktopClientConfig, PeerView, PublicShareView,
+        PublishResultView, PublishVisibility, RuntimeStatus, SearchResultsView, StartNodeRequest,
         SubscriptionView,
     },
 };
@@ -46,6 +47,27 @@ pub async fn list_subscriptions(
     app_state.subscription_views().await
 }
 
+pub async fn list_communities(app_state: &DesktopAppState) -> anyhow::Result<Vec<CommunityView>> {
+    app_state.community_views().await
+}
+
+pub async fn join_community(
+    app_state: &DesktopAppState,
+    share_id_hex: String,
+    share_pubkey_hex: String,
+) -> anyhow::Result<Vec<CommunityView>> {
+    app_state
+        .join_community(&share_id_hex, &share_pubkey_hex)
+        .await
+}
+
+pub async fn browse_community(
+    app_state: &DesktopAppState,
+    share_id_hex: String,
+) -> anyhow::Result<CommunityBrowseView> {
+    app_state.browse_community(&share_id_hex).await
+}
+
 pub async fn subscribe_share(
     app_state: &DesktopAppState,
     share_id_hex: String,
@@ -69,4 +91,46 @@ pub async fn search_catalogs(
     text: String,
 ) -> anyhow::Result<SearchResultsView> {
     app_state.search_catalogs(&text).await
+}
+
+pub async fn browse_public_shares(
+    app_state: &DesktopAppState,
+) -> anyhow::Result<Vec<PublicShareView>> {
+    app_state.browse_public_shares().await
+}
+
+pub async fn subscribe_public_share(
+    app_state: &DesktopAppState,
+    one_based_index: usize,
+) -> anyhow::Result<Vec<SubscriptionView>> {
+    app_state.subscribe_public_share(one_based_index).await
+}
+
+pub async fn download_content(
+    app_state: &DesktopAppState,
+    content_id_hex: String,
+    target_path: String,
+) -> anyhow::Result<()> {
+    app_state
+        .download_content(&content_id_hex, &target_path)
+        .await
+}
+
+pub async fn publish_text_share(
+    app_state: &DesktopAppState,
+    title: String,
+    item_name: String,
+    item_text: String,
+    visibility: PublishVisibility,
+    community_ids_hex: Vec<String>,
+) -> anyhow::Result<PublishResultView> {
+    app_state
+        .publish_text_share(
+            &title,
+            &item_name,
+            &item_text,
+            visibility,
+            &community_ids_hex,
+        )
+        .await
 }

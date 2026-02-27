@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 
-use crate::peer::PeerAddr;
+use crate::{manifest::PublicShareSummary, peer::PeerAddr};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
@@ -86,6 +86,18 @@ pub enum MsgType {
     GetManifest = 400,
     /// Serialized manifest response.
     ManifestData = 401,
+    /// Request public-share summaries from a reachable peer.
+    ListPublicShares = 402,
+    /// Public-share listing response.
+    PublicShareList = 403,
+    /// Ask a reachable peer whether it is joined to a specific community.
+    GetCommunityStatus = 404,
+    /// Response for a specific community membership probe.
+    CommunityStatus = 405,
+    /// Request public-share summaries for a specific joined community.
+    ListCommunityPublicShares = 406,
+    /// Community-scoped public-share listing response.
+    CommunityPublicShareList = 407,
     /// Relay registration request.
     RelayRegister = 450,
     /// Relay registration acknowledgement.
@@ -106,7 +118,7 @@ pub enum MsgType {
 
 impl MsgType {
     /// Stable `u16` registry for protocol envelope types.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 21] = [
         Self::PexOffer,
         Self::PexRequest,
         Self::FindNode,
@@ -114,6 +126,12 @@ impl MsgType {
         Self::Store,
         Self::GetManifest,
         Self::ManifestData,
+        Self::ListPublicShares,
+        Self::PublicShareList,
+        Self::GetCommunityStatus,
+        Self::CommunityStatus,
+        Self::ListCommunityPublicShares,
+        Self::CommunityPublicShareList,
         Self::RelayRegister,
         Self::RelayRegistered,
         Self::RelayConnect,
@@ -143,6 +161,12 @@ impl TryFrom<u16> for MsgType {
             202 => Ok(Self::Store),
             400 => Ok(Self::GetManifest),
             401 => Ok(Self::ManifestData),
+            402 => Ok(Self::ListPublicShares),
+            403 => Ok(Self::PublicShareList),
+            404 => Ok(Self::GetCommunityStatus),
+            405 => Ok(Self::CommunityStatus),
+            406 => Ok(Self::ListCommunityPublicShares),
+            407 => Ok(Self::CommunityPublicShareList),
             450 => Ok(Self::RelayRegister),
             451 => Ok(Self::RelayRegistered),
             452 => Ok(Self::RelayConnect),
@@ -205,6 +229,41 @@ pub struct ManifestData {
     pub manifest_id: [u8; 32],
     #[serde(with = "serde_bytes")]
     pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListPublicShares {
+    pub max_entries: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicShareList {
+    pub shares: Vec<PublicShareSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GetCommunityStatus {
+    pub community_share_id: [u8; 32],
+    pub community_share_pubkey: [u8; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityStatus {
+    pub community_share_id: [u8; 32],
+    pub joined: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListCommunityPublicShares {
+    pub community_share_id: [u8; 32],
+    pub community_share_pubkey: [u8; 32],
+    pub max_entries: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityPublicShareList {
+    pub community_share_id: [u8; 32],
+    pub shares: Vec<PublicShareSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -278,6 +337,12 @@ pub enum WirePayload {
     Store(Store),
     GetManifest(GetManifest),
     ManifestData(ManifestData),
+    ListPublicShares(ListPublicShares),
+    PublicShareList(PublicShareList),
+    GetCommunityStatus(GetCommunityStatus),
+    CommunityStatus(CommunityStatus),
+    ListCommunityPublicShares(ListCommunityPublicShares),
+    CommunityPublicShareList(CommunityPublicShareList),
     RelayRegister(RelayRegister),
     RelayRegistered(RelayRegistered),
     RelayConnect(RelayConnect),
@@ -298,6 +363,12 @@ impl WirePayload {
             Self::Store(_) => MsgType::Store,
             Self::GetManifest(_) => MsgType::GetManifest,
             Self::ManifestData(_) => MsgType::ManifestData,
+            Self::ListPublicShares(_) => MsgType::ListPublicShares,
+            Self::PublicShareList(_) => MsgType::PublicShareList,
+            Self::GetCommunityStatus(_) => MsgType::GetCommunityStatus,
+            Self::CommunityStatus(_) => MsgType::CommunityStatus,
+            Self::ListCommunityPublicShares(_) => MsgType::ListCommunityPublicShares,
+            Self::CommunityPublicShareList(_) => MsgType::CommunityPublicShareList,
             Self::RelayRegister(_) => MsgType::RelayRegister,
             Self::RelayRegistered(_) => MsgType::RelayRegistered,
             Self::RelayConnect(_) => MsgType::RelayConnect,
@@ -318,6 +389,12 @@ impl WirePayload {
             Self::Store(msg) => serde_cbor::to_vec(msg)?,
             Self::GetManifest(msg) => serde_cbor::to_vec(msg)?,
             Self::ManifestData(msg) => serde_cbor::to_vec(msg)?,
+            Self::ListPublicShares(msg) => serde_cbor::to_vec(msg)?,
+            Self::PublicShareList(msg) => serde_cbor::to_vec(msg)?,
+            Self::GetCommunityStatus(msg) => serde_cbor::to_vec(msg)?,
+            Self::CommunityStatus(msg) => serde_cbor::to_vec(msg)?,
+            Self::ListCommunityPublicShares(msg) => serde_cbor::to_vec(msg)?,
+            Self::CommunityPublicShareList(msg) => serde_cbor::to_vec(msg)?,
             Self::RelayRegister(msg) => serde_cbor::to_vec(msg)?,
             Self::RelayRegistered(msg) => serde_cbor::to_vec(msg)?,
             Self::RelayConnect(msg) => serde_cbor::to_vec(msg)?,
@@ -339,6 +416,18 @@ impl WirePayload {
             MsgType::Store => Self::Store(serde_cbor::from_slice(payload)?),
             MsgType::GetManifest => Self::GetManifest(serde_cbor::from_slice(payload)?),
             MsgType::ManifestData => Self::ManifestData(serde_cbor::from_slice(payload)?),
+            MsgType::ListPublicShares => Self::ListPublicShares(serde_cbor::from_slice(payload)?),
+            MsgType::PublicShareList => Self::PublicShareList(serde_cbor::from_slice(payload)?),
+            MsgType::GetCommunityStatus => {
+                Self::GetCommunityStatus(serde_cbor::from_slice(payload)?)
+            }
+            MsgType::CommunityStatus => Self::CommunityStatus(serde_cbor::from_slice(payload)?),
+            MsgType::ListCommunityPublicShares => {
+                Self::ListCommunityPublicShares(serde_cbor::from_slice(payload)?)
+            }
+            MsgType::CommunityPublicShareList => {
+                Self::CommunityPublicShareList(serde_cbor::from_slice(payload)?)
+            }
             MsgType::RelayRegister => Self::RelayRegister(serde_cbor::from_slice(payload)?),
             MsgType::RelayRegistered => Self::RelayRegistered(serde_cbor::from_slice(payload)?),
             MsgType::RelayConnect => Self::RelayConnect(serde_cbor::from_slice(payload)?),
@@ -499,6 +588,79 @@ mod tests {
     }
 
     #[test]
+    fn public_share_messages_roundtrip() {
+        let request = ListPublicShares { max_entries: 25 };
+        let request_rt: ListPublicShares =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&request).expect("encode public list req"))
+                .expect("decode public list req");
+        assert_eq!(request_rt, request);
+
+        let response = PublicShareList {
+            shares: vec![PublicShareSummary {
+                share_id: [1u8; 32],
+                share_pubkey: [2u8; 32],
+                latest_seq: 7,
+                latest_manifest_id: [3u8; 32],
+                title: Some("Public Catalog".into()),
+                description: Some("shared".into()),
+            }],
+        };
+        let response_rt: PublicShareList = serde_cbor::from_slice(
+            &serde_cbor::to_vec(&response).expect("encode public list response"),
+        )
+        .expect("decode public list response");
+        assert_eq!(response_rt, response);
+    }
+
+    #[test]
+    fn community_status_messages_roundtrip() {
+        let request = GetCommunityStatus {
+            community_share_id: [4u8; 32],
+            community_share_pubkey: [5u8; 32],
+        };
+        let request_rt: GetCommunityStatus =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&request).expect("encode")).expect("decode");
+        assert_eq!(request_rt, request);
+
+        let response = CommunityStatus {
+            community_share_id: [4u8; 32],
+            joined: true,
+        };
+        let response_rt: CommunityStatus =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&response).expect("encode"))
+                .expect("decode");
+        assert_eq!(response_rt, response);
+    }
+
+    #[test]
+    fn community_public_share_messages_roundtrip() {
+        let request = ListCommunityPublicShares {
+            community_share_id: [6u8; 32],
+            community_share_pubkey: [7u8; 32],
+            max_entries: 12,
+        };
+        let request_rt: ListCommunityPublicShares =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&request).expect("encode")).expect("decode");
+        assert_eq!(request_rt, request);
+
+        let response = CommunityPublicShareList {
+            community_share_id: [6u8; 32],
+            shares: vec![PublicShareSummary {
+                share_id: [8u8; 32],
+                share_pubkey: [9u8; 32],
+                latest_seq: 2,
+                latest_manifest_id: [10u8; 32],
+                title: Some("Community Public".into()),
+                description: None,
+            }],
+        };
+        let response_rt: CommunityPublicShareList =
+            serde_cbor::from_slice(&serde_cbor::to_vec(&response).expect("encode"))
+                .expect("decode");
+        assert_eq!(response_rt, response);
+    }
+
+    #[test]
     fn chunk_messages_roundtrip() {
         let get = GetChunk {
             content_id: [9u8; 32],
@@ -597,6 +759,41 @@ mod tests {
                 manifest_id: [5u8; 32],
                 bytes: vec![9, 8, 7],
             }),
+            WirePayload::ListPublicShares(ListPublicShares { max_entries: 5 }),
+            WirePayload::PublicShareList(PublicShareList {
+                shares: vec![PublicShareSummary {
+                    share_id: [6u8; 32],
+                    share_pubkey: [7u8; 32],
+                    latest_seq: 8,
+                    latest_manifest_id: [9u8; 32],
+                    title: Some("pub".into()),
+                    description: None,
+                }],
+            }),
+            WirePayload::GetCommunityStatus(GetCommunityStatus {
+                community_share_id: [14u8; 32],
+                community_share_pubkey: [15u8; 32],
+            }),
+            WirePayload::CommunityStatus(CommunityStatus {
+                community_share_id: [14u8; 32],
+                joined: true,
+            }),
+            WirePayload::ListCommunityPublicShares(ListCommunityPublicShares {
+                community_share_id: [16u8; 32],
+                community_share_pubkey: [17u8; 32],
+                max_entries: 4,
+            }),
+            WirePayload::CommunityPublicShareList(CommunityPublicShareList {
+                community_share_id: [16u8; 32],
+                shares: vec![PublicShareSummary {
+                    share_id: [18u8; 32],
+                    share_pubkey: [19u8; 32],
+                    latest_seq: 5,
+                    latest_manifest_id: [20u8; 32],
+                    title: Some("community".into()),
+                    description: Some("public".into()),
+                }],
+            }),
             WirePayload::RelayRegister(RelayRegister {
                 relay_slot_id: Some(77),
             }),
@@ -612,7 +809,7 @@ mod tests {
                 payload: vec![5, 4, 3],
             }),
             WirePayload::Providers(Providers {
-                content_id: [6u8; 32],
+                content_id: [10u8; 32],
                 providers: vec![PeerAddr {
                     ip: "10.0.0.3".parse().expect("valid ip"),
                     port: 9999,
@@ -622,14 +819,14 @@ mod tests {
                 updated_at: 321,
             }),
             WirePayload::HaveContent(HaveContent {
-                content_id: [7u8; 32],
+                content_id: [11u8; 32],
             }),
             WirePayload::GetChunk(GetChunk {
-                content_id: [8u8; 32],
+                content_id: [12u8; 32],
                 chunk_index: 2,
             }),
             WirePayload::ChunkData(ChunkData {
-                content_id: [9u8; 32],
+                content_id: [13u8; 32],
                 chunk_index: 2,
                 bytes: vec![6, 6, 6],
             }),

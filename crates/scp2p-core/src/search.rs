@@ -214,6 +214,8 @@ mod tests {
             expires_at: None,
             title: Some("Cool Media".into()),
             description: Some("Decentralized catalog".into()),
+            visibility: crate::manifest::ShareVisibility::Private,
+            communities: vec![],
             items: vec![ItemV1 {
                 content_id: [1u8; 32],
                 size: 42,
@@ -332,6 +334,8 @@ mod tests {
                 expires_at: None,
                 title: Some(format!("Catalog {share_idx}")),
                 description: Some("benchmark catalog".into()),
+                visibility: crate::manifest::ShareVisibility::Private,
+                communities: vec![],
                 items,
                 recommended_shares: vec![],
                 signature: None,

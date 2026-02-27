@@ -32,13 +32,25 @@ Windows desktop shell notes:
   - runtime config: state DB path, QUIC bind, TCP bind, bootstrap peer list
   - lifecycle: load/save config, start/stop, refresh
   - subscriptions: add/remove by share id
+  - communities: join by `share_id` + `share_pubkey`, browse joined participants and community public shares across reachable peers
+  - public shares: browse reachable-peer public shares and subscribe without manually entering `share_id`
   - sync: manual sync over configured bootstrap TCP peers plus LAN-discovered peers
   - search: local subscription-scoped search
-  - inspection: peer list, subscription list, search results
+  - download: content-id + output path
+  - publish: basic text-share publish flow with `private` / `public` visibility and optional joined-community binding
+  - inspection: peer list, subscription list, community list, search results, publish output
 - LAN discovery:
   - when TCP bind is enabled, the desktop shell broadcasts its TCP port over UDP on the local network and listens for the same from other SCP2P desktop nodes
   - use `Refresh` to confirm peers appear, then `Sync Now` to use both configured bootstrap peers and discovered LAN peers
   - Windows firewall may need to allow the desktop binary for both TCP and UDP traffic
+- Publish notes:
+  - the desktop publish flow reuses a persistent default publisher identity, so later publishes append new manifest versions to the same share unless you change the code path
+  - `private` shares still require explicit `share_id`; `public` shares can be browsed from reachable peers
+  - a publish can be bound to one or more already-joined communities; community browse only lists public shares that were explicitly bound to that community
+  - published content is advertised over the local TCP listener; if `Bind TCP` is `0.0.0.0`, the app derives an address from a known peer when possible
+- Community notes:
+  - community join is explicit and local; there is no community autodiscovery
+  - community browse currently probes the peers you can already reach, lists the ones that report joined membership for the selected community, and then fetches community-bound public shares from those peers
 
 ## 3. CLI usage
 
@@ -95,8 +107,17 @@ The API is currently centered around `Node` and `NodeHandle`.
 - `NodeHandle::disable_blocklist_share(blocklist_share_id)`
 - `NodeHandle::unsubscribe(share_id)`
 - `NodeHandle::publish_share(manifest, publisher)`
+- `NodeHandle::ensure_publisher_identity(label)`
 - `NodeHandle::sync_subscriptions()`
 - `NodeHandle::sync_subscriptions_over_dht(...)`
+- `NodeHandle::communities()`
+- `NodeHandle::join_community(...)`
+- `NodeHandle::leave_community(...)`
+- `NodeHandle::list_local_public_shares(...)`
+- `NodeHandle::list_local_community_public_shares(...)`
+- `NodeHandle::fetch_public_shares_from_peer(...)`
+- `NodeHandle::fetch_community_status_from_peer(...)`
+- `NodeHandle::fetch_community_public_shares_from_peer(...)`
 
 ### Search
 - `NodeHandle::set_share_weight(share_id, weight)`
@@ -217,6 +238,8 @@ The API is currently centered around `Node` and `NodeHandle`.
   - peer DB records
   - subscriptions (including latest seq and manifest id)
   - manifest cache
+  - joined communities
+  - publisher identities
   - share weights
   - search index snapshot
   - partial download records

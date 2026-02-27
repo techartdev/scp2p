@@ -32,6 +32,14 @@ pub struct ItemV1 {
     pub chunks: Vec<[u8; 32]>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareVisibility {
+    #[default]
+    Private,
+    Public,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestV1 {
     pub version: u8,
@@ -42,6 +50,10 @@ pub struct ManifestV1 {
     pub expires_at: Option<u64>,
     pub title: Option<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub visibility: ShareVisibility,
+    #[serde(default)]
+    pub communities: Vec<[u8; 32]>,
     pub items: Vec<ItemV1>,
     pub recommended_shares: Vec<[u8; 32]>,
     pub signature: Option<Vec<u8>>,
@@ -57,6 +69,8 @@ struct ManifestUnsigned<'a> {
     expires_at: Option<u64>,
     title: &'a Option<String>,
     description: &'a Option<String>,
+    visibility: ShareVisibility,
+    communities: &'a [[u8; 32]],
     items: &'a [ItemSigningTuple<'a>],
     recommended_shares: &'a [[u8; 32]],
 }
@@ -71,6 +85,8 @@ struct ManifestSigningTuple<'a>(
     Option<u64>,
     &'a Option<String>,
     &'a Option<String>,
+    ShareVisibility,
+    &'a [[u8; 32]],
     &'a [ItemSigningTuple<'a>],
     &'a [[u8; 32]],
 );
@@ -111,6 +127,8 @@ impl ManifestV1 {
             expires_at: self.expires_at,
             title: &self.title,
             description: &self.description,
+            visibility: self.visibility,
+            communities: &self.communities,
             items: &items,
             recommended_shares: &self.recommended_shares,
         };
@@ -123,6 +141,8 @@ impl ManifestV1 {
             unsigned.expires_at,
             unsigned.title,
             unsigned.description,
+            unsigned.visibility,
+            unsigned.communities,
             unsigned.items,
             unsigned.recommended_shares,
         );
@@ -167,6 +187,8 @@ impl ManifestV1 {
             self.expires_at,
             &self.title,
             &self.description,
+            self.visibility,
+            &self.communities,
             &self.items,
             &self.recommended_shares,
             self.signature.as_deref(),
@@ -187,6 +209,8 @@ struct ManifestContentTuple<'a>(
     Option<u64>,
     &'a Option<String>,
     &'a Option<String>,
+    ShareVisibility,
+    &'a [[u8; 32]],
     &'a [ItemV1],
     &'a [[u8; 32]],
     Option<&'a [u8]>,
@@ -199,6 +223,16 @@ pub struct ShareHead {
     pub latest_manifest_id: [u8; 32],
     pub updated_at: u64,
     pub sig: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicShareSummary {
+    pub share_id: [u8; 32],
+    pub share_pubkey: [u8; 32],
+    pub latest_seq: u64,
+    pub latest_manifest_id: [u8; 32],
+    pub title: Option<String>,
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -285,6 +319,8 @@ mod tests {
             expires_at: None,
             title: Some("sample".to_owned()),
             description: None,
+            visibility: ShareVisibility::Private,
+            communities: vec![],
             items: vec![],
             recommended_shares: vec![],
             signature: None,
@@ -321,6 +357,8 @@ mod tests {
             expires_at: Some(1_700_000_100),
             title: Some("sample".to_owned()),
             description: Some("desc".to_owned()),
+            visibility: ShareVisibility::Private,
+            communities: vec![],
             items: vec![],
             recommended_shares: vec![],
             signature: None,
@@ -331,8 +369,13 @@ mod tests {
                 .expect("decode manifest unsigned");
         let items = match unsigned_manifest {
             serde_cbor::Value::Array(values) => {
-                assert_eq!(values.len(), 10);
-                values[8].clone()
+                assert_eq!(values.len(), 12);
+                assert_eq!(values[8], serde_cbor::Value::Text("private".to_string()));
+                match &values[9] {
+                    serde_cbor::Value::Array(communities) => assert!(communities.is_empty()),
+                    _ => panic!("manifest communities should be cbor array"),
+                }
+                values[10].clone()
             }
             _ => panic!("manifest unsigned form should be cbor array"),
         };
@@ -373,6 +416,8 @@ mod tests {
             expires_at: None,
             title: Some("sample".to_owned()),
             description: Some("desc".to_owned()),
+            visibility: ShareVisibility::Public,
+            communities: vec![[9u8; 32]],
             items: vec![ItemV1 {
                 content_id: [1u8; 32],
                 size: 42,
@@ -389,7 +434,16 @@ mod tests {
             serde_cbor::from_slice(&manifest.unsigned_bytes().expect("manifest unsigned bytes"))
                 .expect("decode manifest unsigned");
         let items = match unsigned_manifest {
-            serde_cbor::Value::Array(values) => values[8].clone(),
+            serde_cbor::Value::Array(values) => {
+                assert_eq!(values[8], serde_cbor::Value::Text("public".to_string()));
+                match &values[9] {
+                    serde_cbor::Value::Array(communities) => {
+                        assert_eq!(communities.len(), 1);
+                    }
+                    _ => panic!("manifest communities should be cbor array"),
+                }
+                values[10].clone()
+            }
             _ => panic!("manifest unsigned form should be cbor array"),
         };
         match items {
@@ -404,5 +458,42 @@ mod tests {
             }
             _ => panic!("manifest items should be cbor array"),
         }
+    }
+
+    #[test]
+    fn manifest_visibility_defaults_to_private_when_omitted() {
+        #[derive(Serialize)]
+        struct LegacyManifestV1 {
+            version: u8,
+            share_pubkey: [u8; 32],
+            share_id: [u8; 32],
+            seq: u64,
+            created_at: u64,
+            expires_at: Option<u64>,
+            title: Option<String>,
+            description: Option<String>,
+            items: Vec<ItemV1>,
+            recommended_shares: Vec<[u8; 32]>,
+            signature: Option<Vec<u8>>,
+        }
+
+        let legacy = serde_cbor::to_vec(&LegacyManifestV1 {
+            version: 1,
+            share_pubkey: [0u8; 32],
+            share_id: [1u8; 32],
+            seq: 1,
+            created_at: 1_700_000_000,
+            expires_at: None,
+            title: None,
+            description: None,
+            items: vec![],
+            recommended_shares: vec![],
+            signature: None,
+        })
+        .expect("encode legacy manifest");
+
+        let manifest: ManifestV1 = serde_cbor::from_slice(&legacy).expect("decode legacy");
+        assert_eq!(manifest.visibility, ShareVisibility::Private);
+        assert!(manifest.communities.is_empty());
     }
 }

@@ -1,236 +1,252 @@
 # SCP2P Future Development Plan
 
-This plan captures what is complete, what remains, and high-value next steps.
+This plan captures what is complete, what remains, and the product constraints now set for the next milestones.
 
-## 1. Status snapshot
+## 1. Product Direction Constraints
 
-## Done foundations
+- Search remains strictly subscription-scoped. No global keyword search.
+- Peer autodiscovery is LAN-only. No external/global node autodiscovery is planned.
+- Communities are the non-LAN discovery boundary:
+  - joining a community is explicit, not autodiscovered
+  - a valid community `share_id` plus `share_pubkey` is required to join
+  - once joined, a node can discover community participants and available joins inside that community
+- Shares will gain explicit visibility modes:
+  - `private`: access requires `share_id`
+  - `public`: subscribable without manually entering `share_id`
+- Community browsing is intended to expose participants and public shares inside the joined community.
+
+Spec mapping and gaps:
+- `SPECIFICATION.md` section 0 already matches no global search and no global discovery.
+- Section 5 covers LAN/bootstrap discovery, but not community-scoped participant discovery.
+- Section 7 covers manifests/subscriptions, but not `public` vs `private` share visibility.
+- Section 8 already matches subscription-scoped search.
+- Communities and share visibility therefore need explicit spec work before any new wire formats are frozen.
+
+## 2. Status Snapshot
+
+### Done foundations
 - Milestone 1: identity, IDs, manifests, baseline wire framing/capabilities
 - Milestone 2: peer DB + PEX sampling/freshness
-- Milestone 3: DHT foundations + hardening baseline (iterative lookup/replication/republish/keyspace validation)
+- Milestone 3: DHT foundations + hardening baseline (iterative lookup, replication, republish, keyspace validation)
 - Milestone 4: ShareHead publication + subscription sync
 - Milestone 5: local subscription-scoped search
 - Milestone 6: provider hints + verified swarm download foundations
 - Milestone 7: relay register/connect/stream primitives
 
-## In-progress quality level
-- Functional prototype logic exists in-memory.
+### In-progress quality level
+- Functional prototype logic exists in memory and in the current desktop runtime.
 - Behavior is strongly unit-tested.
-- **Interoperability is improving**: transport/session runtime foundations and conformance vectors now exist.
-- Not yet production-grade runtime/persistence.
+- Interoperability is improving: transport/session runtime foundations and conformance vectors now exist.
+- Durable state exists, but the overall runtime is not yet production-grade.
 
----
+## 3. Immediate Priorities
 
-## 2. Immediate priorities
+### A) Share visibility model
+Status: **In progress (foundational implementation complete)**
 
-### A) Transport and session security (highest priority)
+Add explicit share visibility in manifest/share metadata:
+- `private`
+- `public`
+
+Behavioral target:
+- private shares are not listed for browse/discovery and require explicit `share_id`
+- public shares can be listed and subscribed to by authorized viewers in the current discovery scope
+- search remains local over already-subscribed shares regardless of visibility
+
+Spec mapping:
+- extends section 7 (manifests/subscriptions)
+- must preserve section 0 and section 8 constraint of no global search
+
+Implemented so far:
+- signed `private` / `public` manifest visibility
+- reachable-peer public-share browse
+- direct subscribe flow for browsed public shares
+- local persistence of visibility-bearing manifests
+
+Remaining work:
+- fold public-share browse more tightly into community-centric UX
+- add spec text before treating the current wire surface as frozen
+
+### B) Community-scoped discovery
+Status: **In progress (foundational implementation complete)**
+
+Add community membership and browse behavior:
+- join community via valid `share_id` + `share_pubkey`
+- no community autodiscovery
+- once joined, discover community participants
+- expose community-public shares for direct subscription
+
+Design constraints:
+- communities replace any notion of external/global autodiscovery
+- discovery scope is bounded by explicit community membership
+- participant discovery is expected to be bidirectional when peers are mutually reachable and firewall/network policy allows it
+
+Spec mapping:
+- extends section 5 (bootstrap/discovery) with a community layer not yet specified
+- should be specified before finalizing new wire payloads
+
+Implemented so far:
+- explicit join via valid `share_id` + `share_pubkey`
+- local persistence of joined communities
+- participant probe across currently reachable peers
+- community-scoped public-share browse
+- publish-time binding of public shares to selected joined communities
+
+Remaining work:
+- define the stable community object model in the spec
+- broaden desktop/community workflows beyond the current direct probe model as protocol requirements become clearer
+
+### C) Transport and session security
 Status: **Done (foundational implementation complete)**
+
 - QUIC runtime foundations implemented
 - TLS-over-TCP fallback foundations implemented
 - identity-bound handshake verification (`remote_node_pubkey` binding) implemented
 - message send/recv loop + dispatcher for all envelope `type` values implemented
 - backpressure/max message size checks implemented for framed envelopes
+- handshake timestamp freshness/skew validation added
 
-Original scope:
-- QUIC primary transport
-- TLS-over-TCP fallback
-- identity-bound handshake verification (`remote_node_pubkey` binding)
-- message send/recv loop + dispatcher for all envelope `type` values
-- backpressure + max message size limits
+Critical spec alignment:
+- define and freeze a stable `type: u16` registry for message kinds
+- ensure deterministic encoding for all signed payloads
 
-**Critical spec alignment**
-- Define and freeze a **stable `type: u16` registry** for message kinds (PEX/DHT/MANIFEST/CONTENT/RELAY/etc.).
-- Ensure **deterministic encoding** for any signed payloads (see section 7).
-
-Why now:
-- Most remaining features are currently simulated in-process.
-
-### B) Persistence layer and boundaries
+### D) Persistence layer and boundaries
 Status: **In progress**
+
+Implemented:
 - `Store` abstraction introduced in core
 - in-memory backend implemented and wired into node lifecycle
 - sqlite backend introduced for durable state snapshots
-- sqlite backend moved to normalized per-slice tables (peers/subscriptions/manifests/weights/partials/metadata)
-- peers/subscriptions/manifests/share weights/search index persisted
-- partial download records persisted
-- encrypted node-key material persistence with optional passphrase-based encryption added
+- sqlite backend moved to normalized per-slice tables
+- peers, subscriptions, manifests, share weights, search index, partial downloads, and encrypted node-key material persisted
 
-Add durable state for:
-- peer DB
-- subscriptions and trust levels
-- manifests cache
-- search index
-- partial downloads
-- keys (with optional encryption at rest)
+Remaining work:
+- harden migration story for future schema changes
+- harden versioning/migration around persisted community membership and publisher identity slices
 
-**Implementation suggestion**
-- Introduce a `scp2p-store` abstraction early (traits + in-memory + sqlite implementation) to avoid later API churn.
-
-Why now:
-- Required for practical client behavior beyond one process lifetime.
-
-### C) Manifest/content fetch over network
+### E) Manifest/content fetch over network
 Status: **Done (foundational implementation complete)**
-- Wire-level `GET_MANIFEST` and `GET_CHUNK` request/response helpers added
-- timeout + retry + provider rotation policy foundations added
-- per-peer chunk request cap policy added
-- session pooling transport added for connection reuse across repeated requests
-- adaptive provider scoring and failure backoff added
-- protocol error-flag handling added (`FLAG_ERROR` on response envelope)
 
-Move from local in-memory source assumptions to real remote fetch:
-- GET_MANIFEST from peers
-- GET_CHUNK from providers
-- end-to-end verification pipeline already in place
-- provider discovery from connected peers + DHT hints + PEX
+Implemented:
+- `GET_MANIFEST` and `GET_CHUNK` request/response helpers
+- timeout + retry + provider rotation policy foundations
+- per-peer chunk request cap policy
+- session pooling transport for repeated requests
+- adaptive provider scoring and failure backoff
+- protocol error-flag handling
 
-Add:
-- timeouts/retries
-- provider rotation strategy
-- per-peer rate limits
-
----
-
-## 3. Relay expansion plan
+## 4. Relay Expansion Plan
 
 Status: **In progress**
-- relay message handling now wired in live TCP runtime dispatcher (RELAY_REGISTER/RELAY_CONNECT/RELAY_STREAM)
-- simulated NAT-style relay integration coverage added (owner/requester operate only via relay)
-- relay slot keepalive renewal baseline implemented via RELAY_REGISTER with optional relay_slot_id refresh
-- relay selection/rotation baseline implemented with health-scored peer selection and anti-sticky rotation
-- relay quota baseline implemented (control-byte cap, content-byte cap, stream-count cap) with control-only default and explicit content opt-in
-- adaptive relay gating baseline implemented: content relay requires positive relay trust score; per-peer adaptive payload cap tied to relay score
+
+- relay message handling wired in live TCP runtime dispatcher
+- simulated NAT-style relay integration coverage added
+- relay slot keepalive renewal baseline implemented
+- relay selection/rotation baseline implemented
+- relay quota baseline implemented with control-only default and explicit content opt-in
+- adaptive relay gating baseline implemented
 
 Current relay support is foundational only. Extend to:
-- stream routing tables between requester/owner
-- keepalive + expiry renewal (advanced policies beyond baseline)
+- stream routing tables between requester and owner
+- keepalive + expiry renewal hardening
 - relay selection/rotation hardening under larger dynamic networks
-- optional relay throughput caps (adaptive/policy-tiered)
+- optional relay throughput caps
 - control-only mode default
 - optional limited content relay mode with stricter dynamic quotas/reputation coupling
 
-**Clarify relay multiplexing**
-- If QUIC is used end-to-end, multiplexing is handled by QUIC streams.
-- If relays proxy at the application layer, define a simple framed multiplex protocol:
-  - `relay_stream_id: u32` + `frame_len: u32` + `frame_bytes`
-  - mapping tables per connected peer
-- Decide which model is v0.1 to keep implementations consistent.
-
-Suggested policy defaults:
-- relay content disabled by default
-- opt-in by user (or per-share)
-- caps by bytes/day and stream count
-- prefer control-only relays; content relay is last-resort fallback
-
----
-
-## 4. DHT hardening plan
+## 5. DHT Hardening Plan
 
 Status: **Done (foundational implementation complete)**
+
 - iterative network queries (`alpha=3`) implemented
 - replication to K closest nodes implemented
 - per-bucket routing/eviction baseline implemented
 - background republish tasks implemented
-- TCP runtime DHT serving loop implemented for live `FIND_NODE`/`FIND_VALUE`/`STORE` and `GET_MANIFEST`
-- subscription sync-over-DHT now fetches missing manifests over network when ShareHead is newer
-- keyspace validation rules implemented for known keyspaces:
-  - ShareHead values must match `share:head` key derivation
-  - Providers values must match `content:prov` key derivation
+- TCP runtime DHT serving loop implemented for live `FIND_NODE` / `FIND_VALUE` / `STORE` / `GET_MANIFEST`
+- subscription sync-over-DHT fetches missing manifests over network when ShareHead is newer
+- keyspace validation rules implemented for known keyspaces
 - signature-enforced ShareHead fetch path implemented when share pubkey is known
 
-Remaining hardening (future increments):
-- stronger anti-abuse/rate-limit controls at network boundary (beyond baseline per-peer fixed-window limits)
+Remaining hardening:
+- stronger anti-abuse and rate-limit controls at the network boundary
 - richer stale-data rejection policies and quotas
-- broader long-run multi-node soak and churn validation in integration harness
+- broader long-run multi-node soak and churn validation
 
----
-
-## 5. Search improvements
+## 6. Search Improvements
 
 Status: **In progress**
-- trust-tier filtering baseline implemented in core API (`trusted|normal|untrusted`, default `trusted+normal`)
+
+- trust-tier filtering baseline implemented in core API
 - pagination + optional snippets baseline implemented in core API search page queries
-- Unicode normalization baseline implemented in tokenizer/query path (`NFKC` + lowercase folding)
-- optional blocklist-share filtering baseline implemented via explicit `BlocklistRules` attached to subscribed blocklist shares
-- large-catalog benchmark smoke baseline implemented (index build + query latency thresholds, env-configurable)
+- Unicode normalization baseline implemented in tokenizer/query path
+- optional blocklist-share filtering baseline implemented via explicit `BlocklistRules`
+- large-catalog benchmark smoke baseline implemented
 
 Current search is local and simple. Extend to:
-- deeper benchmarking and profile-guided optimization for large catalogs (beyond smoke baseline)
+- deeper benchmarking and profile-guided optimization for large catalogs
 
 Notes:
-- Keep search strictly subscription-scoped in v0.1.
-- Consider “directory shares” as the main discovery UX for new subscriptions.
+- keep search strictly subscription-scoped in v0.1
+- do not add network-wide/global search
+- public-share browsing should happen via LAN peers or joined communities, not via search
 
----
-
-## 6. API and SDK maturity
+## 7. API and SDK Maturity
 
 Stabilize public API surface:
-- explicit event stream model (typed events + ordering guarantees)
+- explicit event stream model with ordering guarantees
 - structured error types
 - cancellation/progress hooks for downloads
 - API versioning rules
 - docs examples for GUI/mobile wrappers
 
 Packaging suggestions:
-- Create `scp2p-core` (protocol + state machine) and `scp2p-transport` (QUIC/TCP) crates once runtime grows.
-- Keep a small, stable FFI-friendly surface (for mobile/other languages) as a long-term goal.
+- create `scp2p-core` and `scp2p-transport` as separate crates once runtime grows further
+- keep a small, stable FFI-friendly surface as a long-term goal
 
----
-
-## 7. Canonical encoding and conformance (high impact, do early)
+## 8. Canonical Encoding and Conformance
 
 ### Canonical CBOR for signatures
-- Signed objects (Manifest, ShareHead) must be encoded in a **deterministic/canonical** form.
+- Signed objects (`Manifest`, `ShareHead`, and future community objects) must be encoded in a deterministic/canonical form.
 - Add explicit canonicalization rules and test vectors:
   - map key ordering
   - integer encoding rules
   - byte/string normalization rules
 - Ensure libraries used in Rust follow the same canonical encoding used in vectors.
 
-Why now:
-- Prevents cross-client signature failures and “works on my machine” issues.
-
 ### Stable message type registry
 - Freeze the `type: u16` numbers now and document them.
-- Add a compatibility policy: adding new message types must not break older clients.
+- Adding new message types must not break older clients.
 
----
+## 9. Testing and Conformance
 
-## 8. Testing and conformance
-
-Build conformance pack from spec section 14:
-- signature vectors (Manifest, ShareHead)
+Build a conformance pack from spec section 14:
+- signature vectors (`Manifest`, `ShareHead`, future visibility/community records)
 - ID derivation vectors
 - chunk hashing vectors
 - handshake transcripts (QUIC and TCP fallback)
-- DHT STORE/FIND behavior scenarios
+- DHT `STORE` / `FIND` behavior scenarios
 
-Add integration/e2e tests:
-- multi-node local network simulation (5–50 nodes)
+Add integration and end-to-end tests:
+- multi-node local network simulation (5-50 nodes)
 - churn tests (nodes join/leave)
 - NAT/relay scenarios (at least simulated)
 - manifest update propagation latency
 - large manifest/index performance smoke test
-- baseline churn harness progress: 3-node TCP integration test now covers publisher restart recovery for subscription sync, search, and verified network download
-- baseline soak progress: configurable multi-node churn test added (`SCP2P_CHURN_NODE_COUNT=5..50`, `SCP2P_CHURN_ROUNDS=1..10`) with subscriber restart churn and per-round sync/search/download assertions
-- baseline NAT/relay progress: TCP runtime now serves relay register/connect/stream over authenticated sessions with integration coverage for simulated NAT peers via relay-only control path
-- soak metrics baseline: churn soak now asserts p95 sync latency (`SCP2P_SOAK_MAX_SYNC_MS`) and expected per-round download completions
+- LAN peer discovery symmetry tests
+- desktop two-machine smoke tests for publish/subscribe/download
+- future community join and participant browse scenarios
 
----
-
-## 9. Good ideas (optional enhancements)
+## 10. Good Ideas
 
 - Introduce `scp2p-transport` crate once network runtime grows
 - Introduce `scp2p-store` crate for persistence layer abstraction
 - Add metrics/tracing surfaces for operator diagnostics
 - Configurable bandwidth and concurrency controls
 - Invite-link UX + bootstrap seed management utilities
+- Community membership UX + participant browse surfaces
 - Multi-transport support: prefer QUIC, fallback TCP; allow policy-based selection per platform
 
----
-
-## 10. Definition of “v0.1 usable” (proposed)
+## 11. Definition of "v0.1 usable"
 
 A practical v0.1 should include:
 - real transport (QUIC + TCP fallback)
@@ -241,11 +257,11 @@ A practical v0.1 should include:
 - verified downloads from remote providers
 - relay fallback for control traffic (content relay optional and capped)
 - persistent local state (peers, subscriptions, manifests, index, partial downloads)
+- LAN discovery for local zero-config peer finding
+- public/private share visibility model
 - conformance pack + multi-node integration tests
 
----
+## 12. Desktop Client Track
 
-## 11. Desktop Client Track
-
-- Chosen GUI direction: **Tauri + React** desktop client.
+- Current practical desktop direction: native Windows shell on top of `crates/scp2p-desktop`.
 - Detailed execution plan is tracked in `DESKTOP_APP_PLAN.md`.

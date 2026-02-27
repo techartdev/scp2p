@@ -6,7 +6,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -20,7 +20,7 @@ use crate::{
     dht::{Dht, DhtNodeRecord, DhtValue, ALPHA, DEFAULT_TTL_SECS, K, MAX_VALUE_SIZE},
     dht_keys::{content_provider_key, share_head_key},
     ids::{ContentId, NodeId, ShareId},
-    manifest::{ManifestV1, ShareHead, ShareKeypair},
+    manifest::{ManifestV1, PublicShareSummary, ShareHead, ShareKeypair, ShareVisibility},
     net_fetch::{
         download_swarm_over_network, fetch_manifest_with_retry, FetchPolicy, PeerConnector,
         RequestTransport,
@@ -30,17 +30,19 @@ use crate::{
     relay::{RelayLimits, RelayManager, RelayPayloadKind as RelayInternalPayloadKind},
     search::{IndexedItem, SearchIndex},
     store::{
-        decrypt_secret, encrypt_secret, EncryptedSecret, MemoryStore, PersistedPartialDownload,
-        PersistedState, PersistedSubscription, Store,
+        decrypt_secret, encrypt_secret, EncryptedSecret, MemoryStore, PersistedCommunity,
+        PersistedPartialDownload, PersistedPublisherIdentity, PersistedState,
+        PersistedSubscription, Store,
     },
     transfer::{download_swarm, ChunkProvider},
     transport::{read_envelope, write_envelope},
     transport_net::tcp_accept_session,
     wire::{
-        ChunkData, Envelope, FindNode, FindNodeResult, FindValue, FindValueResult, MsgType,
-        PexOffer, PexRequest, Providers, RelayConnect, RelayPayloadKind as WireRelayPayloadKind,
-        RelayRegister, RelayRegistered, RelayStream, Store as WireStore, WirePayload, FLAG_ERROR,
-        FLAG_RESPONSE,
+        ChunkData, CommunityPublicShareList, CommunityStatus, Envelope, FindNode, FindNodeResult,
+        FindValue, FindValueResult, GetCommunityStatus, ListCommunityPublicShares,
+        ListPublicShares, MsgType, PexOffer, PexRequest, Providers, PublicShareList, RelayConnect,
+        RelayPayloadKind as WireRelayPayloadKind, RelayRegister, RelayRegistered, RelayStream,
+        Store as WireStore, WirePayload, FLAG_ERROR, FLAG_RESPONSE,
     },
 };
 
@@ -147,6 +149,8 @@ pub struct NodeHandle {
 struct NodeState {
     runtime_config: NodeConfig,
     subscriptions: HashMap<[u8; 32], SubscriptionState>,
+    communities: HashMap<[u8; 32], [u8; 32]>,
+    publisher_identities: HashMap<String, [u8; 32]>,
     peer_db: PeerDb,
     dht: Dht,
     manifest_cache: HashMap<[u8; 32], ManifestV1>,
@@ -241,6 +245,8 @@ impl NodeState {
         let PersistedState {
             peers,
             subscriptions,
+            communities,
+            publisher_identities,
             manifests,
             share_heads,
             share_weights,
@@ -265,6 +271,14 @@ impl NodeState {
                     },
                 )
             })
+            .collect::<HashMap<_, _>>();
+        let communities = communities
+            .into_iter()
+            .map(|community| (community.share_id, community.share_pubkey))
+            .collect::<HashMap<_, _>>();
+        let publisher_identities = publisher_identities
+            .into_iter()
+            .map(|identity| (identity.label, identity.share_secret))
             .collect::<HashMap<_, _>>();
 
         let mut rebuilt_search_index = SearchIndex::default();
@@ -304,6 +318,8 @@ impl NodeState {
         Self {
             runtime_config,
             subscriptions,
+            communities,
+            publisher_identities,
             peer_db,
             dht,
             manifest_cache: manifests,
@@ -337,9 +353,27 @@ impl NodeState {
                 trust_level: sub.trust_level,
             })
             .collect();
+        let communities = self
+            .communities
+            .iter()
+            .map(|(share_id, share_pubkey)| PersistedCommunity {
+                share_id: *share_id,
+                share_pubkey: *share_pubkey,
+            })
+            .collect();
+        let publisher_identities = self
+            .publisher_identities
+            .iter()
+            .map(|(label, share_secret)| PersistedPublisherIdentity {
+                label: label.clone(),
+                share_secret: *share_secret,
+            })
+            .collect();
         PersistedState {
             peers: self.peer_db.all_records(),
             subscriptions,
+            communities,
+            publisher_identities,
             manifests: self.manifest_cache.clone(),
             share_heads: self.published_share_heads.clone(),
             share_weights: self.share_weights.clone(),
@@ -443,6 +477,177 @@ impl NodeHandle {
                 trust_level: sub.trust_level,
             })
             .collect()
+    }
+
+    pub async fn communities(&self) -> Vec<PersistedCommunity> {
+        let state = self.state.read().await;
+        state
+            .communities
+            .iter()
+            .map(|(share_id, share_pubkey)| PersistedCommunity {
+                share_id: *share_id,
+                share_pubkey: *share_pubkey,
+            })
+            .collect()
+    }
+
+    pub async fn ensure_publisher_identity(&self, label: &str) -> anyhow::Result<ShareKeypair> {
+        let label = label.trim();
+        if label.is_empty() {
+            anyhow::bail!("publisher label must not be empty");
+        }
+
+        let mut state = self.state.write().await;
+        let secret = match state.publisher_identities.get(label).copied() {
+            Some(secret) => secret,
+            None => {
+                let mut rng = rand::rngs::OsRng;
+                let secret = SigningKey::generate(&mut rng).to_bytes();
+                state.publisher_identities.insert(label.to_string(), secret);
+                persist_state_locked(&state).await?;
+                secret
+            }
+        };
+        Ok(ShareKeypair::new(SigningKey::from_bytes(&secret)))
+    }
+
+    pub async fn list_local_public_shares(
+        &self,
+        max_entries: usize,
+    ) -> anyhow::Result<Vec<PublicShareSummary>> {
+        let state = self.state.read().await;
+        let mut heads = state
+            .published_share_heads
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        heads.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then(b.latest_seq.cmp(&a.latest_seq))
+                .then(a.share_id.cmp(&b.share_id))
+        });
+
+        let mut shares = Vec::new();
+        for head in heads {
+            let Some(manifest) = state.manifest_cache.get(&head.latest_manifest_id) else {
+                continue;
+            };
+            if manifest.visibility != ShareVisibility::Public {
+                continue;
+            }
+            shares.push(PublicShareSummary {
+                share_id: manifest.share_id,
+                share_pubkey: manifest.share_pubkey,
+                latest_seq: head.latest_seq,
+                latest_manifest_id: head.latest_manifest_id,
+                title: manifest.title.clone(),
+                description: manifest.description.clone(),
+            });
+            if shares.len() >= max_entries {
+                break;
+            }
+        }
+        Ok(shares)
+    }
+
+    pub async fn published_share_head(&self, share_id: ShareId) -> Option<ShareHead> {
+        self.state
+            .read()
+            .await
+            .published_share_heads
+            .get(&share_id.0)
+            .cloned()
+    }
+
+    pub async fn list_local_community_public_shares(
+        &self,
+        community_share_id: ShareId,
+        community_share_pubkey: [u8; 32],
+        max_entries: usize,
+    ) -> anyhow::Result<Vec<PublicShareSummary>> {
+        let pubkey = VerifyingKey::from_bytes(&community_share_pubkey)?;
+        if ShareId::from_pubkey(&pubkey) != community_share_id {
+            anyhow::bail!("community share_id does not match share_pubkey");
+        }
+
+        let state = self.state.read().await;
+        if !state.communities.contains_key(&community_share_id.0) {
+            return Ok(Vec::new());
+        }
+
+        let mut heads = state
+            .published_share_heads
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        heads.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then(b.latest_seq.cmp(&a.latest_seq))
+                .then(a.share_id.cmp(&b.share_id))
+        });
+        let mut shares = Vec::new();
+        for head in heads {
+            let Some(manifest) = state.manifest_cache.get(&head.latest_manifest_id) else {
+                continue;
+            };
+            if manifest.visibility != ShareVisibility::Public {
+                continue;
+            }
+            if !manifest.communities.contains(&community_share_id.0) {
+                continue;
+            }
+            shares.push(PublicShareSummary {
+                share_id: manifest.share_id,
+                share_pubkey: manifest.share_pubkey,
+                latest_seq: head.latest_seq,
+                latest_manifest_id: head.latest_manifest_id,
+                title: manifest.title.clone(),
+                description: manifest.description.clone(),
+            });
+            if shares.len() >= max_entries {
+                break;
+            }
+        }
+        Ok(shares)
+    }
+
+    pub async fn fetch_public_shares_from_peer<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        peer: &PeerAddr,
+        max_entries: u16,
+    ) -> anyhow::Result<Vec<PublicShareSummary>> {
+        query_public_shares(transport, peer, max_entries).await
+    }
+
+    pub async fn fetch_community_status_from_peer<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        peer: &PeerAddr,
+        share_id: ShareId,
+        share_pubkey: [u8; 32],
+    ) -> anyhow::Result<bool> {
+        query_community_status(transport, peer, share_id, share_pubkey).await
+    }
+
+    pub async fn fetch_community_public_shares_from_peer<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        peer: &PeerAddr,
+        community_share_id: ShareId,
+        community_share_pubkey: [u8; 32],
+        max_entries: u16,
+    ) -> anyhow::Result<Vec<PublicShareSummary>> {
+        query_community_public_shares(
+            transport,
+            peer,
+            community_share_id,
+            community_share_pubkey,
+            max_entries,
+        )
+        .await
     }
 
     pub async fn connect(&self, peer_addr: PeerAddr) -> anyhow::Result<()> {
@@ -1003,6 +1208,29 @@ impl NodeHandle {
     pub async fn subscribe(&self, share_id: ShareId) -> anyhow::Result<()> {
         self.subscribe_with_options(share_id, None, SubscriptionTrustLevel::Normal)
             .await
+    }
+
+    pub async fn join_community(
+        &self,
+        share_id: ShareId,
+        share_pubkey: [u8; 32],
+    ) -> anyhow::Result<()> {
+        let pubkey = VerifyingKey::from_bytes(&share_pubkey)?;
+        let derived = ShareId::from_pubkey(&pubkey);
+        if derived != share_id {
+            anyhow::bail!("community share_id does not match share_pubkey");
+        }
+        let mut state = self.state.write().await;
+        state.communities.insert(share_id.0, share_pubkey);
+        persist_state_locked(&state).await?;
+        Ok(())
+    }
+
+    pub async fn leave_community(&self, share_id: ShareId) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        state.communities.remove(&share_id.0);
+        persist_state_locked(&state).await?;
+        Ok(())
     }
 
     pub async fn subscribe_with_pubkey(
@@ -1693,6 +1921,66 @@ impl NodeHandle {
                     flags: FLAG_RESPONSE,
                     payload,
                 }),
+            WirePayload::ListPublicShares(msg) => self
+                .list_local_public_shares(msg.max_entries as usize)
+                .await
+                .and_then(|shares| {
+                    serde_cbor::to_vec(&PublicShareList { shares }).map_err(Into::into)
+                })
+                .map(|payload| Envelope {
+                    r#type: MsgType::PublicShareList as u16,
+                    req_id,
+                    flags: FLAG_RESPONSE,
+                    payload,
+                }),
+            WirePayload::GetCommunityStatus(msg) => {
+                let joined = match VerifyingKey::from_bytes(&msg.community_share_pubkey) {
+                    Ok(pubkey) if ShareId::from_pubkey(&pubkey).0 == msg.community_share_id => self
+                        .state
+                        .read()
+                        .await
+                        .communities
+                        .contains_key(&msg.community_share_id),
+                    _ => {
+                        return Some(error_envelope(
+                            req_type,
+                            req_id,
+                            "community share_id does not match share_pubkey",
+                        ));
+                    }
+                };
+                serde_cbor::to_vec(&CommunityStatus {
+                    community_share_id: msg.community_share_id,
+                    joined,
+                })
+                .map_err(Into::into)
+                .map(|payload| Envelope {
+                    r#type: MsgType::CommunityStatus as u16,
+                    req_id,
+                    flags: FLAG_RESPONSE,
+                    payload,
+                })
+            }
+            WirePayload::ListCommunityPublicShares(msg) => self
+                .list_local_community_public_shares(
+                    ShareId(msg.community_share_id),
+                    msg.community_share_pubkey,
+                    msg.max_entries as usize,
+                )
+                .await
+                .and_then(|shares| {
+                    serde_cbor::to_vec(&CommunityPublicShareList {
+                        community_share_id: msg.community_share_id,
+                        shares,
+                    })
+                    .map_err(Into::into)
+                })
+                .map(|payload| Envelope {
+                    r#type: MsgType::CommunityPublicShareList as u16,
+                    req_id,
+                    flags: FLAG_RESPONSE,
+                    payload,
+                }),
             WirePayload::GetChunk(msg) => self
                 .chunk_bytes(msg.content_id, msg.chunk_index)
                 .await
@@ -1911,7 +2199,11 @@ fn request_class(payload: &WirePayload) -> RequestClass {
         WirePayload::FindNode(_) | WirePayload::FindValue(_) | WirePayload::Store(_) => {
             RequestClass::Dht
         }
-        WirePayload::GetManifest(_) | WirePayload::GetChunk(_) => RequestClass::Fetch,
+        WirePayload::GetManifest(_)
+        | WirePayload::ListPublicShares(_)
+        | WirePayload::GetCommunityStatus(_)
+        | WirePayload::ListCommunityPublicShares(_)
+        | WirePayload::GetChunk(_) => RequestClass::Fetch,
         WirePayload::RelayRegister(_)
         | WirePayload::RelayConnect(_)
         | WirePayload::RelayStream(_) => RequestClass::Relay,
@@ -2015,6 +2307,102 @@ async fn query_find_value<T: RequestTransport + ?Sized>(
         anyhow::bail!("find_value response missing response flag");
     }
     Ok(serde_cbor::from_slice(&response.payload)?)
+}
+
+async fn query_public_shares<T: RequestTransport + ?Sized>(
+    transport: &T,
+    peer: &PeerAddr,
+    max_entries: u16,
+) -> anyhow::Result<Vec<PublicShareSummary>> {
+    let req_id = next_req_id();
+    let request = Envelope::from_typed(
+        req_id,
+        0,
+        &WirePayload::ListPublicShares(ListPublicShares { max_entries }),
+    )?;
+    let response = transport
+        .request(peer, request, Duration::from_secs(3))
+        .await?;
+    if response.r#type != MsgType::PublicShareList as u16 {
+        anyhow::bail!("unexpected public share list response type");
+    }
+    if response.req_id != req_id {
+        anyhow::bail!("public share list response req_id mismatch");
+    }
+    if response.flags & FLAG_RESPONSE == 0 {
+        anyhow::bail!("public share list response missing response flag");
+    }
+    Ok(serde_cbor::from_slice::<PublicShareList>(&response.payload)?.shares)
+}
+
+async fn query_community_status<T: RequestTransport + ?Sized>(
+    transport: &T,
+    peer: &PeerAddr,
+    share_id: ShareId,
+    share_pubkey: [u8; 32],
+) -> anyhow::Result<bool> {
+    let req_id = next_req_id();
+    let request = Envelope::from_typed(
+        req_id,
+        0,
+        &WirePayload::GetCommunityStatus(GetCommunityStatus {
+            community_share_id: share_id.0,
+            community_share_pubkey: share_pubkey,
+        }),
+    )?;
+    let response = transport
+        .request(peer, request, Duration::from_secs(3))
+        .await?;
+    if response.r#type != MsgType::CommunityStatus as u16 {
+        anyhow::bail!("unexpected community status response type");
+    }
+    if response.req_id != req_id {
+        anyhow::bail!("community status response req_id mismatch");
+    }
+    if response.flags & FLAG_RESPONSE == 0 {
+        anyhow::bail!("community status response missing response flag");
+    }
+    let status: CommunityStatus = serde_cbor::from_slice(&response.payload)?;
+    if status.community_share_id != share_id.0 {
+        anyhow::bail!("community status response share_id mismatch");
+    }
+    Ok(status.joined)
+}
+
+async fn query_community_public_shares<T: RequestTransport + ?Sized>(
+    transport: &T,
+    peer: &PeerAddr,
+    community_share_id: ShareId,
+    community_share_pubkey: [u8; 32],
+    max_entries: u16,
+) -> anyhow::Result<Vec<PublicShareSummary>> {
+    let req_id = next_req_id();
+    let request = Envelope::from_typed(
+        req_id,
+        0,
+        &WirePayload::ListCommunityPublicShares(ListCommunityPublicShares {
+            community_share_id: community_share_id.0,
+            community_share_pubkey,
+            max_entries,
+        }),
+    )?;
+    let response = transport
+        .request(peer, request, Duration::from_secs(3))
+        .await?;
+    if response.r#type != MsgType::CommunityPublicShareList as u16 {
+        anyhow::bail!("unexpected community public share list response type");
+    }
+    if response.req_id != req_id {
+        anyhow::bail!("community public share list response req_id mismatch");
+    }
+    if response.flags & FLAG_RESPONSE == 0 {
+        anyhow::bail!("community public share list response missing response flag");
+    }
+    let payload: CommunityPublicShareList = serde_cbor::from_slice(&response.payload)?;
+    if payload.community_share_id != community_share_id.0 {
+        anyhow::bail!("community public share list response share_id mismatch");
+    }
+    Ok(payload.shares)
 }
 
 async fn query_store<T: RequestTransport + ?Sized>(
@@ -2660,6 +3048,8 @@ mod tests {
             expires_at: None,
             title: Some("runtime".into()),
             description: Some("integration".into()),
+            visibility: crate::manifest::ShareVisibility::Private,
+            communities: vec![],
             items: vec![ItemV1 {
                 content_id: [77u8; 32],
                 size: 123,
@@ -2757,6 +3147,8 @@ mod tests {
             expires_at: None,
             title: Some("runtime-content".into()),
             description: Some("integration".into()),
+            visibility: crate::manifest::ShareVisibility::Private,
+            communities: vec![],
             items: vec![ItemV1 {
                 content_id: desc.content_id.0,
                 size: payload.len() as u64,
@@ -2888,6 +3280,8 @@ mod tests {
             expires_at: None,
             title: Some("churn-seq1".into()),
             description: Some("initial publish".into()),
+            visibility: crate::manifest::ShareVisibility::Private,
+            communities: vec![],
             items: vec![ItemV1 {
                 content_id: desc_v1.content_id.0,
                 size: payload_v1.len() as u64,
@@ -2973,6 +3367,8 @@ mod tests {
             expires_at: None,
             title: Some("churn-seq2".into()),
             description: Some("publisher restarted".into()),
+            visibility: crate::manifest::ShareVisibility::Private,
+            communities: vec![],
             items: vec![ItemV1 {
                 content_id: desc_v2.content_id.0,
                 size: payload_v2.len() as u64,
@@ -3178,6 +3574,8 @@ mod tests {
                 expires_at: None,
                 title: Some(format!("soak-seq-{seq}")),
                 description: Some("multi-node churn soak".into()),
+                visibility: crate::manifest::ShareVisibility::Private,
+                communities: vec![],
                 items: vec![ItemV1 {
                     content_id: desc.content_id.0,
                     size: payload.len() as u64,
@@ -3477,6 +3875,8 @@ mod tests {
             expires_at: None,
             title: Some("t".into()),
             description: None,
+            visibility: crate::manifest::ShareVisibility::Private,
+            communities: vec![],
             items: vec![],
             recommended_shares: vec![],
             signature: None,
@@ -3505,6 +3905,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_public_share_listing_filters_private_manifests() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        let mut rng = OsRng;
+        let public_share = ShareKeypair::new(SigningKey::generate(&mut rng));
+        let private_share = ShareKeypair::new(SigningKey::generate(&mut rng));
+
+        let public_manifest = ManifestV1 {
+            version: 1,
+            share_pubkey: public_share.verifying_key().to_bytes(),
+            share_id: public_share.share_id().0,
+            seq: 1,
+            created_at: 1_700_000_010,
+            expires_at: None,
+            title: Some("public".into()),
+            description: Some("visible".into()),
+            visibility: crate::manifest::ShareVisibility::Public,
+            communities: vec![],
+            items: vec![],
+            recommended_shares: vec![],
+            signature: None,
+        };
+        let private_manifest = ManifestV1 {
+            version: 1,
+            share_pubkey: private_share.verifying_key().to_bytes(),
+            share_id: private_share.share_id().0,
+            seq: 1,
+            created_at: 1_700_000_011,
+            expires_at: None,
+            title: Some("private".into()),
+            description: Some("hidden".into()),
+            visibility: crate::manifest::ShareVisibility::Private,
+            communities: vec![],
+            items: vec![],
+            recommended_shares: vec![],
+            signature: None,
+        };
+
+        handle
+            .publish_share(public_manifest, &public_share)
+            .await
+            .expect("publish public");
+        handle
+            .publish_share(private_manifest, &private_share)
+            .await
+            .expect("publish private");
+
+        let shares = handle
+            .list_local_public_shares(10)
+            .await
+            .expect("list public shares");
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].share_id, public_share.share_id().0);
+        assert_eq!(
+            shares[0].share_pubkey,
+            public_share.verifying_key().to_bytes()
+        );
+        assert_eq!(shares[0].title.as_deref(), Some("public"));
+    }
+
+    #[tokio::test]
+    async fn fetch_public_shares_from_peer_roundtrip() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        let transport = MockDhtTransport::default();
+        let peer = PeerAddr {
+            ip: "10.0.0.81".parse().expect("valid ip"),
+            port: 7000,
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: Some([17u8; 32]),
+        };
+
+        transport
+            .register(&peer, move |request| {
+                let WirePayload::ListPublicShares(msg) = request.decode_typed()? else {
+                    anyhow::bail!("unexpected payload");
+                };
+                assert_eq!(msg.max_entries, 8);
+                Ok(Envelope {
+                    r#type: MsgType::PublicShareList as u16,
+                    req_id: request.req_id,
+                    flags: FLAG_RESPONSE,
+                    payload: serde_cbor::to_vec(&PublicShareList {
+                        shares: vec![PublicShareSummary {
+                            share_id: [1u8; 32],
+                            share_pubkey: [2u8; 32],
+                            latest_seq: 3,
+                            latest_manifest_id: [4u8; 32],
+                            title: Some("public".into()),
+                            description: Some("listed".into()),
+                        }],
+                    })?,
+                })
+            })
+            .await;
+
+        let shares = handle
+            .fetch_public_shares_from_peer(&transport, &peer, 8)
+            .await
+            .expect("fetch public shares");
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].share_id, [1u8; 32]);
+        assert_eq!(shares[0].title.as_deref(), Some("public"));
+    }
+
+    #[tokio::test]
+    async fn community_membership_persists_across_restart_with_memory_store() {
+        let store = MemoryStore::new();
+        let handle = Node::start_with_store(NodeConfig::default(), store.clone())
+            .await
+            .expect("start");
+        let mut rng = OsRng;
+        let community = ShareKeypair::new(SigningKey::generate(&mut rng));
+
+        handle
+            .join_community(community.share_id(), community.verifying_key().to_bytes())
+            .await
+            .expect("join community");
+
+        let restarted = Node::start_with_store(NodeConfig::default(), store)
+            .await
+            .expect("restart");
+        let communities = restarted.communities().await;
+        assert_eq!(communities.len(), 1);
+        assert_eq!(communities[0].share_id, community.share_id().0);
+        assert_eq!(
+            communities[0].share_pubkey,
+            community.verifying_key().to_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_community_status_from_peer_roundtrip() {
+        let handle = Node::start(NodeConfig::default()).await.expect("start");
+        let transport = MockDhtTransport::default();
+        let mut rng = OsRng;
+        let community = ShareKeypair::new(SigningKey::generate(&mut rng));
+        let peer = PeerAddr {
+            ip: "10.0.0.82".parse().expect("valid ip"),
+            port: 7000,
+            transport: TransportProtocol::Tcp,
+            pubkey_hint: Some([18u8; 32]),
+        };
+
+        transport
+            .register(&peer, {
+                let share_id = community.share_id().0;
+                let share_pubkey = community.verifying_key().to_bytes();
+                move |request| {
+                    let WirePayload::GetCommunityStatus(msg) = request.decode_typed()? else {
+                        anyhow::bail!("unexpected payload");
+                    };
+                    assert_eq!(msg.community_share_id, share_id);
+                    assert_eq!(msg.community_share_pubkey, share_pubkey);
+                    Ok(Envelope {
+                        r#type: MsgType::CommunityStatus as u16,
+                        req_id: request.req_id,
+                        flags: FLAG_RESPONSE,
+                        payload: serde_cbor::to_vec(&CommunityStatus {
+                            community_share_id: share_id,
+                            joined: true,
+                        })?,
+                    })
+                }
+            })
+            .await;
+
+        let joined = handle
+            .fetch_community_status_from_peer(
+                &transport,
+                &peer,
+                community.share_id(),
+                community.verifying_key().to_bytes(),
+            )
+            .await
+            .expect("fetch community status");
+        assert!(joined);
+    }
+
+    #[tokio::test]
     async fn search_is_subscription_scoped_and_weighted() {
         let handle = Node::start(NodeConfig::default()).await.expect("start");
         let mut rng = OsRng;
@@ -3527,6 +4105,8 @@ mod tests {
                 expires_at: None,
                 title: Some((*title).into()),
                 description: Some("movie catalog".into()),
+                visibility: crate::manifest::ShareVisibility::Private,
+                communities: vec![],
                 items: vec![ItemV1 {
                     content_id: if title == "alpha" {
                         [5u8; 32]
@@ -3593,6 +4173,8 @@ mod tests {
                 expires_at: None,
                 title: Some("tiered search".into()),
                 description: None,
+                visibility: crate::manifest::ShareVisibility::Private,
+                communities: vec![],
                 items: vec![ItemV1 {
                     content_id,
                     size: 1,
@@ -3656,6 +4238,8 @@ mod tests {
                 expires_at: None,
                 title: Some(format!("Trusted Movie Collection {}", idx + 1)),
                 description: Some("Curated trusted movie archive".into()),
+                visibility: crate::manifest::ShareVisibility::Private,
+                communities: vec![],
                 items: vec![ItemV1 {
                     content_id: [20 + idx; 32],
                     size: 1,
@@ -3756,6 +4340,8 @@ mod tests {
                 expires_at: None,
                 title: Some("content share".into()),
                 description: None,
+                visibility: crate::manifest::ShareVisibility::Private,
+                communities: vec![],
                 items: vec![ItemV1 {
                     content_id,
                     size: 1,

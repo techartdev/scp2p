@@ -9,9 +9,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::{
     capabilities::Capabilities,
     wire::{
-        ChunkData, Envelope, FindNode, FindValue, GetChunk, GetManifest, HaveContent, ManifestData,
-        PexOffer, PexRequest, Providers, RelayConnect, RelayRegister, RelayRegistered, RelayStream,
-        Store, WirePayload, MAX_ENVELOPE_BYTES, MAX_ENVELOPE_PAYLOAD_BYTES,
+        ChunkData, CommunityPublicShareList, CommunityStatus, Envelope, FindNode, FindValue,
+        GetChunk, GetCommunityStatus, GetManifest, HaveContent, ListCommunityPublicShares,
+        ListPublicShares, ManifestData, PexOffer, PexRequest, Providers, PublicShareList,
+        RelayConnect, RelayRegister, RelayRegistered, RelayStream, Store, WirePayload,
+        MAX_ENVELOPE_BYTES, MAX_ENVELOPE_PAYLOAD_BYTES,
     },
 };
 
@@ -257,6 +259,28 @@ pub trait WireDispatcher {
     async fn on_store(&mut self, msg: Store) -> anyhow::Result<DispatchResult>;
     async fn on_get_manifest(&mut self, msg: GetManifest) -> anyhow::Result<DispatchResult>;
     async fn on_manifest_data(&mut self, msg: ManifestData) -> anyhow::Result<DispatchResult>;
+    async fn on_list_public_shares(
+        &mut self,
+        msg: ListPublicShares,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_public_share_list(
+        &mut self,
+        msg: PublicShareList,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_get_community_status(
+        &mut self,
+        msg: GetCommunityStatus,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_community_status(&mut self, msg: CommunityStatus)
+        -> anyhow::Result<DispatchResult>;
+    async fn on_list_community_public_shares(
+        &mut self,
+        msg: ListCommunityPublicShares,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_community_public_share_list(
+        &mut self,
+        msg: CommunityPublicShareList,
+    ) -> anyhow::Result<DispatchResult>;
     async fn on_relay_register(&mut self, msg: RelayRegister) -> anyhow::Result<DispatchResult>;
     async fn on_relay_registered(&mut self, msg: RelayRegistered)
         -> anyhow::Result<DispatchResult>;
@@ -281,6 +305,16 @@ pub async fn dispatch_envelope<D: WireDispatcher + Send>(
         WirePayload::Store(msg) => dispatcher.on_store(msg).await?,
         WirePayload::GetManifest(msg) => dispatcher.on_get_manifest(msg).await?,
         WirePayload::ManifestData(msg) => dispatcher.on_manifest_data(msg).await?,
+        WirePayload::ListPublicShares(msg) => dispatcher.on_list_public_shares(msg).await?,
+        WirePayload::PublicShareList(msg) => dispatcher.on_public_share_list(msg).await?,
+        WirePayload::GetCommunityStatus(msg) => dispatcher.on_get_community_status(msg).await?,
+        WirePayload::CommunityStatus(msg) => dispatcher.on_community_status(msg).await?,
+        WirePayload::ListCommunityPublicShares(msg) => {
+            dispatcher.on_list_community_public_shares(msg).await?
+        }
+        WirePayload::CommunityPublicShareList(msg) => {
+            dispatcher.on_community_public_share_list(msg).await?
+        }
         WirePayload::RelayRegister(msg) => dispatcher.on_relay_register(msg).await?,
         WirePayload::RelayRegistered(msg) => dispatcher.on_relay_registered(msg).await?,
         WirePayload::RelayConnect(msg) => dispatcher.on_relay_connect(msg).await?,
@@ -335,6 +369,48 @@ impl WireDispatcher for NoopDispatcher {
     }
 
     async fn on_manifest_data(&mut self, _msg: ManifestData) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_list_public_shares(
+        &mut self,
+        _msg: ListPublicShares,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_public_share_list(
+        &mut self,
+        _msg: PublicShareList,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_get_community_status(
+        &mut self,
+        _msg: GetCommunityStatus,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_community_status(
+        &mut self,
+        _msg: CommunityStatus,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_list_community_public_shares(
+        &mut self,
+        _msg: ListCommunityPublicShares,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_community_public_share_list(
+        &mut self,
+        _msg: CommunityPublicShareList,
+    ) -> anyhow::Result<DispatchResult> {
         Ok(DispatchResult::none())
     }
 
@@ -413,6 +489,42 @@ mod tests {
             Ok(DispatchResult::none())
         }
         async fn on_manifest_data(&mut self, _msg: ManifestData) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_list_public_shares(
+            &mut self,
+            _msg: ListPublicShares,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_public_share_list(
+            &mut self,
+            _msg: PublicShareList,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_get_community_status(
+            &mut self,
+            _msg: GetCommunityStatus,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_status(
+            &mut self,
+            _msg: CommunityStatus,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_list_community_public_shares(
+            &mut self,
+            _msg: ListCommunityPublicShares,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_public_share_list(
+            &mut self,
+            _msg: CommunityPublicShareList,
+        ) -> anyhow::Result<DispatchResult> {
             Ok(DispatchResult::none())
         }
         async fn on_relay_register(

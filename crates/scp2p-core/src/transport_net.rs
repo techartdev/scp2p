@@ -365,6 +365,42 @@ mod tests {
         ) -> anyhow::Result<DispatchResult> {
             Ok(DispatchResult::none())
         }
+        async fn on_list_public_shares(
+            &mut self,
+            _msg: crate::wire::ListPublicShares,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_public_share_list(
+            &mut self,
+            _msg: crate::wire::PublicShareList,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_get_community_status(
+            &mut self,
+            _msg: crate::wire::GetCommunityStatus,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_status(
+            &mut self,
+            _msg: crate::wire::CommunityStatus,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_list_community_public_shares(
+            &mut self,
+            _msg: crate::wire::ListCommunityPublicShares,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_public_share_list(
+            &mut self,
+            _msg: crate::wire::CommunityPublicShareList,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
         async fn on_relay_register(
             &mut self,
             _msg: crate::wire::RelayRegister,
