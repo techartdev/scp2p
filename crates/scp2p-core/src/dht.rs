@@ -169,6 +169,7 @@ mod tests {
                 port,
                 transport: TransportProtocol::Quic,
                 pubkey_hint: None,
+                relay_via: None,
             },
             last_seen_unix: 1,
         }

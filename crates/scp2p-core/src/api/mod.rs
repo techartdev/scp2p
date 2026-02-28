@@ -36,7 +36,7 @@ use crate::{
     net_fetch::RequestTransport,
     peer::{PeerAddr, TransportProtocol},
     peer_db::PeerDb,
-    relay::RelayManager,
+    relay::{RelayManager, RelayTunnelRegistry},
     search::SearchIndex,
     store::{
         EncryptedSecret, MemoryStore, PersistedCommunity, PersistedPartialDownload,
@@ -170,6 +170,12 @@ pub struct OwnedShareRecord {
 #[derive(Clone)]
 pub struct NodeHandle {
     state: Arc<RwLock<NodeState>>,
+    /// Shared registry of active relay tunnels.
+    ///
+    /// When this node acts as a relay, firewalled peers register slots
+    /// here; incoming requests for those slots are forwarded through
+    /// the tunnel to the firewalled node's persistent connection.
+    pub(crate) relay_tunnels: RelayTunnelRegistry,
 }
 
 struct NodeState {
@@ -196,7 +202,20 @@ struct NodeState {
     encrypted_node_key: Option<EncryptedSecret>,
     enabled_blocklist_shares: HashSet<[u8; 32]>,
     blocklist_rules_by_share: HashMap<[u8; 32], BlocklistRules>,
+    /// Active relay slot when this node is firewalled and using a relay.
+    active_relay_slot: Option<ActiveRelaySlot>,
     store: Arc<dyn Store>,
+}
+
+/// Tracks an active relay registration for a firewalled node.
+#[derive(Debug, Clone)]
+pub struct ActiveRelaySlot {
+    /// The relay node we registered on.
+    pub relay_addr: PeerAddr,
+    /// The slot ID assigned by the relay.
+    pub slot_id: u64,
+    /// When the slot expires (unix secs).
+    pub expires_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +279,7 @@ impl Node {
         let state = NodeState::from_persisted(config, persisted, store)?;
         Ok(NodeHandle {
             state: Arc::new(RwLock::new(state)),
+            relay_tunnels: RelayTunnelRegistry::new(),
         })
     }
 }
@@ -386,6 +406,7 @@ impl NodeState {
             encrypted_node_key,
             enabled_blocklist_shares: enabled_blocklist_shares.into_iter().collect(),
             blocklist_rules_by_share,
+            active_relay_slot: None,
             store,
         })
     }
@@ -469,7 +490,9 @@ impl NodeState {
             RequestClass::Dht => counter.dht = counter.dht.saturating_add(1),
             RequestClass::Fetch => counter.fetch = counter.fetch.saturating_add(1),
             RequestClass::Relay => counter.relay = counter.relay.saturating_add(1),
-            RequestClass::Other => {}
+            // Chunk data requests are not counted toward any limit — bandwidth
+            // is the only meaningful constraint for bulk data transfer.
+            RequestClass::Other => return Ok(()),
         }
 
         if counter.total > self.abuse_limits.max_total_requests_per_window {
@@ -512,6 +535,7 @@ impl NodeHandle {
                     port: socket.port(),
                     transport,
                     pubkey_hint: None,
+                    relay_via: None,
                 })
             })
             .collect()

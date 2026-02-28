@@ -174,6 +174,7 @@ async fn peer_and_subscription_snapshots_are_exposed() {
         port: 7001,
         transport: crate::peer::TransportProtocol::Tcp,
         pubkey_hint: None,
+        relay_via: None,
     };
     let share_id = ShareId([9u8; 32]);
 
@@ -196,6 +197,7 @@ async fn pex_offer_roundtrip_into_peer_db() {
             port: 7000,
             transport: TransportProtocol::Quic,
             pubkey_hint: None,
+            relay_via: None,
         }],
     };
 
@@ -256,18 +258,21 @@ async fn dht_iterative_find_node_discovers_new_peers() {
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([1u8; 32]),
+        relay_via: None,
     };
     let peer_b = PeerAddr {
         ip: "10.0.0.31".parse().expect("valid ip"),
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([2u8; 32]),
+        relay_via: None,
     };
     let peer_c = PeerAddr {
         ip: "10.0.0.32".parse().expect("valid ip"),
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([3u8; 32]),
+        relay_via: None,
     };
 
     transport
@@ -343,12 +348,14 @@ async fn dht_iterative_find_value_returns_and_caches_remote_hit() {
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([4u8; 32]),
+        relay_via: None,
     };
     let peer_b = PeerAddr {
         ip: "10.0.0.41".parse().expect("valid ip"),
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([5u8; 32]),
+        relay_via: None,
     };
 
     transport
@@ -421,6 +428,7 @@ async fn dht_iterative_find_value_ignores_mismatched_provider_key_value() {
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([14u8; 32]),
+        relay_via: None,
     };
 
     transport
@@ -475,6 +483,7 @@ async fn dht_iterative_find_share_head_verifies_signature_with_known_pubkey() {
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([15u8; 32]),
+        relay_via: None,
     };
 
     let head =
@@ -527,6 +536,7 @@ async fn dht_iterative_find_share_head_rejects_tampered_signature_with_known_pub
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([16u8; 32]),
+        relay_via: None,
     };
 
     let mut head =
@@ -636,6 +646,7 @@ async fn tcp_runtime_serves_dht_and_manifest_for_subscription_sync() {
         port: bind_addr.port(),
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some(server_node_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
     let transport = TcpSessionTransport {
         signing_key: client_node_key,
@@ -692,6 +703,7 @@ async fn tcp_runtime_serves_chunk_data_for_network_download() {
         port: bind_addr.port(),
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some(server_node_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
     server_handle
         .register_content_from_bytes(provider_peer.clone(), &payload, content_dir.path())
@@ -813,12 +825,14 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
         port: bootstrap_addr.port(),
         transport: TransportProtocol::Tcp,
         pubkey_hint: None,
+        relay_via: None,
     };
     let publisher_peer = PeerAddr {
         ip: "127.0.0.1".parse().expect("ip"),
         port: publisher_addr.port(),
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some(publisher_node_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
     bootstrap_handle
         .dht_upsert_peer(
@@ -1090,12 +1104,14 @@ async fn multi_node_churn_soak_is_configurable() {
         port: bootstrap_addr.port(),
         transport: TransportProtocol::Tcp,
         pubkey_hint: None,
+        relay_via: None,
     };
     let publisher_peer = PeerAddr {
         ip: "127.0.0.1".parse().expect("ip"),
         port: publisher_addr.port(),
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some(publisher_node_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
     bootstrap_handle
         .dht_upsert_peer(
@@ -1271,18 +1287,21 @@ async fn dht_store_replicated_stores_locally_and_on_closest_peers() {
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([6u8; 32]),
+        relay_via: None,
     };
     let peer_a = PeerAddr {
         ip: "10.0.0.51".parse().expect("valid ip"),
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([7u8; 32]),
+        relay_via: None,
     };
     let peer_b = PeerAddr {
         ip: "10.0.0.52".parse().expect("valid ip"),
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([8u8; 32]),
+        relay_via: None,
     };
     let stored_count = Arc::new(AtomicUsize::new(0));
 
@@ -1373,12 +1392,14 @@ async fn dht_republish_once_repairs_remote_replication() {
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([9u8; 32]),
+        relay_via: None,
     };
     let peer = PeerAddr {
         ip: "10.0.0.61".parse().expect("valid ip"),
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([10u8; 32]),
+        relay_via: None,
     };
     let stored_count = Arc::new(AtomicUsize::new(0));
 
@@ -1552,6 +1573,7 @@ async fn fetch_public_shares_from_peer_roundtrip() {
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([17u8; 32]),
+        relay_via: None,
     };
 
     transport
@@ -1624,6 +1646,7 @@ async fn fetch_community_status_from_peer_roundtrip() {
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([18u8; 32]),
+        relay_via: None,
     };
 
     transport
@@ -2007,12 +2030,14 @@ async fn relay_register_connect_and_stream_roundtrip() {
         port: 7000,
         transport: TransportProtocol::Quic,
         pubkey_hint: None,
+        relay_via: None,
     };
     let requester = PeerAddr {
         ip: "10.0.0.11".parse().expect("valid ip"),
         port: 7001,
         transport: TransportProtocol::Quic,
         pubkey_hint: None,
+        relay_via: None,
     };
 
     let registered = handle
@@ -2054,18 +2079,21 @@ async fn relay_selection_rotates_across_best_peers() {
             port: 7101,
             transport: TransportProtocol::Tcp,
             pubkey_hint: Some([1u8; 32]),
+            relay_via: None,
         },
         PeerAddr {
             ip: "10.0.2.2".parse().expect("ip"),
             port: 7102,
             transport: TransportProtocol::Tcp,
             pubkey_hint: Some([2u8; 32]),
+            relay_via: None,
         },
         PeerAddr {
             ip: "10.0.2.3".parse().expect("ip"),
             port: 7103,
             transport: TransportProtocol::Tcp,
             pubkey_hint: Some([3u8; 32]),
+            relay_via: None,
         },
     ];
     for peer in &peers {
@@ -2102,12 +2130,14 @@ async fn relay_selection_prefers_healthier_peers() {
         port: 7201,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([9u8; 32]),
+        relay_via: None,
     };
     let good_peer = PeerAddr {
         ip: "10.0.3.2".parse().expect("ip"),
         port: 7202,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([10u8; 32]),
+        relay_via: None,
     };
     handle
         .record_peer_seen(bad_peer.clone())
@@ -2151,12 +2181,14 @@ async fn adaptive_relay_content_requires_positive_score() {
         port: 7301,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([31u8; 32]),
+        relay_via: None,
     };
     let requester = PeerAddr {
         ip: "10.0.4.2".parse().expect("ip"),
         port: 7302,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([32u8; 32]),
+        relay_via: None,
     };
 
     let registered = handle
@@ -2234,6 +2266,7 @@ async fn incoming_request_rate_limits_are_enforced() {
         port: 7999,
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some([44u8; 32]),
+        relay_via: None,
     };
     let req = Envelope::from_typed(
         next_req_id(),
@@ -2293,6 +2326,7 @@ async fn tcp_runtime_supports_relay_for_simulated_nat_peers() {
         port: bind_addr.port(),
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some(relay_node_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
 
     let owner_transport = TcpSessionTransport {
@@ -2310,6 +2344,7 @@ async fn tcp_runtime_supports_relay_for_simulated_nat_peers() {
         0,
         &WirePayload::RelayRegister(RelayRegister {
             relay_slot_id: None,
+            tunnel: false,
         }),
     )
     .expect("encode register");
@@ -2330,6 +2365,7 @@ async fn tcp_runtime_supports_relay_for_simulated_nat_peers() {
         0,
         &WirePayload::RelayRegister(RelayRegister {
             relay_slot_id: Some(registered.relay_slot_id),
+            tunnel: false,
         }),
     )
     .expect("encode renew");
@@ -2401,6 +2437,7 @@ async fn state_persists_across_restart_with_memory_store() {
         port: 7002,
         transport: TransportProtocol::Tcp,
         pubkey_hint: None,
+        relay_via: None,
     };
 
     let first = Node::start_with_store(NodeConfig::default(), store.clone())
@@ -2506,6 +2543,7 @@ async fn download_from_peers_self_seeds_after_completion() {
         port: bind_addr.port(),
         transport: TransportProtocol::Tcp,
         pubkey_hint: Some(server_node_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
     server_handle
         .register_content_from_bytes(server_peer.clone(), &payload, content_dir.path())
@@ -2561,6 +2599,7 @@ async fn download_from_peers_self_seeds_after_completion() {
         port: 7001,
         transport: TransportProtocol::Tcp,
         pubkey_hint: None,
+        relay_via: None,
     };
 
     let target = std::env::temp_dir().join(format!(
@@ -2632,6 +2671,7 @@ async fn reannounce_seeded_content_refreshes_dht_entries() {
         port: 7000,
         transport: TransportProtocol::Tcp,
         pubkey_hint: None,
+        relay_via: None,
     };
 
     let content_dir = tempfile::tempdir().expect("content tmpdir");
@@ -2819,4 +2859,362 @@ async fn reannounce_share_heads_only_refreshes_public_subscriptions() {
             "private share head must NOT be refreshed"
         );
     }
+}
+
+// ── Relay tunnel tests ──────────────────────────────────────────
+
+/// `RelayTunnelRegistry` register → forward → remove roundtrip.
+#[tokio::test]
+async fn relay_tunnel_registry_register_forward_remove() {
+    use crate::relay::RelayTunnelRegistry;
+
+    let registry = RelayTunnelRegistry::default();
+    let slot_id = 42u64;
+
+    // Register a tunnel and get a receiver.
+    let mut rx = registry.register(slot_id, 16).await;
+    assert!(registry.has_tunnel(slot_id).await);
+    assert!(!registry.has_tunnel(999).await);
+
+    // Forward a request through the tunnel.
+    let request = Envelope {
+        r#type: MsgType::GetChunk as u16,
+        req_id: 100,
+        flags: 0,
+        payload: b"hello".to_vec(),
+    };
+    let response = Envelope {
+        r#type: MsgType::GetChunk as u16,
+        req_id: 100,
+        flags: FLAG_RESPONSE,
+        payload: b"chunk-data".to_vec(),
+    };
+
+    let response_clone = response.clone();
+    let forward_handle = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            registry
+                .forward(slot_id, request, std::time::Duration::from_secs(5))
+                .await
+        }
+    });
+
+    // Simulate the bridge side: receive the forwarded request and reply.
+    let (forwarded_req, reply_tx) = rx.recv().await.expect("should receive forwarded request");
+    assert_eq!(forwarded_req.req_id, 100);
+    assert_eq!(forwarded_req.payload, b"hello");
+    reply_tx.send(response_clone).expect("send response");
+
+    let result = forward_handle.await.expect("join").expect("forward");
+    assert_eq!(result.payload, b"chunk-data");
+
+    // Remove the tunnel.
+    registry.remove(slot_id).await;
+    assert!(!registry.has_tunnel(slot_id).await);
+}
+
+/// `relayed_self_addr` wraps the address with relay routing when a
+/// relay slot is active, and passes through unchanged otherwise.
+#[tokio::test]
+async fn relayed_self_addr_wraps_with_relay_route() {
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+
+    let direct_addr = PeerAddr {
+        ip: "192.168.1.10".parse().expect("ip"),
+        port: 7000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+
+    // Without active relay — should pass through unchanged.
+    let result = handle.relayed_self_addr(direct_addr.clone()).await;
+    assert_eq!(result.relay_via, None);
+    assert_eq!(result, direct_addr);
+
+    // Set an active relay slot.
+    let relay_addr = PeerAddr {
+        ip: "1.2.3.4".parse().expect("ip"),
+        port: 9000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+    {
+        let mut state = handle.state.write().await;
+        state.active_relay_slot = Some(ActiveRelaySlot {
+            relay_addr: relay_addr.clone(),
+            slot_id: 77,
+            expires_at: 9999999999,
+        });
+    }
+
+    // Now should wrap with relay routing.
+    let relayed = handle.relayed_self_addr(direct_addr.clone()).await;
+    let route = relayed.relay_via.expect("should have relay_via");
+    assert_eq!(*route.relay_addr, relay_addr);
+    assert_eq!(route.slot_id, 77);
+    assert_eq!(relayed.ip, direct_addr.ip);
+    assert_eq!(relayed.port, direct_addr.port);
+}
+
+/// End-to-end relay tunnel test: firewalled node registers a tunnel on
+/// the relay, then a downloader sends a GetChunk request through the
+/// relay and receives the chunk data from the firewalled node.
+#[tokio::test]
+async fn tcp_relay_tunnel_forwards_chunk_request_to_firewalled_node() {
+    // ── Set up the relay node R ──
+    let relay_handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start relay");
+    let mut rng = OsRng;
+    let relay_node_key = SigningKey::generate(&mut rng);
+
+    let relay_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay probe");
+    let relay_bind = relay_probe.local_addr().expect("relay bind addr");
+    drop(relay_probe);
+
+    let relay_task = relay_handle.clone().start_tcp_dht_service(
+        relay_bind,
+        relay_node_key.clone(),
+        Capabilities::default(),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let relay_peer = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: relay_bind.port(),
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(relay_node_key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+
+    // ── Set up the firewalled node F ──
+    let fw_handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start firewalled");
+    let fw_key = SigningKey::generate(&mut rng);
+
+    // Register some content on the firewalled node.
+    let content_dir = tempfile::tempdir().expect("content tmpdir");
+    let payload = vec![42u8; crate::content::CHUNK_SIZE + 100];
+    let desc = crate::content::describe_content(&payload);
+    let fw_direct_addr = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: 1, // doesn't matter — firewalled, not directly reachable
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+    fw_handle
+        .register_content_from_bytes(fw_direct_addr.clone(), &payload, content_dir.path())
+        .await
+        .expect("register content on firewalled node");
+
+    // Register relay tunnel (F → R).
+    let fw_connector = TcpSessionTransport {
+        signing_key: fw_key,
+        capabilities: Capabilities::default(),
+    };
+    let slot = fw_handle
+        .register_relay_tunnel(&fw_connector, &relay_peer)
+        .await
+        .expect("register relay tunnel");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Build the relayed address for F.
+    let fw_relayed_addr = PeerAddr {
+        ip: fw_direct_addr.ip,
+        port: fw_direct_addr.port,
+        transport: fw_direct_addr.transport,
+        pubkey_hint: None,
+        relay_via: Some(crate::peer::RelayRoute {
+            relay_addr: Box::new(relay_peer.clone()),
+            slot_id: slot.slot_id,
+        }),
+    };
+
+    // ── Downloader D sends a GetChunk request through the relay ──
+    let dl_key = SigningKey::generate(&mut rng);
+    let dl_connector = TcpSessionTransport {
+        signing_key: dl_key,
+        capabilities: Capabilities::default(),
+    };
+
+    // Use RelayAwareTransport to fetch chunk hashes.
+    use crate::net_fetch::RelayAwareTransport;
+    let transport = RelayAwareTransport::new(&dl_connector);
+
+    // First request: GetChunkHashes.
+    let get_hashes_req = Envelope::from_typed(
+        next_req_id(),
+        0,
+        &WirePayload::GetChunkHashes(crate::wire::GetChunkHashes {
+            content_id: desc.content_id.0,
+        }),
+    )
+    .expect("encode GetChunkHashes");
+    let hashes_resp = transport
+        .request(&fw_relayed_addr, get_hashes_req, Duration::from_secs(5))
+        .await
+        .expect("GetChunkHashes through relay");
+    assert_eq!(hashes_resp.r#type, MsgType::ChunkHashList as u16);
+    assert_ne!(hashes_resp.flags & FLAG_RESPONSE, 0);
+    let chunk_hashes: crate::wire::ChunkHashList =
+        serde_cbor::from_slice(&hashes_resp.payload).expect("decode chunk hashes");
+    assert_eq!(chunk_hashes.hashes.len(), desc.chunk_count as usize);
+
+    // Second request: GetChunk for the first chunk.
+    let get_chunk_req = Envelope::from_typed(
+        next_req_id(),
+        0,
+        &WirePayload::GetChunk(crate::wire::GetChunk {
+            content_id: desc.content_id.0,
+            chunk_index: 0,
+        }),
+    )
+    .expect("encode GetChunk");
+    let chunk_resp = transport
+        .request(&fw_relayed_addr, get_chunk_req, Duration::from_secs(5))
+        .await
+        .expect("GetChunk through relay");
+    assert_eq!(chunk_resp.r#type, MsgType::ChunkData as u16);
+    assert_ne!(chunk_resp.flags & FLAG_RESPONSE, 0);
+    let chunk_data: crate::wire::ChunkData =
+        serde_cbor::from_slice(&chunk_resp.payload).expect("decode chunk data");
+    assert_eq!(chunk_data.bytes.len(), crate::content::CHUNK_SIZE);
+    // Verify chunk hash matches.
+    let computed_hash = blake3::hash(&chunk_data.bytes);
+    assert_eq!(computed_hash.as_bytes(), &chunk_hashes.hashes[0]);
+
+    relay_task.abort();
+}
+
+/// Full relay-tunneled download: firewalled node F seeds content, relay
+/// node R bridges the tunnel, and downloader D downloads the full
+/// content through the relay using `download_from_peers`.
+#[tokio::test]
+async fn tcp_relay_tunnel_full_content_download() {
+    // ── Relay node R ──
+    let relay_handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start relay");
+    let mut rng = OsRng;
+    let relay_node_key = SigningKey::generate(&mut rng);
+
+    let relay_probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay");
+    let relay_bind = relay_probe.local_addr().expect("relay addr");
+    drop(relay_probe);
+
+    let relay_task = relay_handle.clone().start_tcp_dht_service(
+        relay_bind,
+        relay_node_key.clone(),
+        Capabilities::default(),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let relay_peer = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: relay_bind.port(),
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(relay_node_key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+
+    // ── Firewalled node F ──
+    let fw_handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start firewalled");
+    let fw_key = SigningKey::generate(&mut rng);
+
+    let content_dir = tempfile::tempdir().expect("content tmpdir");
+    // Use 2+ chunks to exercise parallel download.
+    let payload = vec![0xAB_u8; crate::content::CHUNK_SIZE * 2 + 500];
+    let desc = crate::content::describe_content(&payload);
+
+    let fw_direct_addr = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: 1,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+    fw_handle
+        .register_content_from_bytes(fw_direct_addr.clone(), &payload, content_dir.path())
+        .await
+        .expect("register content");
+
+    // Tunnel F → R.
+    let fw_connector = TcpSessionTransport {
+        signing_key: fw_key,
+        capabilities: Capabilities::default(),
+    };
+    let slot = fw_handle
+        .register_relay_tunnel(&fw_connector, &relay_peer)
+        .await
+        .expect("tunnel registered");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let fw_relayed = PeerAddr {
+        relay_via: Some(crate::peer::RelayRoute {
+            relay_addr: Box::new(relay_peer.clone()),
+            slot_id: slot.slot_id,
+        }),
+        ..fw_direct_addr
+    };
+
+    // ── Downloader D ──
+    let dl_handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start downloader");
+    let dl_key = SigningKey::generate(&mut rng);
+    let dl_connector = TcpSessionTransport {
+        signing_key: dl_key,
+        capabilities: Capabilities::default(),
+    };
+
+    // The downloader needs content metadata in its content_catalog
+    // before it can call download_from_peers.
+    {
+        let mut state = dl_handle.state.write().await;
+        state.content_catalog.insert(
+            desc.content_id.0,
+            crate::content::ChunkedContent {
+                content_id: desc.content_id,
+                chunk_count: desc.chunk_count,
+                chunk_list_hash: desc.chunk_list_hash,
+                chunks: desc.chunks.clone(),
+            },
+        );
+    }
+
+    let target_path = std::env::temp_dir().join(format!(
+        "scp2p_relay_download_{}.bin",
+        now_unix_secs().expect("now")
+    ));
+
+    dl_handle
+        .download_from_peers(
+            &dl_connector,
+            &[fw_relayed],
+            desc.content_id.0,
+            target_path.to_str().expect("utf8"),
+            &FetchPolicy::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("download through relay tunnel");
+
+    let read_back = std::fs::read(&target_path).expect("read downloaded file");
+    assert_eq!(read_back.len(), payload.len());
+    assert_eq!(read_back, payload);
+    let _ = std::fs::remove_file(target_path);
+
+    relay_task.abort();
 }

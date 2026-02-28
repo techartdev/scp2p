@@ -432,6 +432,7 @@ async fn main() -> anyhow::Result<()> {
                 port: bind.port(),
                 transport: TransportProtocol::Tcp,
                 pubkey_hint: None,
+                relay_via: None,
             };
             let paths: Vec<std::path::PathBuf> =
                 files.iter().map(std::path::PathBuf::from).collect();
@@ -470,6 +471,7 @@ async fn main() -> anyhow::Result<()> {
                 port: bind.port(),
                 transport: TransportProtocol::Tcp,
                 pubkey_hint: None,
+                relay_via: None,
             };
             let dir_path = std::path::Path::new(&dir);
             let manifest_id = node
@@ -587,6 +589,7 @@ fn parse_bootstrap_peer(input: &str) -> anyhow::Result<PeerAddr> {
         port: socket.port(),
         transport: TransportProtocol::Tcp,
         pubkey_hint: None,
+        relay_via: None,
     })
 }
 

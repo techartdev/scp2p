@@ -506,12 +506,15 @@ impl DesktopAppState {
             .ok_or_else(|| anyhow::anyhow!("tcp bind must be enabled to publish"))?;
         let peer_records = node.peer_records().await;
         let advertise_ip = resolve_advertise_ip(bind_tcp, &peer_records)?;
-        let provider = PeerAddr {
-            ip: advertise_ip,
-            port: bind_tcp.port(),
-            transport: TransportProtocol::Tcp,
-            pubkey_hint: None,
-        };
+        let provider = node
+            .relayed_self_addr(PeerAddr {
+                ip: advertise_ip,
+                port: bind_tcp.port(),
+                transport: TransportProtocol::Tcp,
+                pubkey_hint: None,
+                relay_via: None,
+            })
+            .await;
 
         let payload = item_text.as_bytes().to_vec();
         let content = describe_content(&payload);
@@ -622,6 +625,10 @@ impl DesktopAppState {
     }
 
     /// Resolve this node's own advertise address for self-seeding.
+    ///
+    /// If the node has an active relay tunnel (firewalled mode), the
+    /// returned address includes `relay_via` so remote peers can reach
+    /// this node through the relay.
     async fn resolve_self_addr(&self, node: &NodeHandle) -> anyhow::Result<PeerAddr> {
         let runtime = node.runtime_config().await;
         let bind_tcp = runtime
@@ -629,12 +636,15 @@ impl DesktopAppState {
             .ok_or_else(|| anyhow::anyhow!("tcp bind not enabled"))?;
         let peer_records = node.peer_records().await;
         let advertise_ip = resolve_advertise_ip(bind_tcp, &peer_records)?;
-        Ok(PeerAddr {
+        let direct_addr = PeerAddr {
             ip: advertise_ip,
             port: bind_tcp.port(),
             transport: TransportProtocol::Tcp,
             pubkey_hint: None,
-        })
+            relay_via: None,
+        };
+        // If we have a relay tunnel active, wrap the address with relay routing.
+        Ok(node.relayed_self_addr(direct_addr).await)
     }
 
     pub async fn publish_files(
@@ -651,12 +661,15 @@ impl DesktopAppState {
             .ok_or_else(|| anyhow::anyhow!("tcp bind must be enabled to publish"))?;
         let peer_records = node.peer_records().await;
         let advertise_ip = resolve_advertise_ip(bind_tcp, &peer_records)?;
-        let provider = PeerAddr {
-            ip: advertise_ip,
-            port: bind_tcp.port(),
-            transport: TransportProtocol::Tcp,
-            pubkey_hint: None,
-        };
+        let provider = node
+            .relayed_self_addr(PeerAddr {
+                ip: advertise_ip,
+                port: bind_tcp.port(),
+                transport: TransportProtocol::Tcp,
+                pubkey_hint: None,
+                relay_via: None,
+            })
+            .await;
 
         let paths: Vec<std::path::PathBuf> =
             file_paths.iter().map(std::path::PathBuf::from).collect();
@@ -705,12 +718,15 @@ impl DesktopAppState {
             .ok_or_else(|| anyhow::anyhow!("tcp bind must be enabled to publish"))?;
         let peer_records = node.peer_records().await;
         let advertise_ip = resolve_advertise_ip(bind_tcp, &peer_records)?;
-        let provider = PeerAddr {
-            ip: advertise_ip,
-            port: bind_tcp.port(),
-            transport: TransportProtocol::Tcp,
-            pubkey_hint: None,
-        };
+        let provider = node
+            .relayed_self_addr(PeerAddr {
+                ip: advertise_ip,
+                port: bind_tcp.port(),
+                transport: TransportProtocol::Tcp,
+                pubkey_hint: None,
+                relay_via: None,
+            })
+            .await;
 
         let share = node.ensure_publisher_identity("default").await?;
         let communities = resolve_joined_communities(&node, community_ids_hex).await?;
@@ -1002,6 +1018,7 @@ async fn start_lan_discovery(
                     port: packet.tcp_port,
                     transport: TransportProtocol::Tcp,
                     pubkey_hint: None,
+                    relay_via: None,
                 };
                 let _ = node.record_peer_seen(peer).await;
             }

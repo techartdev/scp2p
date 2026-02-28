@@ -71,6 +71,7 @@ mod tests {
                 port: 7000,
                 transport: TransportProtocol::Quic,
                 pubkey_hint: None,
+                relay_via: None,
             },
             content_bytes: bytes,
         }

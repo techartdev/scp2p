@@ -284,6 +284,12 @@ pub struct CommunityPublicShareList {
 pub struct RelayRegister {
     #[serde(default)]
     pub relay_slot_id: Option<u64>,
+    /// When `true` the sender is a firewalled node that wants the relay
+    /// to keep this connection open and forward incoming requests from
+    /// other peers through it.  The relay transitions the connection to
+    /// relay-bridge mode after replying with `RelayRegistered`.
+    #[serde(default)]
+    pub tunnel: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -507,6 +513,7 @@ mod tests {
                 port: 7001,
                 transport: TransportProtocol::Tcp,
                 pubkey_hint: Some([1u8; 32]),
+                relay_via: None,
             }],
         };
 
@@ -537,6 +544,7 @@ mod tests {
                 port: 7000,
                 transport: TransportProtocol::Quic,
                 pubkey_hint: None,
+                relay_via: None,
             }],
         };
 
@@ -550,6 +558,7 @@ mod tests {
     fn relay_messages_roundtrip() {
         let reg = RelayRegister {
             relay_slot_id: Some(42),
+            tunnel: false,
         };
         let reg_rt: RelayRegister =
             serde_cbor::from_slice(&serde_cbor::to_vec(&reg).expect("encode relay register"))
@@ -613,6 +622,7 @@ mod tests {
                 port: 7777,
                 transport: TransportProtocol::Quic,
                 pubkey_hint: None,
+                relay_via: None,
             }],
             updated_at: 123,
         };
@@ -793,6 +803,7 @@ mod tests {
                     port: 1234,
                     transport: TransportProtocol::Tcp,
                     pubkey_hint: None,
+                    relay_via: None,
                 }],
             }),
             WirePayload::PexRequest(PexRequest { max_peers: 8 }),
@@ -849,6 +860,7 @@ mod tests {
             }),
             WirePayload::RelayRegister(RelayRegister {
                 relay_slot_id: Some(77),
+                tunnel: false,
             }),
             WirePayload::RelayRegistered(RelayRegistered {
                 relay_slot_id: 77,
@@ -868,6 +880,7 @@ mod tests {
                     port: 9999,
                     transport: TransportProtocol::Quic,
                     pubkey_hint: Some([1u8; 32]),
+                    relay_via: None,
                 }],
                 updated_at: 321,
             }),

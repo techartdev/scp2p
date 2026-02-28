@@ -390,6 +390,7 @@ impl NodeHandle {
                     port: remote_addr.port(),
                     transport: crate::peer::TransportProtocol::Tcp,
                     pubkey_hint: Some(session.remote_node_pubkey),
+                    relay_via: None,
                 };
                 let node = self.clone();
                 tokio::spawn(async move {

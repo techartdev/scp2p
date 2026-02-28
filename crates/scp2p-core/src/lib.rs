@@ -25,8 +25,9 @@ pub mod transport_net;
 pub mod wire;
 
 pub use api::{
-    AbuseLimits, BlocklistRules, Node, NodeHandle, OwnedShareRecord, SearchPage, SearchPageQuery,
-    SearchQuery, SearchResult, SearchTrustFilter, ShareItemInfo, SubscriptionTrustLevel,
+    AbuseLimits, ActiveRelaySlot, BlocklistRules, Node, NodeHandle, OwnedShareRecord, SearchPage,
+    SearchPageQuery, SearchQuery, SearchResult, SearchTrustFilter, ShareItemInfo,
+    SubscriptionTrustLevel,
 };
 pub use capabilities::Capabilities;
 pub use config::NodeConfig;
@@ -43,10 +44,11 @@ pub use manifest::{
     ItemV1, ManifestV1, PublicShareSummary, ShareHead, ShareKeypair, ShareVisibility,
 };
 pub use net_fetch::{
-    download_swarm_over_network, fetch_manifest_with_retry, BoxedStream, DirectRequestTransport,
-    FetchPolicy, PeerConnector, ProgressCallback, RequestTransport, SessionPoolTransport,
+    download_swarm_over_network, fetch_manifest_with_retry, send_request_on_stream, BoxedStream,
+    DirectRequestTransport, FetchPolicy, PeerConnector, ProgressCallback, RelayAwareTransport,
+    RequestTransport, SessionPoolTransport,
 };
-pub use peer::{PeerAddr, TransportProtocol};
+pub use peer::{PeerAddr, RelayRoute, TransportProtocol};
 pub use peer_db::{PeerDb, PeerRecord, PEX_FRESHNESS_WINDOW_SECS, PEX_MAX_PEERS};
 pub use store::{
     decrypt_secret, encrypt_secret, EncryptedSecret, MemoryStore, PersistedCommunity,
@@ -58,7 +60,7 @@ pub use transfer::{download_swarm, ChunkProvider};
 
 pub use relay::{
     RelayLimits, RelayLink, RelayManager, RelayPayloadKind as RelayInternalPayloadKind, RelaySlot,
-    RelayStream as RelayInternalStream, RELAY_SLOT_TTL_SECS,
+    RelayStream as RelayInternalStream, RelayTunnelRegistry, RELAY_SLOT_TTL_SECS,
 };
 pub use transport::{
     dispatch_envelope, handshake_initiator, handshake_responder, read_envelope, run_message_loop,

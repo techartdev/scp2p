@@ -6,6 +6,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use std::collections::{HashMap, HashSet};
 
+use tokio::sync::{mpsc, oneshot, Mutex};
+
+use crate::wire::Envelope;
+
 pub const RELAY_SLOT_TTL_SECS: u64 = 10 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +234,84 @@ impl RelayManager {
             }
             keep
         });
+    }
+}
+
+// ── Relay Tunnel Registry ──────────────────────────────────────────
+
+/// A request forwarded through a relay tunnel.
+///
+/// The relay node receives a request envelope from a downloader, sends
+/// it through this channel to the firewalled node's bridge loop, and
+/// waits for the response on the `oneshot` sender.
+pub type RelayTunnelRequest = (Envelope, oneshot::Sender<Envelope>);
+
+/// Shared registry of active relay tunnels.
+///
+/// Each tunnel corresponds to a firewalled node that has registered a
+/// relay slot with `tunnel: true`.  The registry maps `slot_id` to an
+/// `mpsc::Sender` that feeds the bridge loop for that connection.
+///
+/// This type is cheaply cloneable (interior `Arc<Mutex<…>>`).
+#[derive(Clone, Default)]
+pub struct RelayTunnelRegistry {
+    inner: std::sync::Arc<Mutex<HashMap<u64, mpsc::Sender<RelayTunnelRequest>>>>,
+}
+
+impl RelayTunnelRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a relay tunnel for a slot.
+    ///
+    /// Returns an `mpsc::Receiver` that the bridge loop should read
+    /// forwarded requests from.
+    pub async fn register(
+        &self,
+        slot_id: u64,
+        capacity: usize,
+    ) -> mpsc::Receiver<RelayTunnelRequest> {
+        let (tx, rx) = mpsc::channel(capacity);
+        self.inner.lock().await.insert(slot_id, tx);
+        rx
+    }
+
+    /// Remove a relay tunnel when the firewalled node disconnects.
+    pub async fn remove(&self, slot_id: u64) {
+        self.inner.lock().await.remove(&slot_id);
+    }
+
+    /// Forward an envelope to the firewalled node behind `slot_id`.
+    ///
+    /// Returns the response envelope, or an error if the tunnel is not
+    /// found / the bridge loop has shut down / the timeout expires.
+    pub async fn forward(
+        &self,
+        slot_id: u64,
+        request: Envelope,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Envelope> {
+        let tx = {
+            let tunnels = self.inner.lock().await;
+            tunnels
+                .get(&slot_id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("relay tunnel not found for slot {slot_id}"))?
+        };
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send((request, resp_tx))
+            .await
+            .map_err(|_| anyhow::anyhow!("relay bridge loop closed for slot {slot_id}"))?;
+        tokio::time::timeout(timeout, resp_rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("relay tunnel response timed out for slot {slot_id}"))?
+            .map_err(|_| anyhow::anyhow!("relay bridge dropped response for slot {slot_id}"))
+    }
+
+    /// Check whether a tunnel exists for `slot_id`.
+    pub async fn has_tunnel(&self, slot_id: u64) -> bool {
+        self.inner.lock().await.contains_key(&slot_id)
     }
 }
 

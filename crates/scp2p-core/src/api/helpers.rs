@@ -73,8 +73,12 @@ pub(super) fn request_class(payload: &WirePayload) -> RequestClass {
         | WirePayload::ListPublicShares(_)
         | WirePayload::GetCommunityStatus(_)
         | WirePayload::ListCommunityPublicShares(_)
-        | WirePayload::GetChunk(_)
         | WirePayload::GetChunkHashes(_) => RequestClass::Fetch,
+        // Chunk data is not rate-limited by request count — TCP bandwidth is the
+        // natural throttle.  Applying a fixed-count limit here would cap large
+        // file transfers at max_fetch_requests_per_window * CHUNK_SIZE bytes
+        // (e.g. 240 * 256 KiB ≈ 60 MiB) regardless of available bandwidth.
+        WirePayload::GetChunk(_) => RequestClass::Other,
         WirePayload::RelayRegister(_)
         | WirePayload::RelayConnect(_)
         | WirePayload::RelayStream(_) => RequestClass::Relay,

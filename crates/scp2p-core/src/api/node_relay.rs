@@ -7,16 +7,20 @@
 //! Relay operations on `NodeHandle`: register, connect, stream, peer selection.
 
 use crate::{
+    net_fetch::{send_request_on_stream, PeerConnector},
     peer::PeerAddr,
     relay::RelayLimits,
-    wire::{RelayConnect, RelayPayloadKind as WireRelayPayloadKind, RelayRegistered, RelayStream},
+    wire::{
+        Envelope, MsgType, RelayConnect, RelayPayloadKind as WireRelayPayloadKind, RelayRegister,
+        RelayRegistered, RelayStream, WirePayload, FLAG_RESPONSE,
+    },
 };
 
 use super::{
     helpers::{
         now_unix_secs, relay_payload_kind_to_internal, relay_payload_kind_to_wire, relay_peer_key,
     },
-    AbuseLimits, NodeHandle,
+    AbuseLimits, ActiveRelaySlot, NodeHandle,
 };
 
 impl NodeHandle {
@@ -176,5 +180,97 @@ impl NodeHandle {
             selected.push(source[(start + idx) % source.len()].clone());
         }
         Ok(selected)
+    }
+
+    // ── Relay client methods (firewalled node side) ─────────────
+
+    /// Register a relay tunnel on a remote relay node.
+    ///
+    /// Connects to `relay_addr` using the provided `connector`, sends
+    /// `RelayRegister { tunnel: true }`, stores the slot info, and
+    /// spawns a background task that keeps the connection alive and
+    /// serves forwarded requests via `serve_wire_stream`.
+    ///
+    /// Returns the assigned `ActiveRelaySlot`.
+    pub async fn register_relay_tunnel<C: PeerConnector + 'static>(
+        &self,
+        connector: &C,
+        relay_addr: &PeerAddr,
+    ) -> anyhow::Result<ActiveRelaySlot> {
+        let mut stream = connector.connect(relay_addr).await?;
+
+        // Send RelayRegister { tunnel: true }
+        let register_payload = WirePayload::RelayRegister(RelayRegister {
+            relay_slot_id: None,
+            tunnel: true,
+        });
+        let request_envelope = Envelope::from_typed(1, 0, &register_payload)?;
+
+        let response = send_request_on_stream(
+            &mut stream,
+            request_envelope,
+            std::time::Duration::from_secs(10),
+        )
+        .await?;
+
+        if response.flags & FLAG_RESPONSE == 0 {
+            anyhow::bail!("relay registration: unexpected non-response");
+        }
+        if response.r#type != MsgType::RelayRegistered as u16 {
+            // Check if it's an error
+            let payload_str = String::from_utf8_lossy(&response.payload);
+            anyhow::bail!("relay registration failed: {}", payload_str);
+        }
+
+        let registered: RelayRegistered = serde_cbor::from_slice(&response.payload)?;
+        let slot = ActiveRelaySlot {
+            relay_addr: relay_addr.clone(),
+            slot_id: registered.relay_slot_id,
+            expires_at: registered.expires_at,
+        };
+
+        // Store in state
+        {
+            let mut state = self.state.write().await;
+            state.active_relay_slot = Some(slot.clone());
+        }
+
+        // Spawn a task that keeps the connection open and serves
+        // forwarded requests.  When the relay sends us requests
+        // (forwarded from downloaders), serve_wire_stream will process
+        // them and reply, just as if a downloader connected directly.
+        let node = self.clone();
+        tokio::spawn(async move {
+            let _ = node.serve_wire_stream(stream, None).await;
+            // Connection lost — clear active relay slot.
+            let mut state = node.state.write().await;
+            state.active_relay_slot = None;
+        });
+
+        Ok(slot)
+    }
+
+    /// Return the active relay slot, if any.
+    pub async fn active_relay_slot(&self) -> Option<ActiveRelaySlot> {
+        self.state.read().await.active_relay_slot.clone()
+    }
+
+    /// Build a `PeerAddr` that includes `relay_via` routing for this node.
+    ///
+    /// If this node has an active relay slot, returns a `PeerAddr` whose
+    /// `relay_via` field points to the relay, allowing remote peers to
+    /// reach this firewalled node through the tunnel.
+    pub async fn relayed_self_addr(&self, self_addr: PeerAddr) -> PeerAddr {
+        let slot = self.state.read().await.active_relay_slot.clone();
+        match slot {
+            Some(active) => PeerAddr {
+                relay_via: Some(crate::peer::RelayRoute {
+                    relay_addr: Box::new(active.relay_addr),
+                    slot_id: active.slot_id,
+                }),
+                ..self_addr
+            },
+            None => self_addr,
+        }
     }
 }

@@ -18,7 +18,7 @@ use crate::{
     manifest::{ManifestV1, ShareVisibility},
     net_fetch::{
         download_swarm_over_network, fetch_chunk_hashes_with_retry, fetch_manifest_with_retry,
-        FetchPolicy, PeerConnector, ProgressCallback, RequestTransport,
+        FetchPolicy, PeerConnector, ProgressCallback, RelayAwareTransport, RequestTransport,
     },
     peer::PeerAddr,
     store::{decrypt_secret, encrypt_secret, PersistedPartialDownload},
@@ -433,9 +433,10 @@ impl NodeHandle {
 
         // Pattern B: chunk hashes are not stored in the manifest.
         // If content_catalog has empty chunks (subscribed content), fetch them on demand.
+        let transport = RelayAwareTransport::new(connector);
         let chunk_hashes = if content.chunks.is_empty() && content.chunk_count > 0 {
             fetch_chunk_hashes_with_retry(
-                connector,
+                &transport,
                 &all_peers,
                 content_id,
                 content.chunk_count,
@@ -448,7 +449,7 @@ impl NodeHandle {
         };
 
         let bytes = download_swarm_over_network(
-            connector,
+            &transport,
             &all_peers,
             content_id,
             &chunk_hashes,
@@ -481,13 +482,74 @@ impl NodeHandle {
     {
         loop {
             let incoming = read_envelope(&mut stream).await?;
+
+            // Detect RelayRegister with tunnel=true: after handling and
+            // responding we transition this connection to relay-bridge mode.
+            let tunnel_request = if incoming.r#type == MsgType::RelayRegister as u16 {
+                incoming.decode_typed().ok().and_then(|wp| match wp {
+                    WirePayload::RelayRegister(ref reg) if reg.tunnel => Some(reg.clone()),
+                    _ => None,
+                })
+            } else {
+                None
+            };
+
             let response = self
                 .handle_incoming_envelope(incoming, remote_peer.as_ref())
                 .await;
-            if let Some(envelope) = response {
-                write_envelope(&mut stream, &envelope).await?;
+            if let Some(envelope) = &response {
+                write_envelope(&mut stream, envelope).await?;
+            }
+
+            // If this was a tunnel RelayRegister and the response was
+            // successful (RelayRegistered), transition to bridge mode.
+            if let Some(_reg) = tunnel_request {
+                if let Some(resp) = response {
+                    if resp.flags & FLAG_RESPONSE != 0
+                        && resp.r#type == MsgType::RelayRegistered as u16
+                    {
+                        let registered: crate::wire::RelayRegistered =
+                            serde_cbor::from_slice(&resp.payload)?;
+                        return self
+                            .run_relay_bridge(stream, registered.relay_slot_id, remote_peer)
+                            .await;
+                    }
+                }
             }
         }
+    }
+
+    /// Run the relay bridge loop for a firewalled node.
+    ///
+    /// After a firewalled node sends `RelayRegister { tunnel: true }` and
+    /// receives `RelayRegistered`, the relay node enters this loop.
+    /// The firewalled node's TCP stream is held open and used to forward
+    /// request envelopes from other peers (downloaders) and read back
+    /// the firewalled node's responses.
+    async fn run_relay_bridge<S>(
+        &self,
+        mut stream: S,
+        slot_id: u64,
+        _remote_peer: Option<PeerAddr>,
+    ) -> anyhow::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut rx = self.relay_tunnels.register(slot_id, 32).await;
+
+        let result = async {
+            while let Some((request_envelope, response_tx)) = rx.recv().await {
+                write_envelope(&mut stream, &request_envelope).await?;
+                let response = read_envelope(&mut stream).await?;
+                // Best-effort: if the downloader gave up, drop silently.
+                let _ = response_tx.send(response);
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        self.relay_tunnels.remove(slot_id).await;
+        result
     }
 
     pub(super) async fn handle_incoming_envelope(
@@ -690,7 +752,10 @@ impl NodeHandle {
                     flags: FLAG_RESPONSE,
                     payload,
                 }),
-            WirePayload::RelayRegister(RelayRegister { relay_slot_id }) => {
+            WirePayload::RelayRegister(RelayRegister {
+                relay_slot_id,
+                tunnel: _,
+            }) => {
                 let Some(peer) = remote_peer else {
                     return Some(error_envelope(
                         req_type,
@@ -733,15 +798,67 @@ impl NodeHandle {
                         "missing remote peer identity",
                     ));
                 };
-                self.relay_stream(peer.clone(), msg)
-                    .await
-                    .and_then(|relayed| serde_cbor::to_vec(&relayed).map_err(Into::into))
-                    .map(|payload| Envelope {
-                        r#type: MsgType::RelayStream as u16,
-                        req_id,
-                        flags: FLAG_RESPONSE,
-                        payload,
-                    })
+
+                // If a relay tunnel exists for this slot, forward the
+                // inner payload envelope to the firewalled node and
+                // return its response.
+                if self.relay_tunnels.has_tunnel(msg.relay_slot_id).await {
+                    let inner_envelope = match Envelope::decode(&msg.payload) {
+                        Ok(env) => env,
+                        Err(err) => {
+                            return Some(error_envelope(
+                                req_type,
+                                req_id,
+                                &format!("relay tunnel: bad inner envelope: {err}"),
+                            ));
+                        }
+                    };
+                    let timeout = std::time::Duration::from_secs(30);
+                    match self
+                        .relay_tunnels
+                        .forward(msg.relay_slot_id, inner_envelope, timeout)
+                        .await
+                    {
+                        Ok(inner_response) => {
+                            let response_payload = match inner_response.encode() {
+                                Ok(bytes) => bytes,
+                                Err(err) => {
+                                    return Some(error_envelope(
+                                        req_type,
+                                        req_id,
+                                        &format!("relay tunnel: encode response: {err}"),
+                                    ));
+                                }
+                            };
+                            let relay_stream_response = crate::wire::RelayStream {
+                                relay_slot_id: msg.relay_slot_id,
+                                stream_id: msg.stream_id,
+                                kind: msg.kind,
+                                payload: response_payload,
+                            };
+                            serde_cbor::to_vec(&relay_stream_response)
+                                .map_err(|e| anyhow::anyhow!(e))
+                                .map(|payload| Envelope {
+                                    r#type: MsgType::RelayStream as u16,
+                                    req_id,
+                                    flags: FLAG_RESPONSE,
+                                    payload,
+                                })
+                        }
+                        Err(err) => Err(err),
+                    }
+                } else {
+                    // Fallback: in-process relay logic (no tunnel active).
+                    self.relay_stream(peer.clone(), msg)
+                        .await
+                        .and_then(|relayed| serde_cbor::to_vec(&relayed).map_err(Into::into))
+                        .map(|payload| Envelope {
+                            r#type: MsgType::RelayStream as u16,
+                            req_id,
+                            flags: FLAG_RESPONSE,
+                            payload,
+                        })
+                }
             }
             _ => Err(anyhow::anyhow!("unsupported message type")),
         };

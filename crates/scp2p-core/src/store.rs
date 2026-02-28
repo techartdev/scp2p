@@ -322,8 +322,7 @@ fn load_state_sync(conn: &Connection) -> anyhow::Result<PersistedState> {
         load_metadata_cbor(conn, "enabled_blocklist_shares")?.unwrap_or_default();
     state.blocklist_rules_by_share =
         load_metadata_cbor(conn, "blocklist_rules_by_share")?.unwrap_or_default();
-    state.content_paths =
-        load_metadata_cbor(conn, "content_paths")?.unwrap_or_default();
+    state.content_paths = load_metadata_cbor(conn, "content_paths")?.unwrap_or_default();
 
     Ok(state)
 }
@@ -629,6 +628,7 @@ mod tests {
                 port: 7000,
                 transport: TransportProtocol::Tcp,
                 pubkey_hint: None,
+                relay_via: None,
             },
             42,
         ));

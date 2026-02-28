@@ -138,6 +138,69 @@ impl<C: PeerConnector> RequestTransport for SessionPoolTransport<C> {
     }
 }
 
+/// Request transport that automatically tunnels through a relay when
+/// the target peer has [`PeerAddr::relay_via`] set.
+///
+/// For direct peers, delegates to the inner connector.  For relayed
+/// peers, connects to the relay node, wraps the request envelope in a
+/// `RelayStream`, sends it, and unwraps the response.
+pub struct RelayAwareTransport<'a, C> {
+    connector: &'a C,
+}
+
+impl<'a, C> RelayAwareTransport<'a, C> {
+    pub fn new(connector: &'a C) -> Self {
+        Self { connector }
+    }
+}
+
+#[async_trait]
+impl<'a, C: PeerConnector> RequestTransport for RelayAwareTransport<'a, C> {
+    async fn request(
+        &self,
+        peer: &PeerAddr,
+        request: Envelope,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<Envelope> {
+        if let Some(relay_route) = &peer.relay_via {
+            // Connect to the relay node.
+            let mut stream = self.connector.connect(&relay_route.relay_addr).await?;
+
+            // Wrap the inner request in a RelayStream message.
+            let inner_bytes = request.encode()?;
+            let relay_stream_msg = crate::wire::RelayStream {
+                relay_slot_id: relay_route.slot_id,
+                stream_id: 0,
+                kind: crate::wire::RelayPayloadKind::Content,
+                payload: inner_bytes,
+            };
+            let outer_request = Envelope::from_typed(
+                request.req_id,
+                0,
+                &WirePayload::RelayStream(relay_stream_msg),
+            )?;
+
+            // Send the outer request through the relay.
+            let outer_response =
+                send_request_on_stream(&mut stream, outer_request, timeout_dur).await?;
+
+            // Unwrap the RelayStream response to get the inner envelope.
+            let typed = outer_response.decode_typed()?;
+            match typed {
+                WirePayload::RelayStream(resp) => Envelope::decode(&resp.payload),
+                _ => anyhow::bail!(
+                    "relay tunnel: unexpected response type {:?}",
+                    outer_response.r#type
+                ),
+            }
+        } else {
+            // Direct connection — same as PeerConnector blanket impl.
+            let mut stream = self.connector.connect(peer).await?;
+            send_request_on_stream(&mut stream, request, timeout_dur).await
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FetchPolicy {
     pub attempts_per_peer: usize,
@@ -526,9 +589,7 @@ fn pick_best_peer_index(
     }
 
     // Prefer peers under the cap; fall back to over-cap peers if necessary.
-    best_under
-        .or(best_over)
-        .map(|(idx, _, _, _)| idx)
+    best_under.or(best_over).map(|(idx, _, _, _)| idx)
 }
 
 async fn fetch_manifest_once<T: RequestTransport + ?Sized>(
@@ -613,7 +674,7 @@ async fn fetch_chunk_once<T: RequestTransport + ?Sized>(
     Ok(bytes)
 }
 
-async fn send_request_on_stream(
+pub async fn send_request_on_stream(
     stream: &mut BoxedStream,
     request: Envelope,
     timeout_dur: Duration,
@@ -731,6 +792,7 @@ mod tests {
             port,
             transport: TransportProtocol::Tcp,
             pubkey_hint: None,
+            relay_via: None,
         }
     }
 
