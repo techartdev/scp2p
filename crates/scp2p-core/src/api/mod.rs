@@ -17,6 +17,7 @@ use helpers::*;
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
+    path::PathBuf,
     sync::Arc,
     time::SystemTime,
 };
@@ -26,7 +27,6 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    blob_store::ContentBlobStore,
     config::NodeConfig,
     content::{chunk_hashes, ChunkedContent},
     dht::{Dht, DEFAULT_TTL_SECS},
@@ -184,7 +184,9 @@ struct NodeState {
     search_index: SearchIndex,
     share_weights: HashMap<[u8; 32], f32>,
     content_catalog: HashMap<[u8; 32], ChunkedContent>,
-    content_blobs: ContentBlobStore,
+    /// Maps content_id → file path for path-based seeding.
+    /// Chunks are served directly from the file at this path.
+    content_paths: HashMap<[u8; 32], PathBuf>,
     relay: RelayManager,
     relay_scores: HashMap<String, i32>,
     relay_rotation_cursor: usize,
@@ -281,6 +283,7 @@ impl NodeState {
             encrypted_node_key,
             enabled_blocklist_shares,
             blocklist_rules_by_share,
+            content_paths: persisted_content_paths,
         } = persisted;
         let mut peer_db = PeerDb::default();
         peer_db.replace_records(peers);
@@ -307,25 +310,29 @@ impl NodeState {
             .map(|identity| (identity.label, identity.share_secret))
             .collect::<HashMap<_, _>>();
 
-        let content_blobs = match &runtime_config.blob_dir {
-            Some(dir) => ContentBlobStore::on_disk(dir.clone())?,
-            None => ContentBlobStore::in_memory(),
-        };
+        // Prune content_paths for files that no longer exist on disk.
+        let content_paths: HashMap<[u8; 32], PathBuf> = persisted_content_paths
+            .into_iter()
+            .filter(|(_, path)| path.exists())
+            .collect();
 
         let mut rebuilt_search_index = SearchIndex::default();
         let mut content_catalog = HashMap::new();
         for manifest in manifests.values() {
             rebuilt_search_index.index_manifest(manifest);
             for item in &manifest.items {
-                // Recompute chunk hashes from local blob if available so
-                // that the publisher can serve GetChunkHashes requests
-                // after a restart.
-                let chunks = content_blobs
-                    .read_full(&item.content_id)
-                    .ok()
-                    .flatten()
-                    .map(|bytes| chunk_hashes(&bytes))
-                    .unwrap_or_default();
+                // Recompute chunk hashes from the file path (preferred) or
+                // legacy blob store so the node can serve GetChunkHashes
+                // requests after a restart.
+                let chunks = if let Some(path) = content_paths.get(&item.content_id) {
+                    // Read file and compute chunk hashes on the fly.
+                    std::fs::read(path)
+                        .ok()
+                        .map(|bytes| chunk_hashes(&bytes))
+                        .unwrap_or_default()
+                } else {
+                    vec![]
+                };
                 content_catalog.insert(
                     item.content_id,
                     ChunkedContent {
@@ -369,7 +376,7 @@ impl NodeState {
             search_index,
             share_weights,
             content_catalog,
-            content_blobs,
+            content_paths,
             relay: RelayManager::default(),
             relay_scores: HashMap::new(),
             relay_rotation_cursor: 0,
@@ -424,6 +431,7 @@ impl NodeState {
             encrypted_node_key: self.encrypted_node_key.clone(),
             enabled_blocklist_shares: self.enabled_blocklist_shares.iter().copied().collect(),
             blocklist_rules_by_share: self.blocklist_rules_by_share.clone(),
+            content_paths: self.content_paths.clone(),
         }
     }
 

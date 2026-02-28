@@ -684,6 +684,7 @@ async fn tcp_runtime_serves_chunk_data_for_network_download() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
+    let content_dir = tempfile::tempdir().expect("content tmpdir");
     let payload = vec![7u8; crate::content::CHUNK_SIZE + 42];
     let desc = crate::content::describe_content(&payload);
     let provider_peer = PeerAddr {
@@ -693,7 +694,7 @@ async fn tcp_runtime_serves_chunk_data_for_network_download() {
         pubkey_hint: Some(server_node_key.verifying_key().to_bytes()),
     };
     server_handle
-        .register_local_provider_content(provider_peer.clone(), payload.clone())
+        .register_content_from_bytes(provider_peer.clone(), &payload, content_dir.path())
         .await
         .expect("register provider content");
 
@@ -828,11 +829,12 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
         .await
         .expect("bootstrap learns publisher");
 
+    let content_dir = tempfile::tempdir().expect("content tmpdir");
     let share = ShareKeypair::new(SigningKey::generate(&mut rng));
     let payload_v1 = vec![11u8; crate::content::CHUNK_SIZE + 33];
     let desc_v1 = crate::content::describe_content(&payload_v1);
     publisher_handle
-        .register_local_provider_content(publisher_peer.clone(), payload_v1.clone())
+        .register_content_from_bytes(publisher_peer.clone(), &payload_v1, content_dir.path())
         .await
         .expect("register v1 provider content");
     let manifest_v1 = ManifestV1 {
@@ -923,7 +925,7 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
     let payload_v2 = vec![22u8; crate::content::CHUNK_SIZE * 2 + 17];
     let desc_v2 = crate::content::describe_content(&payload_v2);
     publisher_handle
-        .register_local_provider_content(publisher_peer.clone(), payload_v2.clone())
+        .register_content_from_bytes(publisher_peer.clone(), &payload_v2, content_dir.path())
         .await
         .expect("register v2 provider content");
     let manifest_v2 = ManifestV1 {
@@ -1126,6 +1128,7 @@ async fn multi_node_churn_soak_is_configurable() {
         subscribers.push(SubscriberHarness { store, handle });
     }
 
+    let content_dir = tempfile::tempdir().expect("content tmpdir");
     for seq in 1..=(rounds as u64 + 1) {
         publisher_task.abort();
         let _ = publisher_task.await;
@@ -1134,7 +1137,7 @@ async fn multi_node_churn_soak_is_configurable() {
         let payload = vec![seq as u8; crate::content::CHUNK_SIZE + 16 + seq as usize];
         let desc = crate::content::describe_content(&payload);
         publisher_handle
-            .register_local_provider_content(publisher_peer.clone(), payload.clone())
+            .register_content_from_bytes(publisher_peer.clone(), &payload, content_dir.path())
             .await
             .expect("register provider content");
         let manifest = ManifestV1 {
@@ -2495,6 +2498,7 @@ async fn download_from_peers_self_seeds_after_completion() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
+    let content_dir = tempfile::tempdir().expect("content tmpdir");
     let payload = vec![55u8; crate::content::CHUNK_SIZE + 7];
     let desc = crate::content::describe_content(&payload);
     let server_peer = PeerAddr {
@@ -2504,7 +2508,7 @@ async fn download_from_peers_self_seeds_after_completion() {
         pubkey_hint: Some(server_node_key.verifying_key().to_bytes()),
     };
     server_handle
-        .register_local_provider_content(server_peer.clone(), payload.clone())
+        .register_content_from_bytes(server_peer.clone(), &payload, content_dir.path())
         .await
         .expect("register");
 
@@ -2579,13 +2583,15 @@ async fn download_from_peers_self_seeds_after_completion() {
     let read_back = std::fs::read(&target).expect("read target");
     assert_eq!(read_back, payload);
 
-    // Verify the client now has the content in its blob store.
+    // Verify the client now has the content path registered (no blob copy).
     {
         let state = client_handle.state.read().await;
         assert!(
-            state.content_blobs.contains(&desc.content_id.0),
-            "client should have content in blob store after self-seeding"
+            state.content_paths.contains_key(&desc.content_id.0),
+            "client should have content path registered after self-seeding"
         );
+        let registered_path = state.content_paths.get(&desc.content_id.0).unwrap();
+        assert_eq!(registered_path, &target);
     }
 
     // Verify the client registered itself as a provider in its local DHT.
@@ -2628,8 +2634,9 @@ async fn reannounce_seeded_content_refreshes_dht_entries() {
         pubkey_hint: None,
     };
 
+    let content_dir = tempfile::tempdir().expect("content tmpdir");
     handle
-        .register_local_provider_content(self_addr.clone(), payload)
+        .register_content_from_bytes(self_addr.clone(), &payload, content_dir.path())
         .await
         .expect("register");
 
@@ -2672,8 +2679,7 @@ async fn reannounce_seeded_content_refreshes_dht_entries() {
                 now,
             )
             .expect("provider entry must exist");
-        let providers: crate::wire::Providers =
-            serde_cbor::from_slice(&val.value).expect("decode");
+        let providers: crate::wire::Providers = serde_cbor::from_slice(&val.value).expect("decode");
         assert!(
             providers.providers.contains(&self_addr),
             "self_addr should be re-announced"

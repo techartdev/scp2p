@@ -13,9 +13,8 @@ use rand::{rngs::OsRng, RngCore};
 use scp2p_core::{
     describe_content, transport_net::tcp_connect_session, BoxedStream, Capabilities,
     DirectRequestTransport, FetchPolicy, ItemV1, ManifestV1, Node, NodeConfig, NodeHandle,
-    OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord,
-    PublicShareSummary, SearchPageQuery, ShareItemInfo, ShareVisibility, SqliteStore, Store,
-    TransportProtocol,
+    OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord, PublicShareSummary, SearchPageQuery,
+    ShareItemInfo, ShareVisibility, SqliteStore, Store, TransportProtocol,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -38,6 +37,7 @@ pub struct DesktopAppState {
 struct RuntimeState {
     node: Option<NodeHandle>,
     state_db_path: Option<PathBuf>,
+    content_data_dir: Option<PathBuf>,
     tcp_service_task: Option<JoinHandle<anyhow::Result<()>>>,
     lan_discovery_task: Option<JoinHandle<anyhow::Result<()>>>,
     last_public_shares: Vec<PublicShareView>,
@@ -96,12 +96,11 @@ impl DesktopAppState {
         let store: Arc<dyn Store> = SqliteStore::open(&db_path)
             .with_context(|| format!("open sqlite state at {}", db_path.display()))?;
 
-        let blob_dir = db_path.parent().map(|p| p.join("content_blobs"));
+        let content_data_dir = db_path.parent().map(|p| p.join("content_data"));
         let config = NodeConfig {
             bind_quic: request.bind_quic,
             bind_tcp: request.bind_tcp,
             bootstrap_peers: request.bootstrap_peers,
-            blob_dir,
             ..NodeConfig::default()
         };
 
@@ -125,6 +124,7 @@ impl DesktopAppState {
         }
         state.node = Some(handle);
         state.state_db_path = Some(db_path);
+        state.content_data_dir = content_data_dir;
         drop(state);
         self.status().await
     }
@@ -515,7 +515,14 @@ impl DesktopAppState {
 
         let payload = item_text.as_bytes().to_vec();
         let content = describe_content(&payload);
-        node.register_local_provider_content(provider.clone(), payload)
+        let data_dir = {
+            let state = self.inner.read().await;
+            state
+                .content_data_dir
+                .clone()
+                .unwrap_or_else(|| std::env::temp_dir().join("scp2p-content"))
+        };
+        node.register_content_from_bytes(provider.clone(), &payload, &data_dir)
             .await?;
 
         let share = node.ensure_publisher_identity("default").await?;
@@ -746,10 +753,7 @@ impl DesktopAppState {
     }
 
     /// Delete (unpublish) a locally-published share by its hex share ID.
-    pub async fn delete_my_share(
-        &self,
-        share_id_hex: &str,
-    ) -> anyhow::Result<Vec<OwnedShareView>> {
+    pub async fn delete_my_share(&self, share_id_hex: &str) -> anyhow::Result<Vec<OwnedShareView>> {
         let node = self.node_handle().await?;
         let share_id = parse_hex_32(share_id_hex, "share_id")?;
         node.delete_published_share(scp2p_core::ShareId(share_id))
@@ -765,11 +769,8 @@ impl DesktopAppState {
     ) -> anyhow::Result<Vec<OwnedShareView>> {
         let node = self.node_handle().await?;
         let share_id = parse_hex_32(share_id_hex, "share_id")?;
-        node.update_share_visibility(
-            scp2p_core::ShareId(share_id),
-            share_visibility(visibility),
-        )
-        .await?;
+        node.update_share_visibility(scp2p_core::ShareId(share_id), share_visibility(visibility))
+            .await?;
         self.list_my_shares().await
     }
 
@@ -843,7 +844,9 @@ impl DesktopAppState {
                 .split('/')
                 .filter(|p| !p.is_empty() && *p != "..")
                 .collect();
-            let dest = parts.iter().fold(target.to_path_buf(), |acc, p| acc.join(p));
+            let dest = parts
+                .iter()
+                .fold(target.to_path_buf(), |acc, p| acc.join(p));
             if let Some(parent) = dest.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }

@@ -7,6 +7,7 @@
 //! Network / sync / download / wire-serving operations on `NodeHandle`.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use ed25519_dalek::VerifyingKey;
 
@@ -31,8 +32,8 @@ use crate::{
 
 use super::{
     helpers::{
-        build_search_snippet, error_envelope, merge_peer_list, now_unix_secs,
-        persist_state, request_class, validate_dht_value_for_known_keyspaces,
+        build_search_snippet, error_envelope, merge_peer_list, now_unix_secs, persist_state,
+        request_class, validate_dht_value_for_known_keyspaces,
     },
     NodeHandle, SearchPage, SearchPageQuery, SearchQuery, SearchResult, SearchTrustFilter,
 };
@@ -373,6 +374,7 @@ impl NodeHandle {
     /// successful download the content is stored locally and the
     /// downloading node registers itself as a new seeder so future
     /// peers can pull from it (forming a swarm).
+    #[allow(clippy::too_many_arguments)]
     pub async fn download_from_peers<C: PeerConnector>(
         &self,
         connector: &C,
@@ -408,10 +410,7 @@ impl NodeHandle {
         {
             let mut state = self.state.write().await;
             let now = now_unix_secs()?;
-            if let Some(val) = state
-                .dht
-                .find_value(content_provider_key(&content_id), now)
-            {
+            if let Some(val) = state.dht.find_value(content_provider_key(&content_id), now) {
                 if let Ok(providers) = serde_cbor::from_slice::<Providers>(&val.value) {
                     for p in providers.providers {
                         if !all_peers.contains(&p) {
@@ -420,6 +419,16 @@ impl NodeHandle {
                     }
                 }
             }
+        }
+
+        // Filter out our own address so we never download from ourselves.
+        if let Some(ref me) = self_addr {
+            all_peers.retain(|p| p != me);
+        }
+        if all_peers.is_empty() {
+            anyhow::bail!(
+                "no remote peers available for content download (only local provider found)"
+            );
         }
 
         // Pattern B: chunk hashes are not stored in the manifest.
@@ -438,14 +447,21 @@ impl NodeHandle {
             content.chunks.clone()
         };
 
-        let bytes =
-            download_swarm_over_network(connector, &all_peers, content_id, &chunk_hashes, policy, on_progress)
-                .await?;
+        let bytes = download_swarm_over_network(
+            connector,
+            &all_peers,
+            content_id,
+            &chunk_hashes,
+            policy,
+            on_progress,
+        )
+        .await?;
         std::fs::write(target_path, &bytes)?;
 
-        // ── Gap 1: self-seed — store content locally and register as provider ──
+        // ── Gap 1: self-seed — register file path as provider (no blob copy) ──
         if let Some(addr) = self_addr {
-            self.register_local_provider_content(addr, bytes).await?;
+            self.register_content_by_path(addr, &bytes, PathBuf::from(target_path))
+                .await?;
         }
 
         {
@@ -750,7 +766,10 @@ impl NodeHandle {
         chunk_index: u32,
     ) -> anyhow::Result<Option<Vec<u8>>> {
         let state = self.state.read().await;
-        state.content_blobs.read_chunk(&content_id, chunk_index)
+        if let Some(path) = state.content_paths.get(&content_id) {
+            return crate::blob_store::read_chunk_from_path(path, chunk_index);
+        }
+        Ok(None)
     }
 
     /// Return the chunk hash list for a locally-stored content object.
@@ -771,16 +790,16 @@ impl NodeHandle {
     /// provider records alive past their TTL.  For each content ID in
     /// the local blob store the node ensures its own `PeerAddr` appears
     /// in the `Providers` list under `content_provider_key`.
-    pub async fn reannounce_seeded_content(
-        &self,
-        self_addr: PeerAddr,
-    ) -> anyhow::Result<usize> {
+    pub async fn reannounce_seeded_content(&self, self_addr: PeerAddr) -> anyhow::Result<usize> {
         let content_ids: Vec<[u8; 32]> = {
             let state = self.state.read().await;
             state
                 .content_catalog
                 .keys()
-                .filter(|id| state.content_blobs.contains(id))
+                .filter(|id| {
+                    // Content is seedable if we have a file path on disk.
+                    state.content_paths.get(*id).is_some_and(|p| p.exists())
+                })
                 .copied()
                 .collect()
         };
@@ -870,12 +889,9 @@ impl NodeHandle {
                 }
             };
 
-            state.dht.store(
-                key,
-                encoded,
-                crate::dht::DEFAULT_TTL_SECS,
-                now,
-            )?;
+            state
+                .dht
+                .store(key, encoded, crate::dht::DEFAULT_TTL_SECS, now)?;
             refreshed += 1;
         }
 

@@ -25,7 +25,7 @@ use super::{
         check_manifest_limits, collect_files_recursive, mime_from_extension, normalize_item_path,
         now_unix_secs, persist_state,
     },
-    NodeHandle, ShareItemInfo,
+    NodeHandle, NodeState, ShareItemInfo,
 };
 
 impl NodeHandle {
@@ -65,42 +65,47 @@ impl NodeHandle {
         Ok(manifest_id)
     }
 
-    pub async fn register_local_provider_content(
+    /// Register a file at `path` as a locally-seedable content item.
+    ///
+    /// Chunks are served directly from `path` via seek-based reads, so no
+    /// separate blob copy is made.
+    pub async fn register_content_by_path(
         &self,
         peer: PeerAddr,
-        content_bytes: Vec<u8>,
+        content_bytes: &[u8],
+        path: PathBuf,
     ) -> anyhow::Result<[u8; 32]> {
-        let desc = describe_content(&content_bytes);
+        let desc = describe_content(content_bytes);
         let content_id = desc.content_id.0;
         let now = now_unix_secs()?;
         let mut state = self.state.write().await;
 
         state.content_catalog.insert(content_id, desc);
-        state.content_blobs.store(content_id, content_bytes)?;
+        state.content_paths.insert(content_id, path);
 
-        let mut providers: Providers = state
-            .dht
-            .find_value(content_provider_key(&content_id), now)
-            .and_then(|v| serde_cbor::from_slice(&v.value).ok())
-            .unwrap_or(Providers {
-                content_id,
-                providers: vec![],
-                updated_at: now,
-            });
-
-        if !providers.providers.contains(&peer) {
-            providers.providers.push(peer);
-        }
-        providers.updated_at = now;
-
-        state.dht.store(
-            content_provider_key(&content_id),
-            serde_cbor::to_vec(&providers)?,
-            DEFAULT_TTL_SECS,
-            now,
-        )?;
+        upsert_provider(&mut state, content_id, peer, now)?;
 
         Ok(content_id)
+    }
+
+    /// Register in-memory bytes as seedable content.
+    ///
+    /// Writes `content_bytes` to `{data_dir}/{hex_content_id}.dat` then
+    /// delegates to [`Self::register_content_by_path`].  Use this for small
+    /// payloads (e.g. text publishing) that are not already on disk.
+    pub async fn register_content_from_bytes(
+        &self,
+        peer: PeerAddr,
+        content_bytes: &[u8],
+        data_dir: &Path,
+    ) -> anyhow::Result<[u8; 32]> {
+        let desc = describe_content(content_bytes);
+        let content_id = desc.content_id.0;
+        std::fs::create_dir_all(data_dir)?;
+        let file_path = data_dir.join(format!("{}.dat", hex::encode(content_id)));
+        std::fs::write(&file_path, content_bytes)?;
+        self.register_content_by_path(peer, content_bytes, file_path)
+            .await
     }
 
     /// Publish one or more files from disk as a single share.
@@ -166,7 +171,7 @@ impl NodeHandle {
                 chunk_count: desc.chunk_count,
                 chunk_list_hash: desc.chunk_list_hash,
             });
-            self.register_local_provider_content(provider.clone(), bytes)
+            self.register_content_by_path(provider.clone(), &bytes, file_path.to_path_buf())
                 .await?;
         }
 
@@ -251,5 +256,36 @@ impl NodeHandle {
             })
             .collect())
     }
+}
 
+/// Insert or update a DHT provider entry for `content_id`.
+fn upsert_provider(
+    state: &mut NodeState,
+    content_id: [u8; 32],
+    peer: PeerAddr,
+    now: u64,
+) -> anyhow::Result<()> {
+    let mut providers: Providers = state
+        .dht
+        .find_value(content_provider_key(&content_id), now)
+        .and_then(|v| serde_cbor::from_slice(&v.value).ok())
+        .unwrap_or(Providers {
+            content_id,
+            providers: vec![],
+            updated_at: now,
+        });
+
+    if !providers.providers.contains(&peer) {
+        providers.providers.push(peer);
+    }
+    providers.updated_at = now;
+
+    state.dht.store(
+        content_provider_key(&content_id),
+        serde_cbor::to_vec(&providers)?,
+        DEFAULT_TTL_SECS,
+        now,
+    )?;
+
+    Ok(())
 }

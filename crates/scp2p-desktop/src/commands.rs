@@ -186,9 +186,7 @@ pub async fn download_share_items(
 
 // ── My Shares ──────────────────────────────────────────────────────────────
 
-pub async fn list_my_shares(
-    app_state: &DesktopAppState,
-) -> anyhow::Result<Vec<OwnedShareView>> {
+pub async fn list_my_shares(app_state: &DesktopAppState) -> anyhow::Result<Vec<OwnedShareView>> {
     app_state.list_my_shares().await
 }
 

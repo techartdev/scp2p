@@ -28,7 +28,6 @@ pub use api::{
     AbuseLimits, BlocklistRules, Node, NodeHandle, OwnedShareRecord, SearchPage, SearchPageQuery,
     SearchQuery, SearchResult, SearchTrustFilter, ShareItemInfo, SubscriptionTrustLevel,
 };
-pub use blob_store::ContentBlobStore;
 pub use capabilities::Capabilities;
 pub use config::NodeConfig;
 pub use content::{

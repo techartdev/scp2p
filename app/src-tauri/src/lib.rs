@@ -5,8 +5,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use scp2p_desktop::{
-    commands, CommunityBrowseView, CommunityView, DesktopAppState, DesktopClientConfig, OwnedShareView,
-    PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
+    commands, CommunityBrowseView, CommunityView, DesktopAppState, DesktopClientConfig,
+    OwnedShareView, PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
     SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
 };
 use serde::Serialize;
@@ -264,25 +264,32 @@ async fn download_share_items(
     let progress_cb: scp2p_core::ProgressCallback = {
         let app = app.clone();
         Box::new(move |completed_chunks, total_chunks, bytes_downloaded| {
-            let _ = app.emit("download-progress", DownloadProgress {
-                content_id_hex: String::new(),
-                completed_chunks,
-                total_chunks,
-                bytes_downloaded,
-            });
+            let _ = app.emit(
+                "download-progress",
+                DownloadProgress {
+                    content_id_hex: String::new(),
+                    completed_chunks,
+                    total_chunks,
+                    bytes_downloaded,
+                },
+            );
         })
     };
-    commands::download_share_items(&state.0, share_id_hex, content_ids_hex, target_dir, Some(&progress_cb))
-        .await
-        .map_err(|e| format!("{e:#}"))
+    commands::download_share_items(
+        &state.0,
+        share_id_hex,
+        content_ids_hex,
+        target_dir,
+        Some(&progress_cb),
+    )
+    .await
+    .map_err(|e| format!("{e:#}"))
 }
 
 // ── My Shares ──────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn list_my_shares(
-    state: tauri::State<'_, AppState>,
-) -> Result<Vec<OwnedShareView>, String> {
+async fn list_my_shares(state: tauri::State<'_, AppState>) -> Result<Vec<OwnedShareView>, String> {
     commands::list_my_shares(&state.0)
         .await
         .map_err(|e| format!("{e:#}"))

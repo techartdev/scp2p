@@ -382,10 +382,7 @@ pub async fn download_swarm_over_network<T: RequestTransport + ?Sized>(
         stall_count = 0;
 
         // ── Wait for the next chunk to arrive ──
-        let res = in_flight
-            .next()
-            .await
-            .expect("non-empty FuturesUnordered");
+        let res = in_flight.next().await.expect("non-empty FuturesUnordered");
 
         // Decrement in-flight counter
         if let Some(s) = stats.get_mut(&res.peer_key) {
@@ -461,8 +458,15 @@ async fn fetch_one_chunk<T: RequestTransport + ?Sized>(
     policy: &FetchPolicy,
     retries: usize,
 ) -> ChunkFetchOutcome {
-    let data =
-        fetch_chunk_once(transport, &peer, content_id, chunk_idx as u32, req_id, policy).await;
+    let data = fetch_chunk_once(
+        transport,
+        &peer,
+        content_id,
+        chunk_idx as u32,
+        req_id,
+        policy,
+    )
+    .await;
     ChunkFetchOutcome {
         chunk_idx,
         peer_key,
@@ -884,10 +888,16 @@ mod tests {
             max_chunks_per_peer: 1,
             ..FetchPolicy::default()
         };
-        let out =
-            download_swarm_over_network(&transport, &[peer_a, peer_b], cid, &desc.chunks, &policy, None)
-                .await
-                .expect("download");
+        let out = download_swarm_over_network(
+            &transport,
+            &[peer_a, peer_b],
+            cid,
+            &desc.chunks,
+            &policy,
+            None,
+        )
+        .await
+        .expect("download");
         assert_eq!(out, bytes);
     }
 
@@ -949,14 +959,26 @@ mod tests {
         let pool = SessionPoolTransport::new(connector);
         let single_chunk = vec![desc.chunks[0]];
         let p = FetchPolicy::default();
-        let _ =
-            download_swarm_over_network(&pool, std::slice::from_ref(&peer), cid, &single_chunk, &p, None)
-                .await
-                .expect("download1");
-        let _ =
-            download_swarm_over_network(&pool, std::slice::from_ref(&peer), cid, &single_chunk, &p, None)
-                .await
-                .expect("download2");
+        let _ = download_swarm_over_network(
+            &pool,
+            std::slice::from_ref(&peer),
+            cid,
+            &single_chunk,
+            &p,
+            None,
+        )
+        .await
+        .expect("download1");
+        let _ = download_swarm_over_network(
+            &pool,
+            std::slice::from_ref(&peer),
+            cid,
+            &single_chunk,
+            &p,
+            None,
+        )
+        .await
+        .expect("download2");
 
         assert_eq!(dial_count.load(Ordering::SeqCst), 1);
     }

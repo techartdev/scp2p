@@ -52,6 +52,11 @@ pub struct PersistedState {
     pub enabled_blocklist_shares: Vec<[u8; 32]>,
     #[serde(default)]
     pub blocklist_rules_by_share: HashMap<[u8; 32], BlocklistRules>,
+    /// Maps content_id → file path for path-based seeding.
+    /// Instead of keeping blob copies, chunks are served from the original
+    /// file (publisher) or the downloaded file (subscriber).
+    #[serde(default)]
+    pub content_paths: HashMap<[u8; 32], PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
