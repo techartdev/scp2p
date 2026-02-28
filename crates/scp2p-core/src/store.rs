@@ -322,6 +322,8 @@ fn load_state_sync(conn: &Connection) -> anyhow::Result<PersistedState> {
         load_metadata_cbor(conn, "enabled_blocklist_shares")?.unwrap_or_default();
     state.blocklist_rules_by_share =
         load_metadata_cbor(conn, "blocklist_rules_by_share")?.unwrap_or_default();
+    state.content_paths =
+        load_metadata_cbor(conn, "content_paths")?.unwrap_or_default();
 
     Ok(state)
 }
@@ -441,6 +443,7 @@ fn save_state_sync(conn: &mut Connection, state: &PersistedState) -> anyhow::Res
         "blocklist_rules_by_share",
         &state.blocklist_rules_by_share,
     )?;
+    upsert_metadata_cbor(&tx, "content_paths", &state.content_paths)?;
 
     tx.commit()?;
     Ok(())
@@ -693,6 +696,12 @@ mod tests {
                 blocked_content_ids: vec![[2u8; 32]],
             },
         );
+        // Regression: content_paths must survive a save/load cycle so that
+        // chunk hashes can be rehydrated on restart and GetChunkHashes requests
+        // succeed without re-registering files.
+        initial
+            .content_paths
+            .insert([0xCCu8; 32], PathBuf::from("/some/file.bin"));
 
         store.save_state(&initial).await.expect("save");
         let loaded = store.load_state().await.expect("load");
@@ -706,6 +715,11 @@ mod tests {
         assert!(loaded.encrypted_node_key.is_some());
         assert_eq!(loaded.enabled_blocklist_shares, vec![[7u8; 32]]);
         assert_eq!(loaded.blocklist_rules_by_share.len(), 1);
+        assert_eq!(
+            loaded.content_paths.get(&[0xCCu8; 32]),
+            Some(&PathBuf::from("/some/file.bin")),
+            "content_paths must be persisted so chunk hashes survive restart"
+        );
 
         let _ = std::fs::remove_file(path);
     }
