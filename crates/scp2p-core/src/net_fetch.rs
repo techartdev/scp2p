@@ -478,43 +478,57 @@ async fn fetch_one_chunk<T: RequestTransport + ?Sized>(
 
 /// Pick the best eligible peer for a chunk request.  Selection criteria
 /// (in order): highest score, fewest in-flight requests, fewest total
-/// requests.  Peers that have exceeded `max_chunks_per_peer` or are in
-/// back-off are skipped.
+/// requests.  Peers that are in back-off are always skipped.
+///
+/// `max_chunks_per_peer` is a **soft** cap used for load-balancing: peers
+/// that have served fewer than the cap are preferred.  If *all* non-backed-
+/// off peers have exceeded the cap (e.g. only one seeder is available for a
+/// large file) we fall back to the least-loaded peer among them so the
+/// download is never permanently stuck.
 fn pick_best_peer_index(
     peers: &[PeerAddr],
     stats: &HashMap<String, PeerRuntimeStats>,
     policy: &FetchPolicy,
 ) -> Option<usize> {
     let now = Instant::now();
-    let mut best: Option<(usize, i32, usize, usize)> = None;
+
+    let mut best_under: Option<(usize, i32, usize, usize)> = None;
+    let mut best_over: Option<(usize, i32, usize, usize)> = None;
+
     for (i, peer) in peers.iter().enumerate() {
         let key = peer_key(peer);
         let s = match stats.get(&key) {
             Some(s) => s,
             None => continue,
         };
-        if s.requests >= policy.max_chunks_per_peer {
-            continue;
-        }
         if let Some(until) = s.backoff_until {
             if until > now {
                 continue;
             }
         }
         let candidate = (i, s.score, s.in_flight, s.requests);
-        match best {
-            None => best = Some(candidate),
+        let bucket = if s.requests < policy.max_chunks_per_peer {
+            &mut best_under
+        } else {
+            &mut best_over
+        };
+        match bucket {
+            None => *bucket = Some(candidate),
             Some((_, bs, bif, br)) => {
-                if s.score > bs
-                    || (s.score == bs && s.in_flight < bif)
-                    || (s.score == bs && s.in_flight == bif && s.requests < br)
+                if s.score > *bs
+                    || (s.score == *bs && s.in_flight < *bif)
+                    || (s.score == *bs && s.in_flight == *bif && s.requests < *br)
                 {
-                    best = Some(candidate);
+                    *bucket = Some(candidate);
                 }
             }
         }
     }
-    best.map(|(idx, _, _, _)| idx)
+
+    // Prefer peers under the cap; fall back to over-cap peers if necessary.
+    best_under
+        .or(best_over)
+        .map(|(idx, _, _, _)| idx)
 }
 
 async fn fetch_manifest_once<T: RequestTransport + ?Sized>(
