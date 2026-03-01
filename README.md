@@ -121,19 +121,27 @@ We believe that decentralized communication should be as easy to install and use
 The project is structured as a Rust workspace:
 
 - `crates/scp2p-core`: The heart of the protocol.
-- `crates/scp2p-cli`: A reference command-line interface.
 - `app/`: The Tauri + React desktop application.
 
-### Quick Start (CLI)
+### Desktop Application
+
+The desktop app is built with Tauri and React. To run it in development mode:
+
 ```bash
-# Clone and test
+# Navigate to the app directory
+cd app
+
+# Install dependencies
+npm install
+
+# Start the app in development mode
+npm run tauri dev
+```
+
+### Core Library Tests
+```bash
+# Run the Rust core test suite
 cargo test
-
-# Generate a node identity
-cargo run -p scp2p-cli -- gen-identity
-
-# Start a node
-cargo run -p scp2p-cli -- start
 ```
 
 ---
@@ -144,6 +152,7 @@ SCP2P is open source and community-driven. We welcome contributors, testers, and
 
 - **Found an issue?** Open a GitHub Issue.
 - **Want to contribute?** Check out `AGENTS.md` and `PLAN.md` for current priorities.
+- **Guidelines:** Please read our [Code of Conduct](CODE_OF_CONDUCT.md) and [Security Policy](SECURITY.md).
 - **Stay tuned:** We are working on providing native packages for all major OS platforms soon!
 
 ---
