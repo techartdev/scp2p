@@ -74,7 +74,7 @@ SCP2P is designed for everyone who values digital sovereignty:
 
 ---
 
-## �️ Privacy & Security by Design
+## 🛡️ Privacy & Security by Design
 
 SCP2P isn't just secure; it's architected to protect your digital footprint:
 
