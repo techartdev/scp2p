@@ -13,7 +13,8 @@ use std::{
 use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
-use rand::{rngs::OsRng, RngCore};
+use rand::rngs::OsRng;
+#[allow(deprecated)]
 use scp2p_core::transport_net::tcp_connect_session;
 use scp2p_core::{
     describe_content, BoxedStream, Capabilities, DirectRequestTransport, FetchPolicy, ItemV1,
@@ -143,15 +144,13 @@ impl PeerConnector for CliSessionConnector {
         if peer.transport != TransportProtocol::Tcp {
             anyhow::bail!("cli session connector only supports tcp peers");
         }
-        let mut nonce = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
         let remote = SocketAddr::new(peer.ip, peer.port);
         let expected = peer.pubkey_hint;
+        #[allow(deprecated)]
         let (stream, _session) = tcp_connect_session(
             remote,
             &self.signing_key,
             self.capabilities.clone(),
-            nonce,
             expected,
         )
         .await?;

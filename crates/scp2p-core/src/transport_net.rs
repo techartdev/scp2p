@@ -24,14 +24,27 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::{
     capabilities::Capabilities,
-    transport::{handshake_initiator, handshake_responder, AuthenticatedSession},
+    transport::{generate_nonce, handshake_initiator, handshake_responder, AuthenticatedSession},
 };
 
+/// Accept an incoming **plain TCP** session.
+///
+/// # Deprecation
+///
+/// **This function is deprecated and insecure for production use.**
+/// After the handshake, all subsequent envelopes travel in cleartext — any
+/// network observer can read protocol messages, content chunks, and metadata.
+///
+/// Use [`tls_accept_session`] or [`quic_accept_bi_session`] instead.
+/// Plain TCP should only be used for local development or on trusted LANs.
+#[deprecated(
+    since = "0.1.0",
+    note = "Plain TCP is unencrypted post-handshake. Use tls_accept_session or quic_accept_bi_session instead."
+)]
 pub async fn tcp_accept_session(
     listener: &TcpListener,
     local_signing_key: &SigningKey,
     capabilities: Capabilities,
-    local_nonce: [u8; 32],
     expected_remote_pubkey: Option<[u8; 32]>,
 ) -> anyhow::Result<(TcpStream, AuthenticatedSession, SocketAddr)> {
     let (mut stream, remote_addr) = listener.accept().await?;
@@ -39,18 +52,32 @@ pub async fn tcp_accept_session(
         &mut stream,
         local_signing_key,
         capabilities,
-        local_nonce,
+        generate_nonce(),
         expected_remote_pubkey,
+        None,
     )
     .await?;
     Ok((stream, session, remote_addr))
 }
 
+/// Connect to a remote peer over **plain TCP**.
+///
+/// # Deprecation
+///
+/// **This function is deprecated and insecure for production use.**
+/// After the handshake, all subsequent envelopes travel in cleartext — any
+/// network observer can read protocol messages, content chunks, and metadata.
+///
+/// Use [`tls_connect_session`] or [`quic_connect_bi_session`] instead.
+/// Plain TCP should only be used for local development or on trusted LANs.
+#[deprecated(
+    since = "0.1.0",
+    note = "Plain TCP is unencrypted post-handshake. Use tls_connect_session or quic_connect_bi_session instead."
+)]
 pub async fn tcp_connect_session(
     remote_addr: SocketAddr,
     local_signing_key: &SigningKey,
     capabilities: Capabilities,
-    local_nonce: [u8; 32],
     expected_remote_pubkey: Option<[u8; 32]>,
 ) -> anyhow::Result<(TcpStream, AuthenticatedSession)> {
     let mut stream = TcpStream::connect(remote_addr).await?;
@@ -58,7 +85,7 @@ pub async fn tcp_connect_session(
         &mut stream,
         local_signing_key,
         capabilities,
-        local_nonce,
+        generate_nonce(),
         expected_remote_pubkey,
     )
     .await?;
@@ -94,7 +121,6 @@ pub async fn tls_accept_session(
     server: &TlsServerHandle,
     local_signing_key: &SigningKey,
     capabilities: Capabilities,
-    local_nonce: [u8; 32],
     expected_remote_pubkey: Option<[u8; 32]>,
 ) -> anyhow::Result<(
     tokio_rustls::server::TlsStream<TcpStream>,
@@ -107,8 +133,9 @@ pub async fn tls_accept_session(
         &mut tls_stream,
         local_signing_key,
         capabilities,
-        local_nonce,
+        generate_nonce(),
         expected_remote_pubkey,
+        None,
     )
     .await?;
     Ok((tls_stream, session, remote_addr))
@@ -120,7 +147,6 @@ pub async fn tls_connect_session(
     trusted_server_certificate_der: &[u8],
     local_signing_key: &SigningKey,
     capabilities: Capabilities,
-    local_nonce: [u8; 32],
     expected_remote_pubkey: Option<[u8; 32]>,
 ) -> anyhow::Result<(
     tokio_rustls::client::TlsStream<TcpStream>,
@@ -145,7 +171,7 @@ pub async fn tls_connect_session(
         &mut tls_stream,
         local_signing_key,
         capabilities,
-        local_nonce,
+        generate_nonce(),
         expected_remote_pubkey,
     )
     .await?;
@@ -176,7 +202,6 @@ pub async fn quic_accept_bi_session(
     server: &QuicServerHandle,
     local_signing_key: &SigningKey,
     capabilities: Capabilities,
-    local_nonce: [u8; 32],
     expected_remote_pubkey: Option<[u8; 32]>,
 ) -> anyhow::Result<(QuicBiStream, AuthenticatedSession)> {
     let incoming = server
@@ -191,8 +216,9 @@ pub async fn quic_accept_bi_session(
         &mut stream,
         local_signing_key,
         capabilities,
-        local_nonce,
+        generate_nonce(),
         expected_remote_pubkey,
+        None,
     )
     .await?;
     Ok((stream, session))
@@ -210,7 +236,6 @@ pub async fn quic_connect_bi_session(
     trusted_server_certificate_der: &[u8],
     local_signing_key: &SigningKey,
     capabilities: Capabilities,
-    local_nonce: [u8; 32],
     expected_remote_pubkey: Option<[u8; 32]>,
 ) -> anyhow::Result<QuicClientSession> {
     let mut endpoint = Endpoint::client("0.0.0.0:0".parse().expect("valid socket"))?;
@@ -224,7 +249,7 @@ pub async fn quic_connect_bi_session(
         &mut stream,
         local_signing_key,
         capabilities,
-        local_nonce,
+        generate_nonce(),
         expected_remote_pubkey,
     )
     .await?;
@@ -431,6 +456,18 @@ mod tests {
         ) -> anyhow::Result<DispatchResult> {
             Ok(DispatchResult::none())
         }
+        async fn on_relay_list_request(
+            &mut self,
+            _msg: crate::wire::RelayListRequest,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_relay_list_response(
+            &mut self,
+            _msg: crate::wire::RelayListResponse,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
         async fn on_providers(
             &mut self,
             _msg: crate::wire::Providers,
@@ -470,6 +507,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(deprecated)]
     async fn tcp_runtime_session_and_dispatch_roundtrip() {
         let mut rng = StdRng::seed_from_u64(123);
         let client_key = SigningKey::generate(&mut rng);
@@ -484,7 +522,6 @@ mod tests {
                 &listener,
                 &server_key,
                 Capabilities::default(),
-                [8u8; 32],
                 Some(client_pub),
             )
             .await
@@ -504,7 +541,6 @@ mod tests {
             server_addr,
             &client_key,
             Capabilities::default(),
-            [7u8; 32],
             Some(server_pub),
         )
         .await
@@ -537,7 +573,6 @@ mod tests {
                 &server,
                 &server_key,
                 Capabilities::default(),
-                [4u8; 32],
                 Some(client_pub),
             )
             .await
@@ -552,7 +587,6 @@ mod tests {
             &trusted_cert,
             &client_key,
             Capabilities::default(),
-            [3u8; 32],
             Some(server_pub),
         )
         .await
@@ -587,7 +621,6 @@ mod tests {
                 &tls_server,
                 &server_key,
                 Capabilities::default(),
-                [6u8; 32],
                 Some(client_pub),
             )
             .await
@@ -609,7 +642,6 @@ mod tests {
             &trusted_server_cert,
             &client_key,
             Capabilities::default(),
-            [5u8; 32],
             Some(server_pub),
         )
         .await

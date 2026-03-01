@@ -95,11 +95,13 @@ mod tests {
 
         let unsigned = manifest.unsigned_bytes().expect("manifest unsigned");
         manifest.sign(&share).expect("manifest sign");
-        manifest.verify().expect("manifest verify");
+        // Use verify_at with a timestamp inside the manifest's validity window
+        // (created_at=1_700_000_000, expires_at=1_700_086_400).
+        manifest.verify_at(1_700_000_001).expect("manifest verify");
 
-        let signature = manifest.signature.clone().expect("manifest signature");
-        assert_eq!(hex::encode(&unsigned), MANIFEST_UNSIGNED_HEX);
-        assert_eq!(hex::encode(&signature), MANIFEST_SIGNATURE_HEX);
+        let signature = manifest.signature.expect("manifest signature");
+        assert_eq!(hex::encode(unsigned), MANIFEST_UNSIGNED_HEX);
+        assert_eq!(hex::encode(signature), MANIFEST_SIGNATURE_HEX);
 
         let head = ShareHead::new_signed(
             share.share_id().0,

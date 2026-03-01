@@ -22,7 +22,7 @@ use std::{
     time::SystemTime,
 };
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -40,7 +40,7 @@ use crate::{
     search::SearchIndex,
     store::{
         EncryptedSecret, MemoryStore, PersistedCommunity, PersistedPartialDownload,
-        PersistedPublisherIdentity, PersistedState, PersistedSubscription, Store,
+        PersistedPublisherIdentity, PersistedState, PersistedSubscription, Store, DirtyFlags,
     },
     wire::{PexOffer, PexRequest},
 };
@@ -96,6 +96,124 @@ pub enum SubscriptionTrustLevel {
 pub struct BlocklistRules {
     pub blocked_share_ids: Vec<[u8; 32]>,
     pub blocked_content_ids: Vec<[u8; 32]>,
+}
+
+// ── Community membership token (§4.2) ────────────────────────────────
+//
+// A membership token is issued by the **community publisher** (holder of
+// the community share signing key) to authorize a specific node's
+// membership.  The token is cryptographically bound to the community
+// share_id and member node pubkey:
+//
+//   token = { community_share_id, member_node_pubkey, issued_at,
+//             expires_at, signature }
+//
+// The signature covers the CBOR-canonical encoding of all fields except
+// `signature` itself, signed by the community's Ed25519 key.
+//
+// In v0.1 membership tokens are **optional** — nodes may still join
+// communities without a token for convenience.  Future protocol versions
+// will require a valid token for community-scoped operations.
+
+/// A signed token authorizing `member_node_pubkey` as a member of the
+/// community identified by `community_share_id`.
+///
+/// Issued by the community share publisher and verifiable by any
+/// peer that knows the community's public key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityMembershipToken {
+    pub community_share_id: [u8; 32],
+    pub member_node_pubkey: [u8; 32],
+    pub issued_at: u64,
+    pub expires_at: u64,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+/// Signable portion of a membership token (all fields except `signature`).
+#[derive(Serialize)]
+struct MembershipTokenSignable([u8; 32], [u8; 32], u64, u64);
+
+impl CommunityMembershipToken {
+    /// Issue a new community membership token.
+    ///
+    /// `community_signing_key` must be the Ed25519 signing key whose
+    /// verifying key derives the community `share_id`.
+    pub fn issue(
+        community_signing_key: &SigningKey,
+        member_node_pubkey: [u8; 32],
+        issued_at: u64,
+        expires_at: u64,
+    ) -> anyhow::Result<Self> {
+        let community_pubkey = community_signing_key.verifying_key().to_bytes();
+        let community_share_id = ShareId::from_pubkey(
+            &VerifyingKey::from_bytes(&community_pubkey)?,
+        )
+        .0;
+
+        let signable = MembershipTokenSignable(
+            community_share_id,
+            member_node_pubkey,
+            issued_at,
+            expires_at,
+        );
+        let sig = community_signing_key.sign(&crate::cbor::to_vec(&signable)?);
+
+        Ok(Self {
+            community_share_id,
+            member_node_pubkey,
+            issued_at,
+            expires_at,
+            signature: sig.to_bytes().to_vec(),
+        })
+    }
+
+    /// Verify this token against a community's public key and an
+    /// optional `now_unix` timestamp (for expiry checking).
+    pub fn verify(
+        &self,
+        community_pubkey: &[u8; 32],
+        now_unix: Option<u64>,
+    ) -> anyhow::Result<()> {
+        // Verify the share_id matches the pubkey.
+        let vk = VerifyingKey::from_bytes(community_pubkey)?;
+        let expected_id = ShareId::from_pubkey(&vk).0;
+        if expected_id != self.community_share_id {
+            anyhow::bail!("community_share_id does not match community_pubkey");
+        }
+
+        // Verify expiry.
+        if let Some(now) = now_unix {
+            if now > self.expires_at {
+                anyhow::bail!("community membership token expired");
+            }
+        }
+
+        // Verify signature.
+        if self.signature.len() != 64 {
+            anyhow::bail!("membership token signature must be 64 bytes");
+        }
+        let signable = MembershipTokenSignable(
+            self.community_share_id,
+            self.member_node_pubkey,
+            self.issued_at,
+            self.expires_at,
+        );
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&self.signature);
+        vk.verify(
+            &crate::cbor::to_vec(&signable)?,
+            &ed25519_dalek::Signature::from_bytes(&sig_arr),
+        )?;
+        Ok(())
+    }
+}
+
+/// Internal community membership record storing the pubkey and optional token.
+#[derive(Debug, Clone)]
+struct CommunityMembership {
+    pubkey: [u8; 32],
+    token: Option<CommunityMembershipToken>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -181,8 +299,13 @@ pub struct NodeHandle {
 struct NodeState {
     runtime_config: NodeConfig,
     subscriptions: HashMap<[u8; 32], SubscriptionState>,
-    communities: HashMap<[u8; 32], [u8; 32]>,
+    /// Maps community share_id → (share_pubkey, optional membership token).
+    communities: HashMap<[u8; 32], CommunityMembership>,
     publisher_identities: HashMap<String, [u8; 32]>,
+    /// Encrypted publisher identity secrets, populated by
+    /// [`encrypt_publisher_identities`].  When present for a label,
+    /// [`to_persisted`] writes the encrypted form and omits plaintext.
+    encrypted_publisher_secrets: HashMap<String, EncryptedSecret>,
     peer_db: PeerDb,
     dht: Dht,
     manifest_cache: HashMap<[u8; 32], ManifestV1>,
@@ -203,8 +326,11 @@ struct NodeState {
     enabled_blocklist_shares: HashSet<[u8; 32]>,
     blocklist_rules_by_share: HashMap<[u8; 32], BlocklistRules>,
     /// Active relay slot when this node is firewalled and using a relay.
-    active_relay_slot: Option<ActiveRelaySlot>,
+    /// Supports multiple relays for redundancy.
+    active_relay_slots: Vec<ActiveRelaySlot>,
     store: Arc<dyn Store>,
+    /// Tracks which sections have been mutated since the last persist.
+    dirty: DirtyFlags,
 }
 
 /// Tracks an active relay registration for a firewalled node.
@@ -323,11 +449,26 @@ impl NodeState {
             .collect::<HashMap<_, _>>();
         let communities = communities
             .into_iter()
-            .map(|community| (community.share_id, community.share_pubkey))
+            .map(|community| {
+                let token = community.membership_token.as_ref().and_then(|bytes| {
+                    crate::cbor::from_slice::<CommunityMembershipToken>(bytes).ok()
+                });
+                (
+                    community.share_id,
+                    CommunityMembership {
+                        pubkey: community.share_pubkey,
+                        token,
+                    },
+                )
+            })
             .collect::<HashMap<_, _>>();
         let publisher_identities = publisher_identities
             .into_iter()
-            .map(|identity| (identity.label, identity.share_secret))
+            .filter_map(|identity| {
+                // Only load identities with a plaintext secret.
+                // Encrypted-only identities require explicit unlock.
+                identity.share_secret.map(|secret| (identity.label, secret))
+            })
             .collect::<HashMap<_, _>>();
 
         // Prune content_paths for files that no longer exist on disk.
@@ -374,7 +515,7 @@ impl NodeState {
             .unwrap_or(0);
         let mut dht = Dht::default();
         for (share_id, head) in &share_heads {
-            if let Ok(encoded) = serde_cbor::to_vec(head) {
+            if let Ok(encoded) = crate::cbor::to_vec(head) {
                 let _ = dht.store(
                     share_head_key(&ShareId(*share_id)),
                     encoded,
@@ -389,6 +530,7 @@ impl NodeState {
             subscriptions,
             communities,
             publisher_identities,
+            encrypted_publisher_secrets: HashMap::new(),
             peer_db,
             dht,
             manifest_cache: manifests,
@@ -406,8 +548,9 @@ impl NodeState {
             encrypted_node_key,
             enabled_blocklist_shares: enabled_blocklist_shares.into_iter().collect(),
             blocklist_rules_by_share,
-            active_relay_slot: None,
+            active_relay_slots: Vec::new(),
             store,
+            dirty: DirtyFlags::default(),
         })
     }
 
@@ -426,17 +569,32 @@ impl NodeState {
         let communities = self
             .communities
             .iter()
-            .map(|(share_id, share_pubkey)| PersistedCommunity {
+            .map(|(share_id, membership)| PersistedCommunity {
                 share_id: *share_id,
-                share_pubkey: *share_pubkey,
+                share_pubkey: membership.pubkey,
+                membership_token: membership.token.as_ref().and_then(|t| {
+                    crate::cbor::to_vec(t).ok()
+                }),
             })
             .collect();
         let publisher_identities = self
             .publisher_identities
             .iter()
-            .map(|(label, share_secret)| PersistedPublisherIdentity {
-                label: label.clone(),
-                share_secret: *share_secret,
+            .map(|(label, share_secret)| {
+                if let Some(encrypted) = self.encrypted_publisher_secrets.get(label) {
+                    // Persist only the encrypted form – omit plaintext.
+                    PersistedPublisherIdentity {
+                        label: label.clone(),
+                        share_secret: None,
+                        encrypted_share_secret: Some(encrypted.clone()),
+                    }
+                } else {
+                    PersistedPublisherIdentity {
+                        label: label.clone(),
+                        share_secret: Some(*share_secret),
+                        encrypted_share_secret: None,
+                    }
+                }
             })
             .collect();
         PersistedState {
@@ -577,9 +735,12 @@ impl NodeHandle {
         state
             .communities
             .iter()
-            .map(|(share_id, share_pubkey)| PersistedCommunity {
+            .map(|(share_id, membership)| PersistedCommunity {
                 share_id: *share_id,
-                share_pubkey: *share_pubkey,
+                share_pubkey: membership.pubkey,
+                membership_token: membership.token.as_ref().and_then(|t| {
+                    crate::cbor::to_vec(t).ok()
+                }),
             })
             .collect()
     }
@@ -599,6 +760,7 @@ impl NodeHandle {
                     let mut rng = rand::rngs::OsRng;
                     let secret = SigningKey::generate(&mut rng).to_bytes();
                     state.publisher_identities.insert(label.to_string(), secret);
+                    state.dirty.publisher_identities = true;
                     needs_persist = true;
                     secret
                 }
@@ -698,6 +860,9 @@ impl NodeHandle {
             if let Some(head) = state.published_share_heads.remove(&share_id.0) {
                 state.manifest_cache.remove(&head.latest_manifest_id);
             }
+            state.dirty.manifests = true;
+            state.dirty.share_heads = true;
+            state.dirty.search_index = true;
         }
         persist_state(self).await
     }
@@ -842,6 +1007,27 @@ impl NodeHandle {
         {
             let mut state = self.state.write().await;
             state.peer_db.upsert_seen(peer_addr, now_unix_secs()?);
+            state.dirty.peers = true;
+        }
+        persist_state(self).await
+    }
+
+    /// Record that a peer was seen with specific capabilities.
+    ///
+    /// Call after a successful handshake to persist the remote peer's
+    /// capabilities for future relay selection and capability-aware
+    /// decisions.
+    pub async fn record_peer_seen_with_capabilities(
+        &self,
+        peer_addr: PeerAddr,
+        capabilities: crate::Capabilities,
+    ) -> anyhow::Result<()> {
+        {
+            let mut state = self.state.write().await;
+            state
+                .peer_db
+                .upsert_seen_with_capabilities(peer_addr, now_unix_secs()?, capabilities);
+            state.dirty.peers = true;
         }
         persist_state(self).await
     }
@@ -853,6 +1039,7 @@ impl NodeHandle {
             for addr in offer.peers {
                 state.peer_db.upsert_seen(addr, now);
             }
+            state.dirty.peers = true;
             state.peer_db.total_known_peers()
         };
         persist_state(self).await?;
@@ -870,6 +1057,7 @@ impl NodeHandle {
         {
             let mut state = self.state.write().await;
             state.share_weights.insert(share_id.0, weight.max(0.0));
+            state.dirty.share_weights = true;
         }
         persist_state(self).await
     }
@@ -884,13 +1072,43 @@ impl NodeHandle {
         share_id: ShareId,
         share_pubkey: [u8; 32],
     ) -> anyhow::Result<()> {
+        self.join_community_with_token(share_id, share_pubkey, None)
+            .await
+    }
+
+    /// Join a community with an optional membership token.
+    ///
+    /// When a `CommunityMembershipToken` is provided, it is verified
+    /// against `share_pubkey` before being stored.  In v0.1, tokens
+    /// are optional; community membership without a token is
+    /// self-asserted.
+    pub async fn join_community_with_token(
+        &self,
+        share_id: ShareId,
+        share_pubkey: [u8; 32],
+        token: Option<CommunityMembershipToken>,
+    ) -> anyhow::Result<()> {
         let pubkey = VerifyingKey::from_bytes(&share_pubkey)?;
         let derived = ShareId::from_pubkey(&pubkey);
         if derived != share_id {
             anyhow::bail!("community share_id does not match share_pubkey");
         }
+        // If a token is provided, verify it before storing.
+        if let Some(ref tok) = token {
+            if tok.community_share_id != share_id.0 {
+                anyhow::bail!("membership token community_share_id mismatch");
+            }
+            tok.verify(&share_pubkey, None)?;
+        }
         let mut state = self.state.write().await;
-        state.communities.insert(share_id.0, share_pubkey);
+        state.communities.insert(
+            share_id.0,
+            CommunityMembership {
+                pubkey: share_pubkey,
+                token,
+            },
+        );
+        state.dirty.communities = true;
         drop(state);
         persist_state(self).await
     }
@@ -899,6 +1117,7 @@ impl NodeHandle {
         {
             let mut state = self.state.write().await;
             state.communities.remove(&share_id.0);
+            state.dirty.communities = true;
         }
         persist_state(self).await
     }
@@ -933,6 +1152,7 @@ impl NodeHandle {
                 anyhow::bail!("subscription not found");
             };
             sub.trust_level = trust_level;
+            state.dirty.subscriptions = true;
         }
         persist_state(self).await
     }
@@ -947,6 +1167,7 @@ impl NodeHandle {
             state
                 .blocklist_rules_by_share
                 .insert(blocklist_share_id.0, rules);
+            state.dirty.blocklist = true;
         }
         persist_state(self).await
     }
@@ -956,6 +1177,7 @@ impl NodeHandle {
             let mut state = self.state.write().await;
             state.blocklist_rules_by_share.remove(&blocklist_share_id.0);
             state.enabled_blocklist_shares.remove(&blocklist_share_id.0);
+            state.dirty.blocklist = true;
         }
         persist_state(self).await
     }
@@ -967,6 +1189,7 @@ impl NodeHandle {
                 anyhow::bail!("blocklist share must be subscribed before enabling");
             }
             state.enabled_blocklist_shares.insert(blocklist_share_id.0);
+            state.dirty.blocklist = true;
         }
         persist_state(self).await
     }
@@ -975,6 +1198,7 @@ impl NodeHandle {
         {
             let mut state = self.state.write().await;
             state.enabled_blocklist_shares.remove(&blocklist_share_id.0);
+            state.dirty.blocklist = true;
         }
         persist_state(self).await
     }
@@ -996,6 +1220,7 @@ impl NodeHandle {
                     latest_manifest_id: None,
                     trust_level,
                 });
+            state.dirty.subscriptions = true;
         }
         persist_state(self).await
     }
@@ -1006,6 +1231,8 @@ impl NodeHandle {
             state.subscriptions.remove(&share_id.0);
             state.enabled_blocklist_shares.remove(&share_id.0);
             state.blocklist_rules_by_share.remove(&share_id.0);
+            state.dirty.subscriptions = true;
+            state.dirty.blocklist = true;
         }
         persist_state(self).await
     }

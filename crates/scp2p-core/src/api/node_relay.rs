@@ -137,16 +137,31 @@ impl NodeHandle {
     pub async fn select_relay_peers(&self, max_peers: usize) -> anyhow::Result<Vec<PeerAddr>> {
         let now = now_unix_secs()?;
         let mut state = self.state.write().await;
-        let mut candidates = state
+
+        // Prefer peers with known relay=true capability.
+        let relay_capable: Vec<PeerAddr> = state
             .peer_db
-            .all_records()
+            .relay_capable_peers(now)
             .into_iter()
-            .filter(|record| {
-                now.saturating_sub(record.last_seen_unix)
-                    <= crate::peer_db::PEX_FRESHNESS_WINDOW_SECS
-            })
-            .map(|record| record.addr)
-            .collect::<Vec<_>>();
+            .map(|record| record.addr.clone())
+            .collect();
+
+        // Fall back to all fresh peers if no relay-capable ones are known.
+        let mut candidates = if relay_capable.is_empty() {
+            state
+                .peer_db
+                .all_records()
+                .into_iter()
+                .filter(|record| {
+                    now.saturating_sub(record.last_seen_unix)
+                        <= crate::peer_db::PEX_FRESHNESS_WINDOW_SECS
+                })
+                .map(|record| record.addr)
+                .collect::<Vec<_>>()
+        } else {
+            relay_capable
+        };
+
         candidates.sort_by_key(relay_peer_key);
         if candidates.is_empty() {
             return Ok(vec![]);
@@ -222,17 +237,21 @@ impl NodeHandle {
             anyhow::bail!("relay registration failed: {}", payload_str);
         }
 
-        let registered: RelayRegistered = serde_cbor::from_slice(&response.payload)?;
+        let registered: RelayRegistered = crate::cbor::from_slice(&response.payload)?;
         let slot = ActiveRelaySlot {
             relay_addr: relay_addr.clone(),
             slot_id: registered.relay_slot_id,
             expires_at: registered.expires_at,
         };
 
-        // Store in state
+        // Store in state — add to the list, replacing any existing
+        // slot for the same relay address.
         {
             let mut state = self.state.write().await;
-            state.active_relay_slot = Some(slot.clone());
+            state
+                .active_relay_slots
+                .retain(|s| s.relay_addr != slot.relay_addr);
+            state.active_relay_slots.push(slot.clone());
         }
 
         // Spawn a task that keeps the connection open and serves
@@ -240,19 +259,27 @@ impl NodeHandle {
         // (forwarded from downloaders), serve_wire_stream will process
         // them and reply, just as if a downloader connected directly.
         let node = self.clone();
+        let relay_addr_key = relay_addr.clone();
         tokio::spawn(async move {
             let _ = node.serve_wire_stream(stream, None).await;
-            // Connection lost — clear active relay slot.
+            // Connection lost — remove this specific relay slot.
             let mut state = node.state.write().await;
-            state.active_relay_slot = None;
+            state
+                .active_relay_slots
+                .retain(|s| s.relay_addr != relay_addr_key);
         });
 
         Ok(slot)
     }
 
-    /// Return the active relay slot, if any.
+    /// Return the first active relay slot, if any (backward-compat).
     pub async fn active_relay_slot(&self) -> Option<ActiveRelaySlot> {
-        self.state.read().await.active_relay_slot.clone()
+        self.state.read().await.active_relay_slots.first().cloned()
+    }
+
+    /// Return all active relay slots.
+    pub async fn active_relay_slots(&self) -> Vec<ActiveRelaySlot> {
+        self.state.read().await.active_relay_slots.clone()
     }
 
     /// Build a `PeerAddr` that includes `relay_via` routing for this node.
@@ -260,17 +287,40 @@ impl NodeHandle {
     /// If this node has an active relay slot, returns a `PeerAddr` whose
     /// `relay_via` field points to the relay, allowing remote peers to
     /// reach this firewalled node through the tunnel.
+    ///
+    /// Uses the first active relay slot.
     pub async fn relayed_self_addr(&self, self_addr: PeerAddr) -> PeerAddr {
-        let slot = self.state.read().await.active_relay_slot.clone();
-        match slot {
+        let slots = self.state.read().await.active_relay_slots.clone();
+        match slots.first() {
             Some(active) => PeerAddr {
                 relay_via: Some(crate::peer::RelayRoute {
-                    relay_addr: Box::new(active.relay_addr),
+                    relay_addr: Box::new(active.relay_addr.clone()),
                     slot_id: active.slot_id,
                 }),
                 ..self_addr
             },
             None => self_addr,
         }
+    }
+
+    /// Build multiple `PeerAddr` variants, one for each active relay.
+    ///
+    /// For provider announcements, publishing all relay routes lets
+    /// downloaders try routes in parallel with fast failover.
+    pub async fn all_relayed_self_addrs(&self, self_addr: PeerAddr) -> Vec<PeerAddr> {
+        let slots = self.state.read().await.active_relay_slots.clone();
+        if slots.is_empty() {
+            return vec![self_addr];
+        }
+        slots
+            .iter()
+            .map(|active| PeerAddr {
+                relay_via: Some(crate::peer::RelayRoute {
+                    relay_addr: Box::new(active.relay_addr.clone()),
+                    slot_id: active.slot_id,
+                }),
+                ..self_addr.clone()
+            })
+            .collect()
     }
 }

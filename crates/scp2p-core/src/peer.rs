@@ -55,8 +55,8 @@ mod tests {
             relay_via: None,
         };
 
-        let encoded = serde_cbor::to_vec(&addr).expect("encode peer addr");
-        let decoded: PeerAddr = serde_cbor::from_slice(&encoded).expect("decode peer addr");
+        let encoded = crate::cbor::to_vec(&addr).expect("encode peer addr");
+        let decoded: PeerAddr = crate::cbor::from_slice(&encoded).expect("decode peer addr");
         assert_eq!(decoded, addr);
     }
 
@@ -80,9 +80,9 @@ mod tests {
             }),
         };
 
-        let encoded = serde_cbor::to_vec(&addr).expect("encode peer addr with relay");
+        let encoded = crate::cbor::to_vec(&addr).expect("encode peer addr with relay");
         let decoded: PeerAddr =
-            serde_cbor::from_slice(&encoded).expect("decode peer addr with relay");
+            crate::cbor::from_slice(&encoded).expect("decode peer addr with relay");
         assert_eq!(decoded, addr);
         let route = decoded.relay_via.unwrap();
         assert_eq!(*route.relay_addr, relay);
@@ -102,14 +102,15 @@ mod tests {
             pubkey_hint: None,
             relay_via: None,
         };
-        let full_bytes = serde_cbor::to_vec(&original).expect("encode");
-        let mut val: serde_cbor::Value = serde_cbor::from_slice(&full_bytes).expect("decode value");
+        let full_bytes = crate::cbor::to_vec(&original).expect("encode");
+        let mut val: crate::cbor::Value =
+            crate::cbor::from_slice(&full_bytes).expect("decode value");
         // Strip relay_via from the map to simulate legacy encoding.
-        if let serde_cbor::Value::Map(ref mut m) = val {
-            m.remove(&serde_cbor::Value::Text("relay_via".into()));
+        if let crate::cbor::Value::Map(ref mut m) = val {
+            m.retain(|(k, _)| *k != crate::cbor::Value::Text("relay_via".into()));
         }
-        let legacy = serde_cbor::to_vec(&val).expect("re-encode without relay_via");
-        let decoded: PeerAddr = serde_cbor::from_slice(&legacy).expect("decode legacy peer addr");
+        let legacy = crate::cbor::to_vec(&val).expect("re-encode without relay_via");
+        let decoded: PeerAddr = crate::cbor::from_slice(&legacy).expect("decode legacy peer addr");
         assert_eq!(decoded.relay_via, None);
         assert_eq!(decoded.ip, original.ip);
         assert_eq!(decoded.port, 9000);

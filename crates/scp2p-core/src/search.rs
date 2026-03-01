@@ -30,6 +30,13 @@ pub struct SearchIndexSnapshot {
     inverted: HashMap<String, HashSet<ItemKey>>,
 }
 
+impl SearchIndexSnapshot {
+    /// Iterate over all indexed items in the snapshot.
+    pub fn items(&self) -> impl Iterator<Item = &IndexedItem> {
+        self.items.values()
+    }
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct SearchIndex {
     items: HashMap<ItemKey, IndexedItem>,
@@ -46,12 +53,33 @@ impl SearchIndex {
         }
     }
 
+    /// Return an iterator over all indexed items (read-only).
+    pub fn items(&self) -> impl Iterator<Item = &IndexedItem> {
+        self.items.values()
+    }
+
     pub fn from_snapshot(snapshot: SearchIndexSnapshot) -> Self {
         Self {
             items: snapshot.items,
             by_share: snapshot.by_share,
             inverted: snapshot.inverted,
         }
+    }
+
+    /// Build a `SearchIndex` from a flat list of items (e.g. loaded from FTS5).
+    ///
+    /// Reconstructs the `by_share` and `inverted` maps from the items.
+    pub fn from_items(items: Vec<IndexedItem>) -> Self {
+        let mut index = Self::default();
+        for item in items {
+            let key = (item.share_id, item.content_id);
+            for token in tokens_for_item(&item) {
+                index.inverted.entry(token).or_default().insert(key);
+            }
+            index.by_share.entry(item.share_id).or_default().push(key);
+            index.items.insert(key, item);
+        }
+        index
     }
 
     pub fn index_manifest(&mut self, manifest: &ManifestV1) {

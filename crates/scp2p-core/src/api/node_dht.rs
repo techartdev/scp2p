@@ -9,21 +9,21 @@
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 use ed25519_dalek::SigningKey;
-use rand::RngCore;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use crate::{
     capabilities::Capabilities,
-    dht::{DhtNodeRecord, DhtValue, ALPHA, DEFAULT_TTL_SECS, K, MAX_VALUE_SIZE},
+    dht::{DhtInsertResult, DhtNodeRecord, DhtValue, ALPHA, DEFAULT_TTL_SECS, K, MAX_VALUE_SIZE},
     dht_keys::share_head_key,
     ids::{NodeId, ShareId},
     manifest::ShareHead,
     net_fetch::RequestTransport,
     peer::PeerAddr,
-    transport_net::tcp_accept_session,
     wire::{FindNode, Store as WireStore},
 };
+#[allow(deprecated)]
+use crate::transport_net::tcp_accept_session;
 
 use super::{
     helpers::{
@@ -41,7 +41,7 @@ impl NodeHandle {
         addr: PeerAddr,
     ) -> anyhow::Result<()> {
         let mut state = self.state.write().await;
-        state.dht.upsert_node(
+        let result = state.dht.upsert_node(
             DhtNodeRecord {
                 node_id,
                 addr,
@@ -49,6 +49,20 @@ impl NodeHandle {
             },
             local_target,
         );
+
+        // For now, when a ping-before-evict result is returned we
+        // silently drop the new node (conservative: keeps existing
+        // stable nodes).  Full async ping integration belongs in the
+        // networking layer.
+        match result {
+            DhtInsertResult::Inserted => {}
+            DhtInsertResult::PendingEviction { .. } => {
+                // TODO: ping stale_node, call complete_eviction on
+                // failure, refresh_node on success.
+            }
+            DhtInsertResult::RejectedSubnetLimit => {}
+        }
+
         Ok(())
     }
 
@@ -216,7 +230,7 @@ impl NodeHandle {
         let local_best = self
             .dht_find_value(key)
             .await?
-            .and_then(|value| serde_cbor::from_slice::<ShareHead>(&value.value).ok())
+            .and_then(|value| crate::cbor::from_slice::<ShareHead>(&value.value).ok())
             .filter(|head| head.share_id == share_id.0);
 
         let mut target = [0u8; 20];
@@ -251,7 +265,7 @@ impl NodeHandle {
                         && remote.value.len() <= MAX_VALUE_SIZE
                         && validate_dht_value_for_known_keyspaces(remote.key, &remote.value).is_ok()
                     {
-                        let head: ShareHead = serde_cbor::from_slice(&remote.value)?;
+                        let head: ShareHead = crate::cbor::from_slice(&remote.value)?;
                         if head.share_id != share_id.0 {
                             continue;
                         }
@@ -272,7 +286,7 @@ impl NodeHandle {
                             let mut state = self.state.write().await;
                             state.dht.store(
                                 key,
-                                serde_cbor::to_vec(&head)?,
+                                crate::cbor::to_vec(&head)?,
                                 remote.ttl_secs.max(DEFAULT_TTL_SECS),
                                 now,
                             )?;
@@ -372,16 +386,10 @@ impl NodeHandle {
         tokio::spawn(async move {
             let listener = TcpListener::bind(bind_addr).await?;
             loop {
-                let mut nonce = [0u8; 32];
-                rand::rngs::OsRng.fill_bytes(&mut nonce);
-                let accepted = tcp_accept_session(
-                    &listener,
-                    &local_signing_key,
-                    capabilities.clone(),
-                    nonce,
-                    None,
-                )
-                .await;
+                #[allow(deprecated)]
+                let accepted =
+                    tcp_accept_session(&listener, &local_signing_key, capabilities.clone(), None)
+                        .await;
                 let Ok((stream, session, remote_addr)) = accepted else {
                     continue;
                 };

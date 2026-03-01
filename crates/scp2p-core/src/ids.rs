@@ -39,10 +39,20 @@ impl NodeId {
         out
     }
 
+    /// Deprecated: use [`NodeId::xor_distance_cmp`] for clarity.
+    #[deprecated(note = "use NodeId::xor_distance_cmp(a, b, target) instead")]
     pub fn distance_cmp(&self, target: &Self, other: &Self) -> std::cmp::Ordering {
-        let a = self.xor_distance(target);
-        let b = other.xor_distance(target);
-        a.cmp(&b)
+        Self::xor_distance_cmp(self, other, target)
+    }
+
+    /// Compare which of `a` or `b` is closer to `target` in XOR-distance.
+    ///
+    /// Returns `Ordering::Less` when `a` is closer, `Greater` when `b` is,
+    /// and `Equal` when equidistant.
+    pub fn xor_distance_cmp(a: &Self, b: &Self, target: &Self) -> std::cmp::Ordering {
+        let da = a.xor_distance(target);
+        let db = b.xor_distance(target);
+        da.cmp(&db)
     }
 }
 
@@ -66,10 +76,17 @@ impl ShareId {
         out
     }
 
+    /// Deprecated: use [`ShareId::xor_distance_cmp`] for clarity.
+    #[deprecated(note = "use ShareId::xor_distance_cmp(a, b, target) instead")]
     pub fn distance_cmp(&self, target: &Self, other: &Self) -> std::cmp::Ordering {
-        let a = self.xor_distance(target);
-        let b = other.xor_distance(target);
-        a.cmp(&b)
+        Self::xor_distance_cmp(self, other, target)
+    }
+
+    /// Compare which of `a` or `b` is closer to `target` in XOR-distance.
+    pub fn xor_distance_cmp(a: &Self, b: &Self, target: &Self) -> std::cmp::Ordering {
+        let da = a.xor_distance(target);
+        let db = b.xor_distance(target);
+        da.cmp(&db)
     }
 }
 
@@ -111,6 +128,6 @@ mod tests {
         let target = NodeId([0u8; 20]);
         let a = NodeId([1u8; 20]);
         let b = NodeId([2u8; 20]);
-        assert!(a.distance_cmp(&target, &b).is_lt());
+        assert!(NodeId::xor_distance_cmp(&a, &b, &target).is_lt());
     }
 }

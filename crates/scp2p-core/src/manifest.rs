@@ -75,7 +75,40 @@ pub struct ManifestV1 {
     pub communities: Vec<[u8; 32]>,
     pub items: Vec<ItemV1>,
     pub recommended_shares: Vec<[u8; 32]>,
-    pub signature: Option<Vec<u8>>,
+    /// Ed25519 signature — always exactly 64 bytes when present.
+    #[serde(default, with = "sig_serde")]
+    pub signature: Option<[u8; 64]>,
+}
+
+/// Custom serde for `Option<[u8; 64]>` — serializes as CBOR byte string
+/// (wire-compatible with the previous `Option<Vec<u8>>`).
+mod sig_serde {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(sig: &Option<[u8; 64]>, s: S) -> Result<S::Ok, S::Error> {
+        match sig {
+            Some(bytes) => s.serialize_bytes(bytes),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 64]>, D::Error> {
+        let opt: Option<serde_bytes::ByteBuf> = Deserialize::deserialize(d)?;
+        match opt {
+            Some(buf) => {
+                if buf.len() != 64 {
+                    return Err(serde::de::Error::custom(format!(
+                        "signature must be 64 bytes, got {}",
+                        buf.len()
+                    )));
+                }
+                let mut arr = [0u8; 64];
+                arr.copy_from_slice(&buf);
+                Ok(Some(arr))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -169,34 +202,43 @@ impl ManifestV1 {
             unsigned.items,
             unsigned.recommended_shares,
         );
-        Ok(serde_cbor::to_vec(&signing_tuple)?)
+        Ok(crate::cbor::to_vec(&signing_tuple)?)
     }
 
     pub fn sign(&mut self, key: &ShareKeypair) -> anyhow::Result<()> {
         let bytes = self.unsigned_bytes()?;
         let signature: Signature = key.signing_key.sign(&bytes);
-        self.signature = Some(signature.to_bytes().to_vec());
+        self.signature = Some(signature.to_bytes());
         Ok(())
     }
 
     pub fn verify(&self) -> anyhow::Result<()> {
+        self.verify_at(crate::transport::now_unix_secs()?)
+    }
+
+    /// Verify the manifest signature and expiry at a given timestamp.
+    pub fn verify_at(&self, now_unix: u64) -> anyhow::Result<()> {
+        // Check expiry first — an expired manifest should never be accepted.
+        if let Some(exp) = self.expires_at {
+            if now_unix > exp {
+                anyhow::bail!("manifest has expired");
+            }
+            if exp <= self.created_at {
+                anyhow::bail!("manifest expires_at must be after created_at");
+            }
+        }
+
         let sig = self
             .signature
-            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("manifest missing signature"))?;
-        if sig.len() != 64 {
-            anyhow::bail!("manifest signature must be 64 bytes");
-        }
 
         let pubkey = VerifyingKey::from_bytes(&self.share_pubkey)?;
         if ShareId::from_pubkey(&pubkey).0 != self.share_id {
             anyhow::bail!("manifest share_id does not match share_pubkey");
         }
 
-        let mut sig_arr = [0u8; 64];
-        sig_arr.copy_from_slice(sig);
         let bytes = self.unsigned_bytes()?;
-        pubkey.verify(&bytes, &Signature::from_bytes(&sig_arr))?;
+        pubkey.verify(&bytes, &Signature::from_bytes(&sig))?;
         Ok(())
     }
 
@@ -214,9 +256,9 @@ impl ManifestV1 {
             &self.communities,
             &self.items,
             &self.recommended_shares,
-            self.signature.as_deref(),
+            self.signature.as_ref().map(|s| &s[..]),
         );
-        Ok(ManifestId::from_manifest_bytes(&serde_cbor::to_vec(
+        Ok(ManifestId::from_manifest_bytes(&crate::cbor::to_vec(
             &content,
         )?))
     }
@@ -283,7 +325,7 @@ impl ShareHead {
             unsigned.latest_manifest_id,
             unsigned.updated_at,
         );
-        Ok(serde_cbor::to_vec(&signing_tuple)?)
+        Ok(crate::cbor::to_vec(&signing_tuple)?)
     }
 
     pub fn new_signed(
@@ -387,15 +429,15 @@ mod tests {
             signature: None,
         };
 
-        let unsigned_manifest: serde_cbor::Value =
-            serde_cbor::from_slice(&manifest.unsigned_bytes().expect("manifest unsigned bytes"))
+        let unsigned_manifest: crate::cbor::Value =
+            crate::cbor::from_slice(&manifest.unsigned_bytes().expect("manifest unsigned bytes"))
                 .expect("decode manifest unsigned");
         let items = match unsigned_manifest {
-            serde_cbor::Value::Array(values) => {
+            crate::cbor::Value::Array(values) => {
                 assert_eq!(values.len(), 12);
-                assert_eq!(values[8], serde_cbor::Value::Text("private".to_string()));
+                assert_eq!(values[8], crate::cbor::Value::Text("private".to_string()));
                 match &values[9] {
-                    serde_cbor::Value::Array(communities) => assert!(communities.is_empty()),
+                    crate::cbor::Value::Array(communities) => assert!(communities.is_empty()),
                     _ => panic!("manifest communities should be cbor array"),
                 }
                 values[10].clone()
@@ -403,7 +445,7 @@ mod tests {
             _ => panic!("manifest unsigned form should be cbor array"),
         };
         match items {
-            serde_cbor::Value::Array(values) => assert_eq!(values.len(), 0),
+            crate::cbor::Value::Array(values) => assert_eq!(values.len(), 0),
             _ => panic!("manifest items should be cbor array"),
         }
 
@@ -415,11 +457,11 @@ mod tests {
             sig: vec![],
         };
 
-        let unsigned_head: serde_cbor::Value =
-            serde_cbor::from_slice(&head.signable_bytes().expect("head signable bytes"))
+        let unsigned_head: crate::cbor::Value =
+            crate::cbor::from_slice(&head.signable_bytes().expect("head signable bytes"))
                 .expect("decode head unsigned");
         match unsigned_head {
-            serde_cbor::Value::Array(values) => assert_eq!(values.len(), 4),
+            crate::cbor::Value::Array(values) => assert_eq!(values.len(), 4),
             _ => panic!("share head unsigned form should be cbor array"),
         }
     }
@@ -455,14 +497,14 @@ mod tests {
             signature: None,
         };
 
-        let unsigned_manifest: serde_cbor::Value =
-            serde_cbor::from_slice(&manifest.unsigned_bytes().expect("manifest unsigned bytes"))
+        let unsigned_manifest: crate::cbor::Value =
+            crate::cbor::from_slice(&manifest.unsigned_bytes().expect("manifest unsigned bytes"))
                 .expect("decode manifest unsigned");
         let items = match unsigned_manifest {
-            serde_cbor::Value::Array(values) => {
-                assert_eq!(values[8], serde_cbor::Value::Text("public".to_string()));
+            crate::cbor::Value::Array(values) => {
+                assert_eq!(values[8], crate::cbor::Value::Text("public".to_string()));
                 match &values[9] {
-                    serde_cbor::Value::Array(communities) => {
+                    crate::cbor::Value::Array(communities) => {
                         assert_eq!(communities.len(), 1);
                     }
                     _ => panic!("manifest communities should be cbor array"),
@@ -472,10 +514,10 @@ mod tests {
             _ => panic!("manifest unsigned form should be cbor array"),
         };
         match items {
-            serde_cbor::Value::Array(values) => {
+            crate::cbor::Value::Array(values) => {
                 assert_eq!(values.len(), 1);
                 match &values[0] {
-                    serde_cbor::Value::Array(item_values) => {
+                    crate::cbor::Value::Array(item_values) => {
                         assert_eq!(item_values.len(), 8);
                     }
                     _ => panic!("manifest item should be cbor array"),
@@ -502,7 +544,7 @@ mod tests {
             signature: Option<Vec<u8>>,
         }
 
-        let legacy = serde_cbor::to_vec(&LegacyManifestV1 {
+        let legacy = crate::cbor::to_vec(&LegacyManifestV1 {
             version: 1,
             share_pubkey: [0u8; 32],
             share_id: [1u8; 32],
@@ -517,7 +559,7 @@ mod tests {
         })
         .expect("encode legacy manifest");
 
-        let manifest: ManifestV1 = serde_cbor::from_slice(&legacy).expect("decode legacy");
+        let manifest: ManifestV1 = crate::cbor::from_slice(&legacy).expect("decode legacy");
         assert_eq!(manifest.visibility, ShareVisibility::Private);
         assert!(manifest.communities.is_empty());
     }

@@ -6,6 +6,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use std::{
     collections::{HashMap, VecDeque},
+    io::SeekFrom,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -13,12 +15,12 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 
 use async_trait::async_trait;
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncSeekExt, AsyncWrite, AsyncWriteExt as TokioAsyncWriteExt},
     sync::Mutex,
 };
 
 use crate::{
-    content::{compute_chunk_list_hash, verify_chunk, verify_content},
+    content::{compute_chunk_list_hash, verify_chunk, verify_content, CHUNK_SIZE},
     ids::ContentId,
     manifest::ManifestV1,
     peer::PeerAddr,
@@ -87,8 +89,12 @@ impl<C: PeerConnector> RequestTransport for DirectRequestTransport<C> {
 
 pub struct SessionPoolTransport<C> {
     connector: C,
-    sessions: Mutex<HashMap<String, BoxedStream>>,
+    sessions: Mutex<HashMap<String, (BoxedStream, Instant)>>,
 }
+
+/// Maximum number of cached sessions in the pool.  When full, the
+/// least-recently-used session is evicted before inserting a new one.
+const MAX_POOL_SESSIONS: usize = 64;
 
 impl<C> SessionPoolTransport<C> {
     pub fn new(connector: C) -> Self {
@@ -96,6 +102,22 @@ impl<C> SessionPoolTransport<C> {
             connector,
             sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Insert a session into the pool, evicting the oldest entry if at capacity.
+    async fn pool_insert(&self, key: String, stream: BoxedStream) {
+        let mut sessions = self.sessions.lock().await;
+        if sessions.len() >= MAX_POOL_SESSIONS && !sessions.contains_key(&key) {
+            // Evict least-recently-used entry.
+            if let Some(oldest_key) = sessions
+                .iter()
+                .min_by_key(|(_, (_, ts))| *ts)
+                .map(|(k, _)| k.clone())
+            {
+                sessions.remove(&oldest_key);
+            }
+        }
+        sessions.insert(key, (stream, Instant::now()));
     }
 }
 
@@ -110,7 +132,7 @@ impl<C: PeerConnector> RequestTransport for SessionPoolTransport<C> {
         let key = peer_key(peer);
         let mut stream = {
             let mut sessions = self.sessions.lock().await;
-            sessions.remove(&key)
+            sessions.remove(&key).map(|(s, _)| s)
         };
 
         if stream.is_none() {
@@ -120,8 +142,7 @@ impl<C: PeerConnector> RequestTransport for SessionPoolTransport<C> {
         let mut stream = stream.expect("stream must be initialized");
         match send_request_on_stream(&mut stream, request.clone(), timeout_dur).await {
             Ok(response) => {
-                let mut sessions = self.sessions.lock().await;
-                sessions.insert(key, stream);
+                self.pool_insert(key, stream).await;
                 Ok(response)
             }
             Err(first_err) => {
@@ -130,8 +151,7 @@ impl<C: PeerConnector> RequestTransport for SessionPoolTransport<C> {
                 let response = send_request_on_stream(&mut fresh_stream, request, timeout_dur)
                     .await
                     .map_err(|_| first_err)?;
-                let mut sessions = self.sessions.lock().await;
-                sessions.insert(key, fresh_stream);
+                self.pool_insert(key, fresh_stream).await;
                 Ok(response)
             }
         }
@@ -494,6 +514,174 @@ pub async fn download_swarm_over_network<T: RequestTransport + ?Sized>(
     Ok(output)
 }
 
+/// Like [`download_swarm_over_network`], but streams each verified chunk
+/// directly to disk instead of buffering the entire file in memory.
+///
+/// Chunks are written at their correct offset in a temporary file.  Once
+/// all chunks are received and individually hash-verified, the final
+/// `content_id` (BLAKE3 over the full content) is checked via a streaming
+/// pass over the completed file, and the result is atomically renamed to
+/// `target_path`.
+///
+/// Returns the canonical target path on success.
+pub async fn download_swarm_to_file<T: RequestTransport + ?Sized>(
+    transport: &T,
+    peers: &[PeerAddr],
+    content_id: [u8; 32],
+    chunk_hashes: &[[u8; 32]],
+    policy: &FetchPolicy,
+    target_path: &Path,
+    on_progress: Option<&ProgressCallback>,
+) -> anyhow::Result<PathBuf> {
+    if peers.is_empty() {
+        anyhow::bail!("no peers available for content download");
+    }
+
+    let total_chunks = chunk_hashes.len();
+    let max_parallel = policy.parallel_chunks.min(total_chunks).max(1);
+    let max_retries_per_chunk = policy.attempts_per_peer * peers.len();
+    let mut req_id = 10_000u32;
+
+    // Open a temporary file next to the target for writing chunks.
+    let tmp_path = target_path.with_extension("scp2p-partial");
+    let mut file = tokio::fs::File::create(&tmp_path).await?;
+
+    // Track which chunks are completed.
+    let mut chunk_done = vec![false; total_chunks];
+    let mut completed_count = 0usize;
+    let mut completed_bytes = 0u64;
+
+    let mut stats: HashMap<String, PeerRuntimeStats> = peers
+        .iter()
+        .map(|peer| (peer_key(peer), PeerRuntimeStats::default()))
+        .collect();
+
+    let mut next_chunk = 0usize;
+    let mut retry_queue: VecDeque<(usize, usize)> = VecDeque::new();
+    let mut in_flight = FuturesUnordered::new();
+    let mut stall_count = 0usize;
+
+    loop {
+        while in_flight.len() < max_parallel {
+            let (chunk_idx, retries) = if let Some(retry) = retry_queue.pop_front() {
+                retry
+            } else if next_chunk < total_chunks {
+                let idx = next_chunk;
+                next_chunk += 1;
+                (idx, 0)
+            } else {
+                break;
+            };
+
+            if retries >= max_retries_per_chunk {
+                // Clean up partial file.
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                anyhow::bail!(
+                    "unable to retrieve verified chunk {} after {} attempts",
+                    chunk_idx,
+                    retries
+                );
+            }
+
+            if let Some(peer_idx) = pick_best_peer_index(peers, &stats, policy) {
+                let peer = peers[peer_idx].clone();
+                let pk = peer_key(&peer);
+                let rid = req_id;
+                req_id = req_id.wrapping_add(1);
+                if let Some(s) = stats.get_mut(&pk) {
+                    s.in_flight += 1;
+                }
+                in_flight.push(fetch_one_chunk(
+                    transport,
+                    peer,
+                    content_id,
+                    chunk_idx,
+                    rid,
+                    chunk_hashes[chunk_idx],
+                    pk,
+                    policy,
+                    retries,
+                ));
+            } else {
+                retry_queue.push_front((chunk_idx, retries));
+                break;
+            }
+        }
+
+        if completed_count >= total_chunks {
+            break;
+        }
+
+        if in_flight.is_empty() {
+            stall_count += 1;
+            if stall_count > 60 {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                anyhow::bail!(
+                    "download stalled: no peers can serve remaining {}/{} chunks",
+                    total_chunks - completed_count,
+                    total_chunks
+                );
+            }
+            tokio::time::sleep(policy.failure_backoff_base).await;
+            continue;
+        }
+        stall_count = 0;
+
+        let res = in_flight.next().await.expect("non-empty FuturesUnordered");
+
+        if let Some(s) = stats.get_mut(&res.peer_key) {
+            s.in_flight = s.in_flight.saturating_sub(1);
+        }
+
+        let now = Instant::now();
+        match res.data {
+            Ok(bytes) if verify_chunk(&res.expected_hash, &bytes).is_ok() => {
+                if let Some(s) = stats.get_mut(&res.peer_key) {
+                    s.score += 2;
+                    s.consecutive_failures = 0;
+                    s.backoff_until = None;
+                }
+                // Write chunk to the correct offset.
+                let offset = res.chunk_idx as u64 * CHUNK_SIZE as u64;
+                file.seek(SeekFrom::Start(offset)).await?;
+                file.write_all(&bytes).await?;
+
+                let chunk_len = bytes.len() as u64;
+                chunk_done[res.chunk_idx] = true;
+                completed_count += 1;
+                completed_bytes += chunk_len;
+                if let Some(cb) = &on_progress {
+                    cb(completed_count as u32, total_chunks as u32, completed_bytes);
+                }
+            }
+            Ok(_) => {
+                if let Some(s) = stats.get_mut(&res.peer_key) {
+                    register_failure(s, policy, now);
+                }
+                retry_queue.push_back((res.chunk_idx, res.retries + 1));
+            }
+            Err(_) => {
+                if let Some(s) = stats.get_mut(&res.peer_key) {
+                    register_failure(s, policy, now);
+                }
+                retry_queue.push_back((res.chunk_idx, res.retries + 1));
+            }
+        }
+    }
+
+    // Ensure all data is flushed.
+    file.flush().await?;
+    drop(file);
+
+    // Verify content_id via streaming BLAKE3 over the completed file.
+    let file_bytes = tokio::fs::read(&tmp_path).await?;
+    verify_content(&ContentId(content_id), &file_bytes)?;
+
+    // Atomic rename to target.
+    tokio::fs::rename(&tmp_path, target_path).await?;
+    Ok(target_path.to_path_buf())
+}
+
 /// Outcome of a single chunk fetch attempt, returned from the in-flight
 /// future back to the download loop.
 struct ChunkFetchOutcome {
@@ -626,7 +814,7 @@ async fn fetch_manifest_once<T: RequestTransport + ?Sized>(
         anyhow::bail!("manifest id mismatch");
     }
 
-    let manifest: ManifestV1 = serde_cbor::from_slice(&bytes)?;
+    let manifest: ManifestV1 = crate::cbor::from_slice(&bytes)?;
     if manifest.manifest_id()?.0 != manifest_id {
         anyhow::bail!("manifest bytes hash does not match manifest_id");
     }
@@ -890,7 +1078,7 @@ mod tests {
         signed.share_id = kp.share_id().0;
         signed.sign(&kp).expect("sign");
         let manifest_id = signed.manifest_id().expect("id").0;
-        let manifest_bytes = serde_cbor::to_vec(&signed).expect("bytes");
+        let manifest_bytes = crate::cbor::to_vec(&signed).expect("bytes");
 
         transport
             .connector

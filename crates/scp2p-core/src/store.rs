@@ -29,10 +29,10 @@ use crate::{
     search::SearchIndexSnapshot,
 };
 
-const KEY_KDF_ITERATIONS: u32 = 120_000;
+const KEY_KDF_ITERATIONS: u32 = 600_000;
 
 /// Bump when making schema changes; migrations are applied in order.
-const CURRENT_SCHEMA_VERSION: u32 = 1;
+const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PersistedState {
@@ -73,12 +73,24 @@ pub struct PersistedSubscription {
 pub struct PersistedCommunity {
     pub share_id: [u8; 32],
     pub share_pubkey: [u8; 32],
+    /// Optional cryptographic membership token signed by the community
+    /// publisher key (§4.2).  When present, community membership is
+    /// verifiable by any peer; when absent, membership is self-asserted.
+    #[serde(default)]
+    pub membership_token: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PersistedPublisherIdentity {
     pub label: String,
-    pub share_secret: [u8; 32],
+    /// Plaintext secret — present when no passphrase-based encryption is active.
+    /// When encryption is enabled this field is zeroed out in persisted form.
+    #[serde(default)]
+    pub share_secret: Option<[u8; 32]>,
+    /// Encrypted secret — present when the publisher identity has been
+    /// locked with a passphrase via [`encrypt_publisher_identities`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_share_secret: Option<EncryptedSecret>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,17 +101,88 @@ pub struct PersistedPartialDownload {
     pub completed_chunks: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EncryptedSecret {
     pub salt: [u8; 16],
     pub nonce: [u8; 24],
     pub ciphertext: Vec<u8>,
 }
 
+/// Tracks which sections of persisted state have been mutated since the
+/// last successful save.  When all flags are `false`, `persist_state`
+/// short-circuits without cloning or writing anything.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DirtyFlags {
+    pub peers: bool,
+    pub subscriptions: bool,
+    pub communities: bool,
+    pub publisher_identities: bool,
+    pub manifests: bool,
+    pub share_heads: bool,
+    pub share_weights: bool,
+    pub search_index: bool,
+    pub partial_downloads: bool,
+    pub node_key: bool,
+    pub blocklist: bool,
+    pub content_paths: bool,
+}
+
+impl DirtyFlags {
+    /// Return a flags set with every section marked dirty.
+    pub fn all() -> Self {
+        Self {
+            peers: true,
+            subscriptions: true,
+            communities: true,
+            publisher_identities: true,
+            manifests: true,
+            share_heads: true,
+            share_weights: true,
+            search_index: true,
+            partial_downloads: true,
+            node_key: true,
+            blocklist: true,
+            content_paths: true,
+        }
+    }
+
+    /// `true` when at least one section is dirty.
+    pub fn any(&self) -> bool {
+        self.peers
+            || self.subscriptions
+            || self.communities
+            || self.publisher_identities
+            || self.manifests
+            || self.share_heads
+            || self.share_weights
+            || self.search_index
+            || self.partial_downloads
+            || self.node_key
+            || self.blocklist
+            || self.content_paths
+    }
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
     async fn load_state(&self) -> anyhow::Result<PersistedState>;
     async fn save_state(&self, state: &PersistedState) -> anyhow::Result<()>;
+
+    /// Save only the sections indicated by `dirty`.
+    ///
+    /// Default implementation falls back to `save_state`.  `SqliteStore`
+    /// overrides this to skip unchanged tables.
+    async fn save_incremental(
+        &self,
+        state: &PersistedState,
+        dirty: &DirtyFlags,
+    ) -> anyhow::Result<()> {
+        if dirty.any() {
+            self.save_state(state).await
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Default)]
@@ -175,6 +258,23 @@ impl SqliteStore {
             )
             .unwrap_or(0);
 
+        // --- Schema v2: FTS5 search index ---
+        if current_version < 2 {
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
+                    share_id UNINDEXED,
+                    content_id UNINDEXED,
+                    name,
+                    tags,
+                    title,
+                    description,
+                    tokenize = 'unicode61'
+                );",
+            )?;
+            // Drop the legacy CBOR search_index blob if present.
+            conn.execute("DELETE FROM metadata WHERE key = 'search_index'", [])?;
+        }
+
         // Persist the schema version.
         if current_version != CURRENT_SCHEMA_VERSION {
             conn.execute(
@@ -219,7 +319,27 @@ impl Store for SqliteStore {
             let store = SqliteStore { path };
             store.ensure_schema()?;
             let mut conn = store.open_connection()?;
-            save_state_sync(&mut conn, &state)
+            save_state_sync(&mut conn, &state, &DirtyFlags::all())
+        })
+        .await?
+    }
+
+    async fn save_incremental(
+        &self,
+        state: &PersistedState,
+        dirty: &DirtyFlags,
+    ) -> anyhow::Result<()> {
+        if !dirty.any() {
+            return Ok(());
+        }
+        let path = self.path.clone();
+        let state = state.clone();
+        let dirty = *dirty;
+        tokio::task::spawn_blocking(move || {
+            let store = SqliteStore { path };
+            store.ensure_schema()?;
+            let mut conn = store.open_connection()?;
+            save_state_sync(&mut conn, &state, &dirty)
         })
         .await?
     }
@@ -233,7 +353,7 @@ fn load_state_sync(conn: &Connection) -> anyhow::Result<PersistedState> {
         let mut stmt = conn.prepare("SELECT payload FROM peers")?;
         let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         for row in rows {
-            let record: PeerRecord = serde_cbor::from_slice(&row?)?;
+            let record: PeerRecord = crate::cbor::from_slice(&row?)?;
             state.peers.push(record);
         }
     }
@@ -278,7 +398,7 @@ fn load_state_sync(conn: &Connection) -> anyhow::Result<PersistedState> {
         })?;
         for row in rows {
             let (manifest_id, payload) = row?;
-            let manifest: ManifestV1 = serde_cbor::from_slice(&payload)?;
+            let manifest: ManifestV1 = crate::cbor::from_slice(&payload)?;
             state.manifests.insert(
                 blob_to_array::<32>(&manifest_id, "manifests.manifest_id")?,
                 manifest,
@@ -307,7 +427,7 @@ fn load_state_sync(conn: &Connection) -> anyhow::Result<PersistedState> {
         })?;
         for row in rows {
             let (content_id, payload) = row?;
-            let partial: PersistedPartialDownload = serde_cbor::from_slice(&payload)?;
+            let partial: PersistedPartialDownload = crate::cbor::from_slice(&payload)?;
             state.partial_downloads.insert(
                 blob_to_array::<32>(&content_id, "partial_downloads.content_id")?,
                 partial,
@@ -315,7 +435,64 @@ fn load_state_sync(conn: &Connection) -> anyhow::Result<PersistedState> {
         }
     }
 
-    state.search_index = load_metadata_cbor(conn, "search_index")?;
+    // --- FTS5 search index ---
+    {
+        // Try loading from the search_fts table (schema v2+).
+        // Falls back to legacy CBOR blob for databases not yet migrated.
+        let has_fts = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='search_fts'")
+            .and_then(|mut s| s.query_row([], |_| Ok(())))
+            .is_ok();
+
+        if has_fts {
+            let mut stmt = conn.prepare(
+                "SELECT share_id, content_id, name, tags, title, description FROM search_fts",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?;
+            let mut items = Vec::new();
+            for row in rows {
+                let (share_id_hex, content_id_hex, name, tags_str, title, description) = row?;
+                let share_id = hex_to_array::<32>(&share_id_hex, "search_fts.share_id")?;
+                let content_id = hex_to_array::<32>(&content_id_hex, "search_fts.content_id")?;
+                let tags: Vec<String> = tags_str
+                    .split('\t')
+                    .filter(|t| !t.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect();
+                let title = if title.is_empty() { None } else { Some(title) };
+                let description = if description.is_empty() {
+                    None
+                } else {
+                    Some(description)
+                };
+                items.push(crate::search::IndexedItem {
+                    share_id,
+                    content_id,
+                    name,
+                    tags,
+                    title,
+                    description,
+                });
+            }
+            if !items.is_empty() {
+                state.search_index = Some(
+                    crate::search::SearchIndex::from_items(items).snapshot(),
+                );
+            }
+        } else {
+            state.search_index = load_metadata_cbor(conn, "search_index")?;
+        }
+    }
+
     state.share_heads = load_metadata_cbor(conn, "share_heads")?.unwrap_or_default();
     state.encrypted_node_key = load_metadata_cbor(conn, "encrypted_node_key")?;
     state.enabled_blocklist_shares =
@@ -338,111 +515,156 @@ fn load_metadata_cbor<T: serde::de::DeserializeOwned>(
         |row| row.get::<_, Vec<u8>>(0),
     )
     .optional()?
-    .map(|payload| serde_cbor::from_slice(&payload).map_err(Into::into))
+    .map(|payload| crate::cbor::from_slice(&payload).map_err(Into::into))
     .transpose()
 }
 
 /// All SQLite writes happen here, on a blocking thread.
 /// Uses UPSERT (INSERT … ON CONFLICT DO UPDATE) so only changed rows are
 /// written.  Stale rows that no longer exist in `state` are deleted by
-/// comparing keys.
-fn save_state_sync(conn: &mut Connection, state: &PersistedState) -> anyhow::Result<()> {
+/// comparing keys.  When `dirty` indicates a section is unchanged, the
+/// corresponding table writes are skipped entirely.
+fn save_state_sync(
+    conn: &mut Connection,
+    state: &PersistedState,
+    dirty: &DirtyFlags,
+) -> anyhow::Result<()> {
     let tx = conn.transaction()?;
 
     // --- peers: UPSERT + prune stale ---
-    let mut live_peer_keys: HashSet<String> = HashSet::new();
-    for peer in &state.peers {
-        let addr_key = format!(
-            "{}:{}:{:?}",
-            peer.addr.ip, peer.addr.port, peer.addr.transport
-        );
-        tx.execute(
-            "INSERT INTO peers(addr_key, payload) VALUES(?1, ?2)
-             ON CONFLICT(addr_key) DO UPDATE SET payload = excluded.payload",
-            params![addr_key, serde_cbor::to_vec(peer)?],
-        )?;
-        live_peer_keys.insert(addr_key);
+    if dirty.peers {
+        let mut live_peer_keys: HashSet<String> = HashSet::new();
+        for peer in &state.peers {
+            let addr_key = format!(
+                "{}:{}:{:?}",
+                peer.addr.ip, peer.addr.port, peer.addr.transport
+            );
+            tx.execute(
+                "INSERT INTO peers(addr_key, payload) VALUES(?1, ?2)
+                 ON CONFLICT(addr_key) DO UPDATE SET payload = excluded.payload",
+                params![addr_key, crate::cbor::to_vec(peer)?],
+            )?;
+            live_peer_keys.insert(addr_key);
+        }
+        delete_stale_text_keys(&tx, "peers", "addr_key", &live_peer_keys)?;
     }
-    delete_stale_text_keys(&tx, "peers", "addr_key", &live_peer_keys)?;
 
     // --- subscriptions: UPSERT + prune stale ---
-    let mut live_sub_keys: HashSet<Vec<u8>> = HashSet::new();
-    for sub in &state.subscriptions {
-        tx.execute(
-            "INSERT INTO subscriptions(share_id, share_pubkey, latest_seq, latest_manifest_id, trust_level)
-             VALUES(?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(share_id) DO UPDATE SET
-               share_pubkey = excluded.share_pubkey,
-               latest_seq = excluded.latest_seq,
-               latest_manifest_id = excluded.latest_manifest_id,
-               trust_level = excluded.trust_level",
-            params![
-                sub.share_id.to_vec(),
-                sub.share_pubkey.map(|v| v.to_vec()),
-                sub.latest_seq,
-                sub.latest_manifest_id.map(|v| v.to_vec()),
-                trust_level_str(sub.trust_level),
-            ],
-        )?;
-        live_sub_keys.insert(sub.share_id.to_vec());
+    if dirty.subscriptions {
+        let mut live_sub_keys: HashSet<Vec<u8>> = HashSet::new();
+        for sub in &state.subscriptions {
+            tx.execute(
+                "INSERT INTO subscriptions(share_id, share_pubkey, latest_seq, latest_manifest_id, trust_level)
+                 VALUES(?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(share_id) DO UPDATE SET
+                   share_pubkey = excluded.share_pubkey,
+                   latest_seq = excluded.latest_seq,
+                   latest_manifest_id = excluded.latest_manifest_id,
+                   trust_level = excluded.trust_level",
+                params![
+                    sub.share_id.to_vec(),
+                    sub.share_pubkey.map(|v| v.to_vec()),
+                    sub.latest_seq,
+                    sub.latest_manifest_id.map(|v| v.to_vec()),
+                    trust_level_str(sub.trust_level),
+                ],
+            )?;
+            live_sub_keys.insert(sub.share_id.to_vec());
+        }
+        delete_stale_blob_keys(&tx, "subscriptions", "share_id", &live_sub_keys)?;
     }
-    delete_stale_blob_keys(&tx, "subscriptions", "share_id", &live_sub_keys)?;
 
     // --- metadata blobs (communities, publisher_identities, etc.) ---
-    upsert_metadata_cbor(&tx, "communities", &state.communities)?;
-    upsert_metadata_cbor(&tx, "publisher_identities", &state.publisher_identities)?;
+    if dirty.communities {
+        upsert_metadata_cbor(&tx, "communities", &state.communities)?;
+    }
+    if dirty.publisher_identities {
+        upsert_metadata_cbor(&tx, "publisher_identities", &state.publisher_identities)?;
+    }
 
     // --- manifests: UPSERT + prune stale ---
-    let mut live_manifest_keys: HashSet<Vec<u8>> = HashSet::new();
-    for (manifest_id, manifest) in &state.manifests {
-        tx.execute(
-            "INSERT INTO manifests(manifest_id, payload) VALUES(?1, ?2)
-             ON CONFLICT(manifest_id) DO UPDATE SET payload = excluded.payload",
-            params![manifest_id.to_vec(), serde_cbor::to_vec(manifest)?],
-        )?;
-        live_manifest_keys.insert(manifest_id.to_vec());
+    if dirty.manifests {
+        let mut live_manifest_keys: HashSet<Vec<u8>> = HashSet::new();
+        for (manifest_id, manifest) in &state.manifests {
+            tx.execute(
+                "INSERT INTO manifests(manifest_id, payload) VALUES(?1, ?2)
+                 ON CONFLICT(manifest_id) DO UPDATE SET payload = excluded.payload",
+                params![manifest_id.to_vec(), crate::cbor::to_vec(manifest)?],
+            )?;
+            live_manifest_keys.insert(manifest_id.to_vec());
+        }
+        delete_stale_blob_keys(&tx, "manifests", "manifest_id", &live_manifest_keys)?;
     }
-    delete_stale_blob_keys(&tx, "manifests", "manifest_id", &live_manifest_keys)?;
 
     // --- share_weights: UPSERT + prune stale ---
-    let mut live_weight_keys: HashSet<Vec<u8>> = HashSet::new();
-    for (share_id, weight) in &state.share_weights {
-        tx.execute(
-            "INSERT INTO share_weights(share_id, weight) VALUES(?1, ?2)
-             ON CONFLICT(share_id) DO UPDATE SET weight = excluded.weight",
-            params![share_id.to_vec(), weight],
-        )?;
-        live_weight_keys.insert(share_id.to_vec());
+    if dirty.share_weights {
+        let mut live_weight_keys: HashSet<Vec<u8>> = HashSet::new();
+        for (share_id, weight) in &state.share_weights {
+            tx.execute(
+                "INSERT INTO share_weights(share_id, weight) VALUES(?1, ?2)
+                 ON CONFLICT(share_id) DO UPDATE SET weight = excluded.weight",
+                params![share_id.to_vec(), weight],
+            )?;
+            live_weight_keys.insert(share_id.to_vec());
+        }
+        delete_stale_blob_keys(&tx, "share_weights", "share_id", &live_weight_keys)?;
     }
-    delete_stale_blob_keys(&tx, "share_weights", "share_id", &live_weight_keys)?;
 
     // --- partial_downloads: UPSERT + prune stale ---
-    let mut live_partial_keys: HashSet<Vec<u8>> = HashSet::new();
-    for (content_id, partial) in &state.partial_downloads {
-        tx.execute(
-            "INSERT INTO partial_downloads(content_id, payload) VALUES(?1, ?2)
-             ON CONFLICT(content_id) DO UPDATE SET payload = excluded.payload",
-            params![content_id.to_vec(), serde_cbor::to_vec(partial)?],
-        )?;
-        live_partial_keys.insert(content_id.to_vec());
+    if dirty.partial_downloads {
+        let mut live_partial_keys: HashSet<Vec<u8>> = HashSet::new();
+        for (content_id, partial) in &state.partial_downloads {
+            tx.execute(
+                "INSERT INTO partial_downloads(content_id, payload) VALUES(?1, ?2)
+                 ON CONFLICT(content_id) DO UPDATE SET payload = excluded.payload",
+                params![content_id.to_vec(), crate::cbor::to_vec(partial)?],
+            )?;
+            live_partial_keys.insert(content_id.to_vec());
+        }
+        delete_stale_blob_keys(&tx, "partial_downloads", "content_id", &live_partial_keys)?;
     }
-    delete_stale_blob_keys(&tx, "partial_downloads", "content_id", &live_partial_keys)?;
 
     // --- remaining metadata ---
-    upsert_metadata_cbor_opt(&tx, "search_index", &state.search_index)?;
-    upsert_metadata_cbor(&tx, "share_heads", &state.share_heads)?;
-    upsert_metadata_cbor_opt(&tx, "encrypted_node_key", &state.encrypted_node_key)?;
-    upsert_metadata_cbor(
-        &tx,
-        "enabled_blocklist_shares",
-        &state.enabled_blocklist_shares,
-    )?;
-    upsert_metadata_cbor(
-        &tx,
-        "blocklist_rules_by_share",
-        &state.blocklist_rules_by_share,
-    )?;
-    upsert_metadata_cbor(&tx, "content_paths", &state.content_paths)?;
+    if dirty.search_index {
+        // FTS5-backed search index: clear and repopulate.
+        tx.execute("DELETE FROM search_fts", [])?;
+        if let Some(ref snapshot) = state.search_index {
+            let mut insert_stmt = tx.prepare(
+                "INSERT INTO search_fts(share_id, content_id, name, tags, title, description) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for item in snapshot.items() {
+                insert_stmt.execute(params![
+                    hex::encode(item.share_id),
+                    hex::encode(item.content_id),
+                    &item.name,
+                    item.tags.join("\t"),
+                    item.title.as_deref().unwrap_or(""),
+                    item.description.as_deref().unwrap_or(""),
+                ])?;
+            }
+        }
+    }
+    if dirty.share_heads {
+        upsert_metadata_cbor(&tx, "share_heads", &state.share_heads)?;
+    }
+    if dirty.node_key {
+        upsert_metadata_cbor_opt(&tx, "encrypted_node_key", &state.encrypted_node_key)?;
+    }
+    if dirty.blocklist {
+        upsert_metadata_cbor(
+            &tx,
+            "enabled_blocklist_shares",
+            &state.enabled_blocklist_shares,
+        )?;
+        upsert_metadata_cbor(
+            &tx,
+            "blocklist_rules_by_share",
+            &state.blocklist_rules_by_share,
+        )?;
+    }
+    if dirty.content_paths {
+        upsert_metadata_cbor(&tx, "content_paths", &state.content_paths)?;
+    }
 
     tx.commit()?;
     Ok(())
@@ -455,7 +677,7 @@ fn upsert_metadata_cbor<T: Serialize>(
     key: &str,
     value: &T,
 ) -> anyhow::Result<()> {
-    let bytes = serde_cbor::to_vec(value)?;
+    let bytes = crate::cbor::to_vec(value)?;
     tx.execute(
         "INSERT INTO metadata(key, payload) VALUES(?1, ?2)
          ON CONFLICT(key) DO UPDATE SET payload = excluded.payload",
@@ -472,7 +694,7 @@ fn upsert_metadata_cbor_opt<T: Serialize>(
 ) -> anyhow::Result<()> {
     match value {
         Some(v) => {
-            let bytes = serde_cbor::to_vec(v)?;
+            let bytes = crate::cbor::to_vec(v)?;
             tx.execute(
                 "INSERT INTO metadata(key, payload) VALUES(?1, ?2)
                  ON CONFLICT(key) DO UPDATE SET payload = excluded.payload",
@@ -487,12 +709,22 @@ fn upsert_metadata_cbor_opt<T: Serialize>(
 }
 
 /// Delete rows whose TEXT primary-key is not in `live_keys`.
+/// Validate that a SQL identifier contains only safe characters (alphanumeric + underscore).
+fn validate_sql_identifier(ident: &str) -> anyhow::Result<()> {
+    if ident.is_empty() || !ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        anyhow::bail!("invalid SQL identifier: {ident:?}");
+    }
+    Ok(())
+}
+
 fn delete_stale_text_keys(
     tx: &rusqlite::Transaction<'_>,
     table: &str,
     pk_col: &str,
     live_keys: &HashSet<String>,
 ) -> anyhow::Result<()> {
+    validate_sql_identifier(table)?;
+    validate_sql_identifier(pk_col)?;
     let mut stmt = tx.prepare(&format!("SELECT {pk_col} FROM {table}"))?;
     let existing: Vec<String> = stmt
         .query_map([], |row| row.get::<_, String>(0))?
@@ -516,6 +748,8 @@ fn delete_stale_blob_keys(
     pk_col: &str,
     live_keys: &HashSet<Vec<u8>>,
 ) -> anyhow::Result<()> {
+    validate_sql_identifier(table)?;
+    validate_sql_identifier(pk_col)?;
     let mut stmt = tx.prepare(&format!("SELECT {pk_col} FROM {table}"))?;
     let existing: Vec<Vec<u8>> = stmt
         .query_map([], |row| row.get::<_, Vec<u8>>(0))?
@@ -562,10 +796,18 @@ fn blob_to_array<const N: usize>(blob: &[u8], field: &str) -> anyhow::Result<[u8
     Ok(out)
 }
 
+fn hex_to_array<const N: usize>(hex_str: &str, field: &str) -> anyhow::Result<[u8; N]> {
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| anyhow::anyhow!("invalid hex in {}: {}", field, e))?;
+    blob_to_array::<N>(&bytes, field)
+}
+
 pub fn peer_record(addr: PeerAddr, last_seen_unix: u64) -> PeerRecord {
     PeerRecord {
         addr,
         last_seen_unix,
+        capabilities: None,
+        capabilities_seen_at: None,
     }
 }
 
@@ -730,5 +972,77 @@ mod tests {
         let encrypted = encrypt_secret(secret, "passphrase").expect("encrypt");
         let decrypted = decrypt_secret(&encrypted, "passphrase").expect("decrypt");
         assert_eq!(decrypted, secret);
+    }
+
+    #[tokio::test]
+    async fn sqlite_fts5_search_index_roundtrip() {
+        use crate::search::{IndexedItem, SearchIndex};
+
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "scp2p_fts5_test_{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("now")
+                .as_nanos()
+        ));
+        let store = SqliteStore::open(&path).expect("open sqlite");
+
+        let mut initial = PersistedState::default();
+
+        // Build a search index with two items.
+        let items = vec![
+            IndexedItem {
+                share_id: [1u8; 32],
+                content_id: [2u8; 32],
+                name: "Ubuntu ISO".into(),
+                tags: vec!["linux".into(), "ubuntu".into()],
+                title: Some("Linux Downloads".into()),
+                description: Some("Latest Ubuntu release".into()),
+            },
+            IndexedItem {
+                share_id: [1u8; 32],
+                content_id: [3u8; 32],
+                name: "Fedora DVD".into(),
+                tags: vec!["linux".into(), "fedora".into()],
+                title: Some("Linux Downloads".into()),
+                description: None,
+            },
+        ];
+        let index = SearchIndex::from_items(items);
+        initial.search_index = Some(index.snapshot());
+
+        store.save_state(&initial).await.expect("save");
+        let loaded = store.load_state().await.expect("load");
+
+        let loaded_snapshot = loaded.search_index.expect("search_index should be Some");
+        let loaded_items: Vec<_> = loaded_snapshot.items().collect();
+        assert_eq!(loaded_items.len(), 2, "should load 2 FTS5 items");
+
+        // Verify item content.
+        let ubuntu = loaded_items
+            .iter()
+            .find(|i| i.name == "Ubuntu ISO")
+            .expect("ubuntu item");
+        assert_eq!(ubuntu.tags, vec!["linux", "ubuntu"]);
+        assert_eq!(ubuntu.title.as_deref(), Some("Linux Downloads"));
+        assert_eq!(ubuntu.description.as_deref(), Some("Latest Ubuntu release"));
+
+        let fedora = loaded_items
+            .iter()
+            .find(|i| i.name == "Fedora DVD")
+            .expect("fedora item");
+        assert_eq!(fedora.tags, vec!["linux", "fedora"]);
+        assert!(fedora.description.is_none());
+
+        // Rebuild the search index and verify search works.
+        let reloaded_index = SearchIndex::from_snapshot(loaded_snapshot);
+        let mut subs = std::collections::HashSet::new();
+        subs.insert([1u8; 32]);
+        let hits = reloaded_index.search("ubuntu", &subs, &std::collections::HashMap::new());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.name, "Ubuntu ISO");
+
+        let _ = std::fs::remove_file(path);
     }
 }

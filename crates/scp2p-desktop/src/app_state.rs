@@ -11,11 +11,13 @@ use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use rand::{rngs::OsRng, RngCore};
 use scp2p_core::{
-    describe_content, transport_net::tcp_connect_session, BoxedStream, Capabilities,
+    describe_content, BoxedStream, Capabilities,
     DirectRequestTransport, FetchPolicy, ItemV1, ManifestV1, Node, NodeConfig, NodeHandle,
     OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord, PublicShareSummary, SearchPageQuery,
     ShareItemInfo, ShareVisibility, SqliteStore, Store, TransportProtocol,
 };
+#[allow(deprecated)]
+use scp2p_core::transport_net::tcp_connect_session;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -51,6 +53,9 @@ struct LanDiscoveryAnnouncement {
     version: u8,
     instance_id: [u8; 16],
     tcp_port: u16,
+    /// Capabilities of the announcing node (version >= 2).
+    #[serde(default)]
+    capabilities: Option<Capabilities>,
 }
 
 struct DesktopSessionConnector {
@@ -64,14 +69,12 @@ impl PeerConnector for DesktopSessionConnector {
         if peer.transport != TransportProtocol::Tcp {
             anyhow::bail!("desktop connector only supports tcp peers");
         }
-        let mut nonce = [0u8; 32];
-        OsRng.fill_bytes(&mut nonce);
         let remote = std::net::SocketAddr::new(peer.ip, peer.port);
+        #[allow(deprecated)]
         let (stream, _) = tcp_connect_session(
             remote,
             &self.signing_key,
             self.capabilities.clone(),
-            nonce,
             peer.pubkey_hint,
         )
         .await?;
@@ -109,10 +112,11 @@ impl DesktopAppState {
         if let Some(bind_tcp) = request.bind_tcp {
             let mut rng = OsRng;
             let service_key = SigningKey::generate(&mut rng);
+            let caps = Capabilities::default();
             state.tcp_service_task = Some(handle.clone().start_tcp_dht_service(
                 bind_tcp,
                 service_key,
-                Capabilities::default(),
+                caps.clone(),
             ));
             let mut instance_id = [0u8; 16];
             OsRng.fill_bytes(&mut instance_id);
@@ -120,6 +124,7 @@ impl DesktopAppState {
                 handle.clone(),
                 bind_tcp.port(),
                 instance_id,
+                caps,
             )));
         }
         state.node = Some(handle);
@@ -141,6 +146,8 @@ impl DesktopAppState {
         state.last_public_shares.clear();
         RuntimeStatus {
             running: false,
+            app_version: scp2p_core::APP_VERSION.to_string(),
+            protocol_version: scp2p_core::transport::PROTOCOL_VERSION,
             state_db_path: state
                 .state_db_path
                 .as_ref()
@@ -160,6 +167,8 @@ impl DesktopAppState {
         };
         Ok(RuntimeStatus {
             running: state.node.is_some(),
+            app_version: scp2p_core::APP_VERSION.to_string(),
+            protocol_version: scp2p_core::transport::PROTOCOL_VERSION,
             state_db_path: state
                 .state_db_path
                 .as_ref()
@@ -585,7 +594,7 @@ impl DesktopAppState {
         config: &DesktopClientConfig,
     ) -> anyhow::Result<()> {
         let path = path.into();
-        let bytes = serde_cbor::to_vec(config)?;
+        let bytes = scp2p_core::cbor::to_vec(config)?;
         std::fs::write(&path, bytes)
             .with_context(|| format!("write desktop config to {}", path.display()))?;
         Ok(())
@@ -602,7 +611,7 @@ impl DesktopAppState {
 
         let bytes = std::fs::read(&path)
             .with_context(|| format!("read desktop config from {}", path.display()))?;
-        Ok(serde_cbor::from_slice(&bytes)?)
+        Ok(scp2p_core::cbor::from_slice(&bytes)?)
     }
 
     async fn node_handle(&self) -> anyhow::Result<NodeHandle> {
@@ -986,14 +995,16 @@ async fn start_lan_discovery(
     node: NodeHandle,
     tcp_port: u16,
     instance_id: [u8; 16],
+    capabilities: Capabilities,
 ) -> anyhow::Result<()> {
     let socket = UdpSocket::bind(("0.0.0.0", LAN_DISCOVERY_PORT)).await?;
     socket.set_broadcast(true)?;
     let broadcast = std::net::SocketAddr::from(([255, 255, 255, 255], LAN_DISCOVERY_PORT));
-    let announcement = serde_cbor::to_vec(&LanDiscoveryAnnouncement {
-        version: 1,
+    let announcement = scp2p_core::cbor::to_vec(&LanDiscoveryAnnouncement {
+        version: 2,
         instance_id,
         tcp_port,
+        capabilities: Some(capabilities),
     })?;
     let mut interval = time::interval(Duration::from_secs(LAN_DISCOVERY_INTERVAL_SECS));
     let mut buf = [0u8; 1024];
@@ -1007,10 +1018,11 @@ async fn start_lan_discovery(
                 let Ok((len, from)) = recv else {
                     continue;
                 };
-                let Ok(packet) = serde_cbor::from_slice::<LanDiscoveryAnnouncement>(&buf[..len]) else {
+                let Ok(packet) = scp2p_core::cbor::from_slice::<LanDiscoveryAnnouncement>(&buf[..len]) else {
                     continue;
                 };
-                if packet.version != 1 || packet.instance_id == instance_id {
+                // Accept version 1 (no capabilities) and version 2
+                if packet.version == 0 || packet.instance_id == instance_id {
                     continue;
                 }
                 let peer = PeerAddr {
@@ -1020,7 +1032,11 @@ async fn start_lan_discovery(
                     pubkey_hint: None,
                     relay_via: None,
                 };
-                let _ = node.record_peer_seen(peer).await;
+                if let Some(caps) = packet.capabilities {
+                    let _ = node.record_peer_seen_with_capabilities(peer, caps).await;
+                } else {
+                    let _ = node.record_peer_seen(peer).await;
+                }
             }
         }
     }
@@ -1116,9 +1132,56 @@ mod tests {
             version: 1,
             instance_id: [7u8; 16],
             tcp_port: 7001,
+            capabilities: None,
         };
-        let bytes = serde_cbor::to_vec(&packet).expect("encode");
-        let decoded: LanDiscoveryAnnouncement = serde_cbor::from_slice(&bytes).expect("decode");
+        let bytes = scp2p_core::cbor::to_vec(&packet).expect("encode");
+        let decoded: LanDiscoveryAnnouncement =
+            scp2p_core::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, packet);
+    }
+
+    #[test]
+    fn lan_discovery_v2_includes_capabilities() {
+        let caps = Capabilities {
+            relay: true,
+            dht: true,
+            ..Default::default()
+        };
+        let packet = LanDiscoveryAnnouncement {
+            version: 2,
+            instance_id: [8u8; 16],
+            tcp_port: 7002,
+            capabilities: Some(caps.clone()),
+        };
+        let bytes = scp2p_core::cbor::to_vec(&packet).expect("encode");
+        let decoded: LanDiscoveryAnnouncement =
+            scp2p_core::cbor::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, packet);
+        assert!(decoded.capabilities.unwrap().relay);
+    }
+
+    #[test]
+    fn lan_discovery_v1_backwards_compatible() {
+        // A v1 packet (no capabilities field) should still decode
+        // thanks to #[serde(default)] on the capabilities field.
+        //
+        // Simulate by encoding a V1-only struct.
+        #[derive(Serialize)]
+        struct V1Only {
+            version: u8,
+            instance_id: [u8; 16],
+            tcp_port: u16,
+        }
+        let v1 = V1Only {
+            version: 1,
+            instance_id: [7u8; 16],
+            tcp_port: 7001,
+        };
+        let bytes = scp2p_core::cbor::to_vec(&v1).expect("encode v1");
+        let decoded: LanDiscoveryAnnouncement =
+            scp2p_core::cbor::from_slice(&bytes).expect("decode v1");
+        assert_eq!(decoded.version, 1);
+        assert_eq!(decoded.tcp_port, 7001);
+        assert!(decoded.capabilities.is_none());
     }
 }

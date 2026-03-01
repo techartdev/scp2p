@@ -11,6 +11,6 @@ ed25519-dalek.workspace = true
 hex.workspace = true
 rand.workspace = true
 serde.workspace = true
-serde_cbor.workspace = true
+ciborium.workspace = true
 scp2p-core = { path = "../scp2p-core" }
 tokio.workspace = true

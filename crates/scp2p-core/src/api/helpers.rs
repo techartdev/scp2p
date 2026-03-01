@@ -122,21 +122,23 @@ pub(super) fn validate_dht_value_for_known_keyspaces(
     key: [u8; 32],
     value: &[u8],
 ) -> anyhow::Result<()> {
-    if let Ok(head) = serde_cbor::from_slice::<ShareHead>(value) {
+    if let Ok(head) = crate::cbor::from_slice::<ShareHead>(value) {
         let expected = share_head_key(&ShareId(head.share_id));
         if expected != key {
             anyhow::bail!("share head value does not match share head key");
         }
         return Ok(());
     }
-    if let Ok(providers) = serde_cbor::from_slice::<Providers>(value) {
+    if let Ok(providers) = crate::cbor::from_slice::<Providers>(value) {
         let expected = content_provider_key(&providers.content_id);
         if expected != key {
             anyhow::bail!("providers value does not match content provider key");
         }
         return Ok(());
     }
-    Ok(())
+    // Reject values that do not match any recognized keyspace to prevent
+    // arbitrary data storage and potential abuse (§4.5).
+    anyhow::bail!("DHT value does not match any recognized keyspace")
 }
 
 pub(super) async fn query_find_node<T: RequestTransport + ?Sized>(
@@ -162,7 +164,7 @@ pub(super) async fn query_find_node<T: RequestTransport + ?Sized>(
     if response.flags & FLAG_RESPONSE == 0 {
         anyhow::bail!("find_node response missing response flag");
     }
-    Ok(serde_cbor::from_slice(&response.payload)?)
+    Ok(crate::cbor::from_slice(&response.payload)?)
 }
 
 pub(super) async fn query_find_value<T: RequestTransport + ?Sized>(
@@ -184,7 +186,7 @@ pub(super) async fn query_find_value<T: RequestTransport + ?Sized>(
     if response.flags & FLAG_RESPONSE == 0 {
         anyhow::bail!("find_value response missing response flag");
     }
-    Ok(serde_cbor::from_slice(&response.payload)?)
+    Ok(crate::cbor::from_slice(&response.payload)?)
 }
 
 pub(super) async fn query_public_shares<T: RequestTransport + ?Sized>(
@@ -210,7 +212,7 @@ pub(super) async fn query_public_shares<T: RequestTransport + ?Sized>(
     if response.flags & FLAG_RESPONSE == 0 {
         anyhow::bail!("public share list response missing response flag");
     }
-    Ok(serde_cbor::from_slice::<PublicShareList>(&response.payload)?.shares)
+    Ok(crate::cbor::from_slice::<PublicShareList>(&response.payload)?.shares)
 }
 
 pub(super) async fn query_community_status<T: RequestTransport + ?Sized>(
@@ -240,7 +242,7 @@ pub(super) async fn query_community_status<T: RequestTransport + ?Sized>(
     if response.flags & FLAG_RESPONSE == 0 {
         anyhow::bail!("community status response missing response flag");
     }
-    let status: CommunityStatus = serde_cbor::from_slice(&response.payload)?;
+    let status: CommunityStatus = crate::cbor::from_slice(&response.payload)?;
     if status.community_share_id != share_id.0 {
         anyhow::bail!("community status response share_id mismatch");
     }
@@ -276,7 +278,7 @@ pub(super) async fn query_community_public_shares<T: RequestTransport + ?Sized>(
     if response.flags & FLAG_RESPONSE == 0 {
         anyhow::bail!("community public share list response missing response flag");
     }
-    let payload: CommunityPublicShareList = serde_cbor::from_slice(&response.payload)?;
+    let payload: CommunityPublicShareList = crate::cbor::from_slice(&response.payload)?;
     if payload.community_share_id != community_share_id.0 {
         anyhow::bail!("community public share list response share_id mismatch");
     }
@@ -341,14 +343,21 @@ pub(super) async fn replicate_store_to_closest<T: RequestTransport + ?Sized>(
     Ok(stored)
 }
 
-/// Persist current state: snapshot under read-lock, drop lock, then write.
-/// This avoids holding the `RwLock` across async I/O.
+/// Persist current state: snapshot under write-lock (to read and clear
+/// dirty flags), drop lock, then write only dirty sections.
+/// Short-circuits when nothing has changed.
 pub(super) async fn persist_state(handle: &NodeHandle) -> anyhow::Result<()> {
-    let (snapshot, store) = {
-        let state = handle.state.read().await;
-        (state.to_persisted(), state.store.clone())
+    let (snapshot, store, dirty) = {
+        let mut state = handle.state.write().await;
+        let dirty = state.dirty;
+        if !dirty.any() {
+            return Ok(());
+        }
+        let snapshot = state.to_persisted();
+        state.dirty = crate::store::DirtyFlags::default();
+        (snapshot, state.store.clone(), dirty)
     };
-    store.save_state(&snapshot).await
+    store.save_incremental(&snapshot, &dirty).await
 }
 
 pub(super) fn error_envelope(message_type: u16, req_id: u32, message: &str) -> Envelope {

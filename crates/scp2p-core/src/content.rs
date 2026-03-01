@@ -44,6 +44,10 @@ pub fn compute_chunk_list_hash(chunk_hashes: &[[u8; 32]]) -> [u8; 32] {
 
 pub fn describe_content(bytes: &[u8]) -> ChunkedContent {
     let chunks = chunk_hashes(bytes);
+    assert!(
+        chunks.len() <= u32::MAX as usize,
+        "file too large: chunk count exceeds u32::MAX (~1 TiB limit)"
+    );
     let chunk_count = chunks.len() as u32;
     let chunk_list_hash = compute_chunk_list_hash(&chunks);
     ChunkedContent {

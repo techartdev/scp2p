@@ -7,6 +7,7 @@
 pub mod api;
 pub mod blob_store;
 pub mod capabilities;
+pub mod cbor;
 pub mod config;
 pub mod content;
 pub mod dht;
@@ -25,9 +26,9 @@ pub mod transport_net;
 pub mod wire;
 
 pub use api::{
-    AbuseLimits, ActiveRelaySlot, BlocklistRules, Node, NodeHandle, OwnedShareRecord, SearchPage,
-    SearchPageQuery, SearchQuery, SearchResult, SearchTrustFilter, ShareItemInfo,
-    SubscriptionTrustLevel,
+    AbuseLimits, ActiveRelaySlot, BlocklistRules, CommunityMembershipToken, Node, NodeHandle,
+    OwnedShareRecord, SearchPage, SearchPageQuery, SearchQuery, SearchResult, SearchTrustFilter,
+    ShareItemInfo, SubscriptionTrustLevel,
 };
 pub use capabilities::Capabilities;
 pub use config::NodeConfig;
@@ -36,7 +37,8 @@ pub use content::{
     verify_content, ChunkedContent, CHUNK_SIZE,
 };
 pub use dht::{
-    Dht, DhtNodeRecord, DhtValue, ALPHA, DEFAULT_TTL_SECS, K, MAX_TTL_SECS, MAX_VALUE_SIZE,
+    Dht, DhtInsertResult, DhtNodeRecord, DhtValue, ALPHA, DEFAULT_TTL_SECS, K, MAX_TTL_SECS,
+    MAX_VALUE_SIZE,
 };
 pub use dht_keys::{content_provider_key, manifest_loc_key, share_head_key};
 pub use ids::{ContentId, ManifestId, NodeId, ShareId};
@@ -44,12 +46,14 @@ pub use manifest::{
     ItemV1, ManifestV1, PublicShareSummary, ShareHead, ShareKeypair, ShareVisibility,
 };
 pub use net_fetch::{
-    download_swarm_over_network, fetch_manifest_with_retry, send_request_on_stream, BoxedStream,
-    DirectRequestTransport, FetchPolicy, PeerConnector, ProgressCallback, RelayAwareTransport,
-    RequestTransport, SessionPoolTransport,
+    download_swarm_over_network, download_swarm_to_file, fetch_manifest_with_retry,
+    send_request_on_stream, BoxedStream, DirectRequestTransport, FetchPolicy, PeerConnector,
+    ProgressCallback, RelayAwareTransport, RequestTransport, SessionPoolTransport,
 };
 pub use peer::{PeerAddr, RelayRoute, TransportProtocol};
-pub use peer_db::{PeerDb, PeerRecord, PEX_FRESHNESS_WINDOW_SECS, PEX_MAX_PEERS};
+pub use peer_db::{
+    PeerDb, PeerRecord, CAPABILITY_FRESHNESS_WINDOW_SECS, PEX_FRESHNESS_WINDOW_SECS, PEX_MAX_PEERS,
+};
 pub use store::{
     decrypt_secret, encrypt_secret, EncryptedSecret, MemoryStore, PersistedCommunity,
     PersistedPartialDownload, PersistedPublisherIdentity, PersistedState, PersistedSubscription,
@@ -59,14 +63,24 @@ pub use store::{
 pub use transfer::{download_swarm, ChunkProvider};
 
 pub use relay::{
-    RelayLimits, RelayLink, RelayManager, RelayPayloadKind as RelayInternalPayloadKind, RelaySlot,
-    RelayStream as RelayInternalStream, RelayTunnelRegistry, RELAY_SLOT_TTL_SECS,
+    BandwidthClass, RelayAnnouncement, RelayCapacity, RelayLimits, RelayLink, RelayManager,
+    RelayPayloadKind as RelayInternalPayloadKind, RelayScore, RelaySlot,
+    RelayStream as RelayInternalStream, RelayTunnelRegistry, RELAY_ANNOUNCEMENT_MAX_TTL_SECS,
+    RELAY_RENDEZVOUS_BUCKET_SECS, RELAY_RENDEZVOUS_N, RELAY_SLOT_TTL_SECS,
 };
+/// Application version string, derived from `Cargo.toml`.
+///
+/// This is the single source of truth for version display and update
+/// checks.  The workspace `[workspace.package].version` value flows
+/// through here so all crates share the same version.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use transport::{
-    dispatch_envelope, handshake_initiator, handshake_responder, read_envelope, run_message_loop,
-    write_envelope, AuthenticatedSession, DispatchResult, NoopDispatcher, WireDispatcher,
-    HANDSHAKE_MAX_BYTES,
+    dispatch_envelope, generate_nonce, handshake_initiator, handshake_responder, read_envelope,
+    run_message_loop, write_envelope, AuthenticatedSession, DispatchResult, NonceTracker,
+    NoopDispatcher, WireDispatcher, HANDSHAKE_MAX_BYTES,
 };
+#[allow(deprecated)]
 pub use transport_net::{
     build_tls_server_handle, quic_accept_bi_session, quic_connect_bi_session, start_quic_server,
     tcp_accept_session, tcp_connect_session, tls_accept_session, tls_connect_session, QuicBiStream,

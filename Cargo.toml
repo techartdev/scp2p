@@ -22,7 +22,7 @@ hex = "0.4"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
-serde_cbor = "0.11"
+ciborium = "0.2"
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "signal", "fs"] }
@@ -33,6 +33,7 @@ rustls = "0.23"
 tokio-rustls = "0.26"
 rusqlite = { version = "0.32", features = ["bundled"] }
 chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 futures-util = "0.3"
 pbkdf2 = "0.12"
 unicode-normalization = "0.1"

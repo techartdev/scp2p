@@ -17,6 +17,22 @@ use std::{
 
 use crate::content::CHUNK_SIZE;
 
+/// Validate that `path` does not contain any `..` components.
+///
+/// Returns an error if path traversal segments are detected.
+/// This is a defence-in-depth check; callers should already sanitise paths.
+pub fn validate_no_traversal(path: &Path) -> anyhow::Result<()> {
+    for component in path.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            anyhow::bail!(
+                "path contains disallowed '..' component: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Read a single chunk (up to 256 KiB) from an arbitrary file on disk.
 ///
 /// Seeks to `chunk_index * CHUNK_SIZE` and reads the lesser of `CHUNK_SIZE`

@@ -50,6 +50,8 @@ pub struct StartNodeRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeStatus {
     pub running: bool,
+    pub app_version: String,
+    pub protocol_version: u16,
     pub state_db_path: Option<String>,
     pub bind_quic: Option<SocketAddr>,
     pub bind_tcp: Option<SocketAddr>,
@@ -164,6 +166,8 @@ mod tests {
     fn runtime_status_serde_roundtrip() {
         let status = RuntimeStatus {
             running: true,
+            app_version: scp2p_core::APP_VERSION.to_string(),
+            protocol_version: scp2p_core::transport::PROTOCOL_VERSION,
             state_db_path: Some("scp2p-desktop.db".to_string()),
             bind_quic: "127.0.0.1:7000".parse().ok(),
             bind_tcp: "127.0.0.1:7001".parse().ok(),
@@ -171,8 +175,8 @@ mod tests {
             warnings: vec!["w1".to_string()],
         };
 
-        let json = serde_cbor::to_vec(&status).expect("encode");
-        let decoded: RuntimeStatus = serde_cbor::from_slice(&json).expect("decode");
+        let json = scp2p_core::cbor::to_vec(&status).expect("encode");
+        let decoded: RuntimeStatus = scp2p_core::cbor::from_slice(&json).expect("decode");
         assert_eq!(decoded, status);
     }
 
@@ -194,8 +198,8 @@ mod tests {
             title: Some("Public".into()),
             description: Some("Visible".into()),
         };
-        let bytes = serde_cbor::to_vec(&view).expect("encode");
-        let decoded: PublicShareView = serde_cbor::from_slice(&bytes).expect("decode");
+        let bytes = scp2p_core::cbor::to_vec(&view).expect("encode");
+        let decoded: PublicShareView = scp2p_core::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, view);
     }
 
@@ -205,8 +209,8 @@ mod tests {
             share_id_hex: "03".repeat(32),
             share_pubkey_hex: "04".repeat(32),
         };
-        let bytes = serde_cbor::to_vec(&view).expect("encode");
-        let decoded: CommunityView = serde_cbor::from_slice(&bytes).expect("decode");
+        let bytes = scp2p_core::cbor::to_vec(&view).expect("encode");
+        let decoded: CommunityView = scp2p_core::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, view);
     }
 
@@ -228,8 +232,8 @@ mod tests {
                 description: None,
             }],
         };
-        let bytes = serde_cbor::to_vec(&view).expect("encode");
-        let decoded: CommunityBrowseView = serde_cbor::from_slice(&bytes).expect("decode");
+        let bytes = scp2p_core::cbor::to_vec(&view).expect("encode");
+        let decoded: CommunityBrowseView = scp2p_core::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, view);
     }
 
@@ -242,8 +246,8 @@ mod tests {
             path: Some("docs/readme.md".to_string()),
             mime: Some("text/markdown".to_string()),
         };
-        let bytes = serde_cbor::to_vec(&view).expect("encode");
-        let decoded: ShareItemView = serde_cbor::from_slice(&bytes).expect("decode");
+        let bytes = scp2p_core::cbor::to_vec(&view).expect("encode");
+        let decoded: ShareItemView = scp2p_core::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, view);
     }
 
@@ -256,8 +260,8 @@ mod tests {
             path: None,
             mime: None,
         };
-        let bytes = serde_cbor::to_vec(&view).expect("encode");
-        let decoded: ShareItemView = serde_cbor::from_slice(&bytes).expect("decode");
+        let bytes = scp2p_core::cbor::to_vec(&view).expect("encode");
+        let decoded: ShareItemView = scp2p_core::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, view);
     }
 }

@@ -54,10 +54,12 @@ impl NodeHandle {
             state.published_share_heads.insert(share_id.0, head.clone());
             state.dht.store(
                 share_head_key(&share_id),
-                serde_cbor::to_vec(&head)?,
+                crate::cbor::to_vec(&head)?,
                 DEFAULT_TTL_SECS,
                 now_unix_secs()?,
             )?;
+            state.dirty.manifests = true;
+            state.dirty.share_heads = true;
             manifest_id
         };
         persist_state(self).await?;
@@ -75,6 +77,7 @@ impl NodeHandle {
         content_bytes: &[u8],
         path: PathBuf,
     ) -> anyhow::Result<[u8; 32]> {
+        crate::blob_store::validate_no_traversal(&path)?;
         let desc = describe_content(content_bytes);
         let content_id = desc.content_id.0;
         let now = now_unix_secs()?;
@@ -82,6 +85,7 @@ impl NodeHandle {
 
         state.content_catalog.insert(content_id, desc);
         state.content_paths.insert(content_id, path);
+        state.dirty.content_paths = true;
 
         upsert_provider(&mut state, content_id, peer, now)?;
 
@@ -268,7 +272,7 @@ fn upsert_provider(
     let mut providers: Providers = state
         .dht
         .find_value(content_provider_key(&content_id), now)
-        .and_then(|v| serde_cbor::from_slice(&v.value).ok())
+        .and_then(|v| crate::cbor::from_slice(&v.value).ok())
         .unwrap_or(Providers {
             content_id,
             providers: vec![],
@@ -282,7 +286,7 @@ fn upsert_provider(
 
     state.dht.store(
         content_provider_key(&content_id),
-        serde_cbor::to_vec(&providers)?,
+        crate::cbor::to_vec(&providers)?,
         DEFAULT_TTL_SECS,
         now,
     )?;

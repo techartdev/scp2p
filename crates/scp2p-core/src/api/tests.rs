@@ -13,16 +13,17 @@ use crate::{
     peer::TransportProtocol,
     relay::RelayLimits,
     store::MemoryStore,
-    transport_net::tcp_connect_session,
     wire::{
         CommunityStatus, Envelope, FindNode, FindNodeResult, FindValueResult, MsgType, Providers,
         PublicShareList, RelayConnect, RelayPayloadKind as WireRelayPayloadKind, RelayRegister,
         RelayRegistered, RelayStream, Store as WireStore, WirePayload, FLAG_ERROR, FLAG_RESPONSE,
     },
 };
+#[allow(deprecated)]
+use crate::transport_net::tcp_connect_session;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
-use rand::{rngs::OsRng, RngCore};
+use rand::rngs::OsRng;
 use std::{
     collections::HashMap,
     sync::{
@@ -75,15 +76,13 @@ struct TcpSessionTransport {
 #[async_trait]
 impl PeerConnector for TcpSessionTransport {
     async fn connect(&self, peer: &PeerAddr) -> anyhow::Result<BoxedStream> {
-        let mut nonce = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
         let remote = std::net::SocketAddr::new(peer.ip, peer.port);
         let expected = peer.pubkey_hint;
+        #[allow(deprecated)]
         let (stream, _session) = tcp_connect_session(
             remote,
             &self.signing_key,
             self.capabilities.clone(),
-            nonce,
             expected,
         )
         .await?;
@@ -92,6 +91,24 @@ impl PeerConnector for TcpSessionTransport {
 }
 
 // RequestTransport is provided by blanket impl for all PeerConnector types.
+
+/// Create a valid ShareHead DHT key + CBOR value pair for testing.
+/// The returned key is `share_head_key(share_id)` and the value is
+/// valid CBOR that passes `validate_dht_value_for_known_keyspaces`.
+fn make_share_head_kv(share_id: [u8; 32]) -> ([u8; 32], Vec<u8>) {
+    use crate::dht_keys::share_head_key;
+    use crate::manifest::ShareHead;
+    let key = share_head_key(&crate::ids::ShareId(share_id));
+    let head = ShareHead {
+        share_id,
+        latest_seq: 1,
+        latest_manifest_id: [0u8; 32],
+        updated_at: 1_700_000_000,
+        sig: vec![0u8; 64],
+    };
+    let value = crate::cbor::to_vec(&head).expect("encode share head");
+    (key, value)
+}
 
 #[tokio::test]
 async fn subscribe_roundtrip() {
@@ -214,19 +231,20 @@ async fn pex_offer_roundtrip_into_peer_db() {
 #[tokio::test]
 async fn dht_store_find_value_roundtrip() {
     let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let (key, value) = make_share_head_kv([3u8; 32]);
     let req = WireStore {
-        key: [3u8; 32],
-        value: vec![7, 8],
+        key,
+        value: value.clone(),
         ttl_secs: 60,
     };
     handle.dht_store(req).await.expect("store value");
 
-    let value = handle
-        .dht_find_value([3u8; 32])
+    let found = handle
+        .dht_find_value(key)
         .await
         .expect("query value")
         .expect("value exists");
-    assert_eq!(value.value, vec![7, 8]);
+    assert_eq!(found.value, value);
 }
 
 #[tokio::test]
@@ -239,7 +257,7 @@ async fn dht_store_rejects_mismatched_share_head_key() {
     let err = handle
         .dht_store(WireStore {
             key: [9u8; 32],
-            value: serde_cbor::to_vec(&head).expect("encode head"),
+            value: crate::cbor::to_vec(&head).expect("encode head"),
             ttl_secs: 60,
         })
         .await
@@ -287,7 +305,7 @@ async fn dht_iterative_find_node_discovers_new_peers() {
                     r#type: MsgType::FindNode as u16,
                     req_id: request.req_id,
                     flags: FLAG_RESPONSE,
-                    payload: serde_cbor::to_vec(&FindNodeResult {
+                    payload: crate::cbor::to_vec(&FindNodeResult {
                         peers: vec![peer_b.clone()],
                     })?,
                 })
@@ -306,7 +324,7 @@ async fn dht_iterative_find_node_discovers_new_peers() {
                     r#type: MsgType::FindNode as u16,
                     req_id: request.req_id,
                     flags: FLAG_RESPONSE,
-                    payload: serde_cbor::to_vec(&FindNodeResult {
+                    payload: crate::cbor::to_vec(&FindNodeResult {
                         peers: vec![peer_c.clone()],
                     })?,
                 })
@@ -323,7 +341,7 @@ async fn dht_iterative_find_node_discovers_new_peers() {
                 r#type: MsgType::FindNode as u16,
                 req_id: request.req_id,
                 flags: FLAG_RESPONSE,
-                payload: serde_cbor::to_vec(&FindNodeResult { peers: vec![] })?,
+                payload: crate::cbor::to_vec(&FindNodeResult { peers: vec![] })?,
             })
         })
         .await;
@@ -341,8 +359,7 @@ async fn dht_iterative_find_node_discovers_new_peers() {
 async fn dht_iterative_find_value_returns_and_caches_remote_hit() {
     let handle = Node::start(NodeConfig::default()).await.expect("start");
     let transport = MockDhtTransport::default();
-    let key = [7u8; 32];
-    let expected = vec![11u8, 22, 33];
+    let (key, expected) = make_share_head_kv([7u8; 32]);
     let peer_a = PeerAddr {
         ip: "10.0.0.40".parse().expect("valid ip"),
         port: 7000,
@@ -370,7 +387,7 @@ async fn dht_iterative_find_value_returns_and_caches_remote_hit() {
                     r#type: MsgType::FindValue as u16,
                     req_id: request.req_id,
                     flags: FLAG_RESPONSE,
-                    payload: serde_cbor::to_vec(&FindValueResult {
+                    payload: crate::cbor::to_vec(&FindValueResult {
                         value: None,
                         closer_peers: vec![peer_b.clone()],
                     })?,
@@ -390,7 +407,7 @@ async fn dht_iterative_find_value_returns_and_caches_remote_hit() {
                     r#type: MsgType::FindValue as u16,
                     req_id: request.req_id,
                     flags: FLAG_RESPONSE,
-                    payload: serde_cbor::to_vec(&FindValueResult {
+                    payload: crate::cbor::to_vec(&FindValueResult {
                         value: Some(WireStore {
                             key,
                             value: value.clone(),
@@ -446,10 +463,10 @@ async fn dht_iterative_find_value_ignores_mismatched_provider_key_value() {
                 r#type: MsgType::FindValue as u16,
                 req_id: request.req_id,
                 flags: FLAG_RESPONSE,
-                payload: serde_cbor::to_vec(&FindValueResult {
+                payload: crate::cbor::to_vec(&FindValueResult {
                     value: Some(WireStore {
                         key,
-                        value: serde_cbor::to_vec(&mismatched)?,
+                        value: crate::cbor::to_vec(&mismatched)?,
                         ttl_secs: 120,
                     }),
                     closer_peers: vec![],
@@ -498,10 +515,10 @@ async fn dht_iterative_find_share_head_verifies_signature_with_known_pubkey() {
                 r#type: MsgType::FindValue as u16,
                 req_id: request.req_id,
                 flags: FLAG_RESPONSE,
-                payload: serde_cbor::to_vec(&FindValueResult {
+                payload: crate::cbor::to_vec(&FindValueResult {
                     value: Some(WireStore {
                         key,
-                        value: serde_cbor::to_vec(&head)?,
+                        value: crate::cbor::to_vec(&head)?,
                         ttl_secs: 60,
                     }),
                     closer_peers: vec![],
@@ -552,10 +569,10 @@ async fn dht_iterative_find_share_head_rejects_tampered_signature_with_known_pub
                 r#type: MsgType::FindValue as u16,
                 req_id: request.req_id,
                 flags: FLAG_RESPONSE,
-                payload: serde_cbor::to_vec(&FindValueResult {
+                payload: crate::cbor::to_vec(&FindValueResult {
                     value: Some(WireStore {
                         key,
-                        value: serde_cbor::to_vec(&head)?,
+                        value: crate::cbor::to_vec(&head)?,
                         ttl_secs: 60,
                     }),
                     closer_peers: vec![],
@@ -1280,8 +1297,7 @@ async fn multi_node_churn_soak_is_configurable() {
 async fn dht_store_replicated_stores_locally_and_on_closest_peers() {
     let handle = Node::start(NodeConfig::default()).await.expect("start");
     let transport = MockDhtTransport::default();
-    let key = [13u8; 32];
-    let value = vec![1u8, 2, 3, 4];
+    let (key, value) = make_share_head_kv([13u8; 32]);
     let seed = PeerAddr {
         ip: "10.0.0.50".parse().expect("valid ip"),
         port: 7000,
@@ -1315,7 +1331,7 @@ async fn dht_store_replicated_stores_locally_and_on_closest_peers() {
                     r#type: MsgType::FindNode as u16,
                     req_id: request.req_id,
                     flags: FLAG_RESPONSE,
-                    payload: serde_cbor::to_vec(&FindNodeResult {
+                    payload: crate::cbor::to_vec(&FindNodeResult {
                         peers: vec![peer_a.clone(), peer_b.clone()],
                     })?,
                 }),
@@ -1341,7 +1357,7 @@ async fn dht_store_replicated_stores_locally_and_on_closest_peers() {
                         r#type: MsgType::FindNode as u16,
                         req_id: request.req_id,
                         flags: FLAG_RESPONSE,
-                        payload: serde_cbor::to_vec(&FindNodeResult { peers: vec![] })?,
+                        payload: crate::cbor::to_vec(&FindNodeResult { peers: vec![] })?,
                     }),
                     WirePayload::Store(_) => {
                         stored_count.fetch_add(1, Ordering::SeqCst);
@@ -1385,8 +1401,7 @@ async fn dht_store_replicated_stores_locally_and_on_closest_peers() {
 async fn dht_republish_once_repairs_remote_replication() {
     let handle = Node::start(NodeConfig::default()).await.expect("start");
     let transport = MockDhtTransport::default();
-    let key = [21u8; 32];
-    let value = vec![9u8, 8, 7];
+    let (key, value) = make_share_head_kv([21u8; 32]);
     let seed = PeerAddr {
         ip: "10.0.0.60".parse().expect("valid ip"),
         port: 7000,
@@ -1411,7 +1426,7 @@ async fn dht_republish_once_repairs_remote_replication() {
                     r#type: MsgType::FindNode as u16,
                     req_id: request.req_id,
                     flags: FLAG_RESPONSE,
-                    payload: serde_cbor::to_vec(&FindNodeResult {
+                    payload: crate::cbor::to_vec(&FindNodeResult {
                         peers: vec![peer.clone()],
                     })?,
                 }),
@@ -1427,7 +1442,7 @@ async fn dht_republish_once_repairs_remote_replication() {
                     r#type: MsgType::FindNode as u16,
                     req_id: request.req_id,
                     flags: FLAG_RESPONSE,
-                    payload: serde_cbor::to_vec(&FindNodeResult { peers: vec![] })?,
+                    payload: crate::cbor::to_vec(&FindNodeResult { peers: vec![] })?,
                 }),
                 WirePayload::Store(_) => {
                     stored_count.fetch_add(1, Ordering::SeqCst);
@@ -1586,7 +1601,7 @@ async fn fetch_public_shares_from_peer_roundtrip() {
                 r#type: MsgType::PublicShareList as u16,
                 req_id: request.req_id,
                 flags: FLAG_RESPONSE,
-                payload: serde_cbor::to_vec(&PublicShareList {
+                payload: crate::cbor::to_vec(&PublicShareList {
                     shares: vec![PublicShareSummary {
                         share_id: [1u8; 32],
                         share_pubkey: [2u8; 32],
@@ -1663,9 +1678,10 @@ async fn fetch_community_status_from_peer_roundtrip() {
                     r#type: MsgType::CommunityStatus as u16,
                     req_id: request.req_id,
                     flags: FLAG_RESPONSE,
-                    payload: serde_cbor::to_vec(&CommunityStatus {
+                    payload: crate::cbor::to_vec(&CommunityStatus {
                         community_share_id: share_id,
                         joined: true,
+                        membership_proof: None,
                     })?,
                 })
             }
@@ -2356,7 +2372,7 @@ async fn tcp_runtime_supports_relay_for_simulated_nat_peers() {
     assert_eq!(register_response.req_id, register_req_id);
     assert_ne!(register_response.flags & FLAG_RESPONSE, 0);
     let registered: RelayRegistered =
-        serde_cbor::from_slice(&register_response.payload).expect("decode registered");
+        crate::cbor::from_slice(&register_response.payload).expect("decode registered");
     tokio::time::sleep(Duration::from_millis(1100)).await;
 
     let renew_req_id = next_req_id();
@@ -2377,7 +2393,7 @@ async fn tcp_runtime_supports_relay_for_simulated_nat_peers() {
     assert_eq!(renew_response.req_id, renew_req_id);
     assert_ne!(renew_response.flags & FLAG_RESPONSE, 0);
     let renewed: RelayRegistered =
-        serde_cbor::from_slice(&renew_response.payload).expect("decode renewed");
+        crate::cbor::from_slice(&renew_response.payload).expect("decode renewed");
     assert_eq!(renewed.relay_slot_id, registered.relay_slot_id);
     assert!(renewed.expires_at > registered.expires_at);
 
@@ -2418,7 +2434,7 @@ async fn tcp_runtime_supports_relay_for_simulated_nat_peers() {
     assert_eq!(stream_response.req_id, stream_req_id);
     assert_ne!(stream_response.flags & FLAG_RESPONSE, 0);
     let relayed: RelayStream =
-        serde_cbor::from_slice(&stream_response.payload).expect("decode stream");
+        crate::cbor::from_slice(&stream_response.payload).expect("decode stream");
     assert_eq!(relayed.stream_id, 42);
     assert_eq!(relayed.kind, WireRelayPayloadKind::Control);
     assert_eq!(relayed.payload, b"nat-bridge".to_vec());
@@ -2645,7 +2661,7 @@ async fn download_from_peers_self_seeds_after_completion() {
             )
             .expect("provider entry should exist");
         let providers: crate::wire::Providers =
-            serde_cbor::from_slice(&val.value).expect("decode providers");
+            crate::cbor::from_slice(&val.value).expect("decode providers");
         assert!(
             providers.providers.contains(&client_self_addr),
             "client should be listed as a provider"
@@ -2694,7 +2710,7 @@ async fn reannounce_seeded_content_refreshes_dht_entries() {
             .dht
             .store(
                 crate::dht_keys::content_provider_key(&desc.content_id.0),
-                serde_cbor::to_vec(&empty).expect("encode"),
+                crate::cbor::to_vec(&empty).expect("encode"),
                 crate::dht::DEFAULT_TTL_SECS,
                 now,
             )
@@ -2719,7 +2735,8 @@ async fn reannounce_seeded_content_refreshes_dht_entries() {
                 now,
             )
             .expect("provider entry must exist");
-        let providers: crate::wire::Providers = serde_cbor::from_slice(&val.value).expect("decode");
+        let providers: crate::wire::Providers =
+            crate::cbor::from_slice(&val.value).expect("decode");
         assert!(
             providers.providers.contains(&self_addr),
             "self_addr should be re-announced"
@@ -2943,7 +2960,7 @@ async fn relayed_self_addr_wraps_with_relay_route() {
     };
     {
         let mut state = handle.state.write().await;
-        state.active_relay_slot = Some(ActiveRelaySlot {
+        state.active_relay_slots.push(ActiveRelaySlot {
             relay_addr: relay_addr.clone(),
             slot_id: 77,
             expires_at: 9999999999,
@@ -3064,7 +3081,7 @@ async fn tcp_relay_tunnel_forwards_chunk_request_to_firewalled_node() {
     assert_eq!(hashes_resp.r#type, MsgType::ChunkHashList as u16);
     assert_ne!(hashes_resp.flags & FLAG_RESPONSE, 0);
     let chunk_hashes: crate::wire::ChunkHashList =
-        serde_cbor::from_slice(&hashes_resp.payload).expect("decode chunk hashes");
+        crate::cbor::from_slice(&hashes_resp.payload).expect("decode chunk hashes");
     assert_eq!(chunk_hashes.hashes.len(), desc.chunk_count as usize);
 
     // Second request: GetChunk for the first chunk.
@@ -3084,7 +3101,7 @@ async fn tcp_relay_tunnel_forwards_chunk_request_to_firewalled_node() {
     assert_eq!(chunk_resp.r#type, MsgType::ChunkData as u16);
     assert_ne!(chunk_resp.flags & FLAG_RESPONSE, 0);
     let chunk_data: crate::wire::ChunkData =
-        serde_cbor::from_slice(&chunk_resp.payload).expect("decode chunk data");
+        crate::cbor::from_slice(&chunk_resp.payload).expect("decode chunk data");
     assert_eq!(chunk_data.bytes.len(), crate::content::CHUNK_SIZE);
     // Verify chunk hash matches.
     let computed_hash = blake3::hash(&chunk_data.bytes);
@@ -3217,4 +3234,557 @@ async fn tcp_relay_tunnel_full_content_download() {
     let _ = std::fs::remove_file(target_path);
 
     relay_task.abort();
+}
+
+/// Helper: bind a TCP port and return the address.
+async fn allocate_tcp_addr() -> std::net::SocketAddr {
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind probe");
+    let addr = probe.local_addr().expect("addr");
+    drop(probe);
+    addr
+}
+
+/// 5-node integration test: publisher -> 3 intermediary DHT nodes -> subscriber.
+///
+/// Validates DHT routing / convergence across a chain of 5 nodes where
+/// no single node has a direct peer entry for both publisher and subscriber.
+///
+/// Topology: `Pub <-> A <-> B <-> C <-> Sub`
+#[tokio::test]
+async fn five_node_dht_convergence_and_sync() {
+    let mut rng = OsRng;
+
+    // Create 5 nodes.
+    let publisher = Node::start(NodeConfig::default()).await.expect("pub");
+    let node_a = Node::start(NodeConfig::default()).await.expect("A");
+    let node_b = Node::start(NodeConfig::default()).await.expect("B");
+    let node_c = Node::start(NodeConfig::default()).await.expect("C");
+    let subscriber = Node::start(NodeConfig::default()).await.expect("sub");
+
+    // Generate signing keys and bind addresses.
+    let pub_key = SigningKey::generate(&mut rng);
+    let a_key = SigningKey::generate(&mut rng);
+    let b_key = SigningKey::generate(&mut rng);
+    let c_key = SigningKey::generate(&mut rng);
+    let sub_key = SigningKey::generate(&mut rng);
+
+    let pub_addr = allocate_tcp_addr().await;
+    let a_addr = allocate_tcp_addr().await;
+    let b_addr = allocate_tcp_addr().await;
+    let c_addr = allocate_tcp_addr().await;
+
+    // Start TCP services.
+    let pub_task = publisher.clone().start_tcp_dht_service(
+        pub_addr, pub_key.clone(), Capabilities::default(),
+    );
+    let a_task = node_a.clone().start_tcp_dht_service(
+        a_addr, a_key.clone(), Capabilities::default(),
+    );
+    let b_task = node_b.clone().start_tcp_dht_service(
+        b_addr, b_key.clone(), Capabilities::default(),
+    );
+    let c_task = node_c.clone().start_tcp_dht_service(
+        c_addr, c_key.clone(), Capabilities::default(),
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Build PeerAddr structs.
+    let pub_peer = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"), port: pub_addr.port(),
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(pub_key.verifying_key().to_bytes()), relay_via: None,
+    };
+    let a_peer = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"), port: a_addr.port(),
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(a_key.verifying_key().to_bytes()), relay_via: None,
+    };
+    let b_peer = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"), port: b_addr.port(),
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(b_key.verifying_key().to_bytes()), relay_via: None,
+    };
+    let c_peer = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"), port: c_addr.port(),
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(c_key.verifying_key().to_bytes()), relay_via: None,
+    };
+
+    // NodeId helpers.
+    let pub_nid = NodeId::from_pubkey_bytes(&pub_key.verifying_key().to_bytes());
+    let a_nid = NodeId::from_pubkey_bytes(&a_key.verifying_key().to_bytes());
+    let b_nid = NodeId::from_pubkey_bytes(&b_key.verifying_key().to_bytes());
+    let c_nid = NodeId::from_pubkey_bytes(&c_key.verifying_key().to_bytes());
+
+    // Wire up chain: Pub <-> A <-> B <-> C
+    // Each node knows its immediate neighbors.
+    publisher.dht_upsert_peer(pub_nid, a_nid, a_peer.clone()).await.expect("pub->A");
+    node_a.dht_upsert_peer(a_nid, pub_nid, pub_peer.clone()).await.expect("A->pub");
+    node_a.dht_upsert_peer(a_nid, b_nid, b_peer.clone()).await.expect("A->B");
+    node_b.dht_upsert_peer(b_nid, a_nid, a_peer.clone()).await.expect("B->A");
+    node_b.dht_upsert_peer(b_nid, c_nid, c_peer.clone()).await.expect("B->C");
+    node_c.dht_upsert_peer(c_nid, b_nid, b_peer.clone()).await.expect("C->B");
+
+    // Publisher publishes a share.
+    let share = ShareKeypair::new(SigningKey::generate(&mut rng));
+    let manifest = ManifestV1 {
+        version: 1,
+        share_pubkey: share.verifying_key().to_bytes(),
+        share_id: share.share_id().0,
+        seq: 1,
+        created_at: 1_700_000_500,
+        expires_at: None,
+        title: Some("five-node-test".into()),
+        description: Some("dht convergence integration".into()),
+        visibility: crate::manifest::ShareVisibility::Private,
+        communities: vec![],
+        items: vec![ItemV1 {
+            content_id: [55u8; 32],
+            size: 100,
+            name: "convergence.txt".into(),
+            path: None, mime: None,
+            tags: vec!["dht".into()],
+            chunk_count: 0,
+            chunk_list_hash: [0u8; 32],
+        }],
+        recommended_shares: vec![],
+        signature: None,
+    };
+    publisher.publish_share(manifest, &share).await.expect("publish");
+
+    // Subscriber subscribes and syncs via node C (which is 3 hops from publisher).
+    subscriber.subscribe_with_pubkey(
+        share.share_id(), Some(share.verifying_key().to_bytes())
+    ).await.expect("subscribe");
+
+    let sub_transport = TcpSessionTransport {
+        signing_key: sub_key,
+        capabilities: Capabilities::default(),
+    };
+    // Subscriber only knows about node_c directly — must route through C->B->A->Pub.
+    subscriber
+        .sync_subscriptions_over_dht(&sub_transport, &[c_peer])
+        .await
+        .expect("sync through 5-node chain");
+
+    // Verify the subscriber received the manifest.
+    let hits = subscriber
+        .search(SearchQuery { text: "convergence".into() })
+        .await
+        .expect("search");
+    assert_eq!(hits.len(), 1, "subscriber should find the item via DHT convergence");
+    assert_eq!(hits[0].content_id, [55u8; 32]);
+
+    pub_task.abort();
+    a_task.abort();
+    b_task.abort();
+    c_task.abort();
+}
+
+/// Two-provider concurrent download integration test.
+///
+/// Two nodes register the same content and the subscriber downloads from both
+/// providers in the seed list, validating swarm-style multi-peer retrieval.
+#[tokio::test]
+async fn multi_provider_concurrent_download() {
+    let mut rng = OsRng;
+
+    let provider1 = Node::start(NodeConfig::default()).await.expect("p1");
+    let provider2 = Node::start(NodeConfig::default()).await.expect("p2");
+    let subscriber = Node::start(NodeConfig::default()).await.expect("sub");
+
+    let p1_key = SigningKey::generate(&mut rng);
+    let p2_key = SigningKey::generate(&mut rng);
+    let sub_key = SigningKey::generate(&mut rng);
+
+    let p1_addr = allocate_tcp_addr().await;
+    let p2_addr = allocate_tcp_addr().await;
+
+    let p1_task = provider1.clone().start_tcp_dht_service(
+        p1_addr, p1_key.clone(), Capabilities::default(),
+    );
+    let p2_task = provider2.clone().start_tcp_dht_service(
+        p2_addr, p2_key.clone(), Capabilities::default(),
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let p1_peer = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"), port: p1_addr.port(),
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(p1_key.verifying_key().to_bytes()), relay_via: None,
+    };
+    let p2_peer = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"), port: p2_addr.port(),
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(p2_key.verifying_key().to_bytes()), relay_via: None,
+    };
+
+    // Both providers register the same content.
+    let content_dir1 = tempfile::tempdir().expect("tmpdir1");
+    let content_dir2 = tempfile::tempdir().expect("tmpdir2");
+    let payload = vec![42u8; crate::content::CHUNK_SIZE * 3 + 99];
+    let desc = crate::content::describe_content(&payload);
+
+    provider1
+        .register_content_from_bytes(p1_peer.clone(), &payload, content_dir1.path())
+        .await.expect("register p1");
+    provider2
+        .register_content_from_bytes(p2_peer.clone(), &payload, content_dir2.path())
+        .await.expect("register p2");
+
+    // Provider 1 publishes the share manifest.
+    let share = ShareKeypair::new(SigningKey::generate(&mut rng));
+    let manifest = ManifestV1 {
+        version: 1,
+        share_pubkey: share.verifying_key().to_bytes(),
+        share_id: share.share_id().0,
+        seq: 1, created_at: 1_700_000_600, expires_at: None,
+        title: Some("multi-provider".into()),
+        description: Some("concurrent download test".into()),
+        visibility: crate::manifest::ShareVisibility::Private,
+        communities: vec![],
+        items: vec![ItemV1 {
+            content_id: desc.content_id.0,
+            size: payload.len() as u64,
+            name: "multi-provider.bin".into(),
+            path: None, mime: None,
+            tags: vec!["multi".into()],
+            chunk_count: desc.chunk_count,
+            chunk_list_hash: desc.chunk_list_hash,
+        }],
+        recommended_shares: vec![],
+        signature: None,
+    };
+    provider1.publish_share(manifest, &share).await.expect("publish");
+
+    // Subscriber subscribes & syncs from provider1.
+    subscriber.subscribe_with_pubkey(
+        share.share_id(), Some(share.verifying_key().to_bytes())
+    ).await.expect("subscribe");
+
+    let transport = TcpSessionTransport {
+        signing_key: sub_key,
+        capabilities: Capabilities::default(),
+    };
+    subscriber
+        .sync_subscriptions_over_dht(&transport, std::slice::from_ref(&p1_peer))
+        .await.expect("sync");
+
+    // Download with BOTH providers in the seed list.
+    let target = std::env::temp_dir().join(format!(
+        "scp2p_multi_provider_{}.bin",
+        now_unix_secs().expect("now"),
+    ));
+    subscriber
+        .download_from_peers(
+            &transport,
+            &[p1_peer, p2_peer],
+            desc.content_id.0,
+            target.to_str().expect("utf8"),
+            &FetchPolicy::default(),
+            None,
+            None,
+        )
+        .await
+        .expect("download from multiple providers");
+
+    let read_back = std::fs::read(&target).expect("read target");
+    assert_eq!(read_back.len(), payload.len());
+    assert_eq!(read_back, payload);
+    let _ = std::fs::remove_file(target);
+
+    p1_task.abort();
+    p2_task.abort();
+}
+
+// ── Community membership token tests (§4.2) ─────────────────────────
+
+#[test]
+fn community_membership_token_issue_and_verify() {
+    use ed25519_dalek::SigningKey;
+    use rand::SeedableRng;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+    let community_key = SigningKey::generate(&mut rng);
+    let member_key = SigningKey::generate(&mut rng);
+    let member_pubkey = member_key.verifying_key().to_bytes();
+    let community_pubkey = community_key.verifying_key().to_bytes();
+
+    let token = CommunityMembershipToken::issue(
+        &community_key,
+        member_pubkey,
+        1_000_000,
+        2_000_000,
+    )
+    .expect("issue token");
+
+    // Verify should succeed.
+    token
+        .verify(&community_pubkey, Some(1_500_000))
+        .expect("token should verify");
+
+    // Verify with no timestamp check.
+    token
+        .verify(&community_pubkey, None)
+        .expect("token should verify without timestamp");
+}
+
+#[test]
+fn community_membership_token_rejects_expired() {
+    use ed25519_dalek::SigningKey;
+    use rand::SeedableRng;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(43);
+    let community_key = SigningKey::generate(&mut rng);
+    let member_key = SigningKey::generate(&mut rng);
+    let member_pubkey = member_key.verifying_key().to_bytes();
+    let community_pubkey = community_key.verifying_key().to_bytes();
+
+    let token = CommunityMembershipToken::issue(
+        &community_key,
+        member_pubkey,
+        1_000_000,
+        1_500_000,
+    )
+    .expect("issue token");
+
+    let err = token
+        .verify(&community_pubkey, Some(2_000_000))
+        .expect_err("expired token should fail");
+    assert!(err.to_string().contains("expired"));
+}
+
+#[test]
+fn community_membership_token_rejects_wrong_pubkey() {
+    use ed25519_dalek::SigningKey;
+    use rand::SeedableRng;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(44);
+    let community_key = SigningKey::generate(&mut rng);
+    let wrong_key = SigningKey::generate(&mut rng);
+    let member_key = SigningKey::generate(&mut rng);
+    let member_pubkey = member_key.verifying_key().to_bytes();
+    let wrong_pubkey = wrong_key.verifying_key().to_bytes();
+
+    let token = CommunityMembershipToken::issue(
+        &community_key,
+        member_pubkey,
+        1_000_000,
+        2_000_000,
+    )
+    .expect("issue token");
+
+    let err = token
+        .verify(&wrong_pubkey, None)
+        .expect_err("wrong pubkey should fail");
+    assert!(
+        err.to_string().contains("does not match")
+            || err.to_string().contains("signature"),
+        "error should indicate mismatch or signature failure: {err}"
+    );
+}
+
+#[test]
+fn community_membership_token_roundtrip_cbor() {
+    use ed25519_dalek::SigningKey;
+    use rand::SeedableRng;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(45);
+    let community_key = SigningKey::generate(&mut rng);
+    let member_key = SigningKey::generate(&mut rng);
+    let member_pubkey = member_key.verifying_key().to_bytes();
+    let community_pubkey = community_key.verifying_key().to_bytes();
+
+    let token = CommunityMembershipToken::issue(
+        &community_key,
+        member_pubkey,
+        100,
+        200,
+    )
+    .expect("issue token");
+
+    let bytes = crate::cbor::to_vec(&token).expect("encode token");
+    let decoded: CommunityMembershipToken =
+        crate::cbor::from_slice(&bytes).expect("decode token");
+    assert_eq!(decoded, token);
+
+    // Decoded copy should also verify
+    decoded
+        .verify(&community_pubkey, Some(150))
+        .expect("decoded token should verify");
+}
+
+#[tokio::test]
+async fn join_community_with_valid_token() {
+    use ed25519_dalek::SigningKey;
+    use rand::SeedableRng;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(46);
+    let community_key = SigningKey::generate(&mut rng);
+    let community_pubkey = community_key.verifying_key().to_bytes();
+    let community_vk = VerifyingKey::from_bytes(&community_pubkey).unwrap();
+    let community_share_id = ShareId::from_pubkey(&community_vk);
+
+    let node_key = SigningKey::generate(&mut rng);
+    let node_pubkey = node_key.verifying_key().to_bytes();
+
+    let token = CommunityMembershipToken::issue(
+        &community_key,
+        node_pubkey,
+        100,
+        999_999_999,
+    )
+    .expect("issue token");
+
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    handle
+        .join_community_with_token(
+            community_share_id,
+            community_pubkey,
+            Some(token),
+        )
+        .await
+        .expect("join with valid token");
+
+    let communities = handle.communities().await;
+    assert_eq!(communities.len(), 1);
+    assert!(
+        communities[0].membership_token.is_some(),
+        "persisted community should have token"
+    );
+}
+
+#[tokio::test]
+async fn join_community_with_invalid_token_rejected() {
+    use ed25519_dalek::SigningKey;
+    use rand::SeedableRng;
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(47);
+    let community_key = SigningKey::generate(&mut rng);
+    let wrong_key = SigningKey::generate(&mut rng);
+    let community_pubkey = community_key.verifying_key().to_bytes();
+    let community_vk = VerifyingKey::from_bytes(&community_pubkey).unwrap();
+    let community_share_id = ShareId::from_pubkey(&community_vk);
+
+    let node_key = SigningKey::generate(&mut rng);
+    let node_pubkey = node_key.verifying_key().to_bytes();
+
+    // Token signed by wrong key
+    let bad_token = CommunityMembershipToken::issue(
+        &wrong_key,
+        node_pubkey,
+        100,
+        999_999_999,
+    )
+    .expect("issue wrong token");
+    // Manually fix the community_share_id so the check reaches verification
+    let mut patched = bad_token;
+    patched.community_share_id = community_share_id.0;
+
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let err = handle
+        .join_community_with_token(
+            community_share_id,
+            community_pubkey,
+            Some(patched),
+        )
+        .await
+        .expect_err("invalid token should be rejected");
+    assert!(
+        err.to_string().contains("signature")
+            || err.to_string().contains("does not match"),
+        "error: {err}"
+    );
+}
+
+// ── §4.13 Handler coverage for PEX / HaveContent / RelayList ──
+
+#[tokio::test]
+async fn handle_pex_request_returns_pex_offer() {
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    // Seed a peer so there's something to return.
+    let seed_peer = PeerAddr {
+        ip: "10.0.0.5".parse().unwrap(),
+        port: 7005,
+        transport: TransportProtocol::Quic,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+    handle
+        .apply_pex_offer(PexOffer {
+            peers: vec![seed_peer],
+        })
+        .await
+        .expect("seed");
+
+    let req = Envelope::from_typed(
+        1,
+        0x0001,
+        &WirePayload::PexRequest(PexRequest { max_peers: 10 }),
+    )
+    .expect("encode");
+    let resp = handle.handle_incoming_envelope(req, None).await.unwrap();
+    assert_eq!(resp.r#type, MsgType::PexOffer as u16);
+    let decoded: PexOffer = crate::cbor::from_slice(&resp.payload).expect("decode");
+    assert_eq!(decoded.peers.len(), 1);
+}
+
+#[tokio::test]
+async fn handle_pex_offer_ingests_peers() {
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let offer_peer = PeerAddr {
+        ip: "10.0.0.6".parse().unwrap(),
+        port: 7006,
+        transport: TransportProtocol::Quic,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+    let req = Envelope::from_typed(
+        1,
+        0x0001,
+        &WirePayload::PexOffer(PexOffer {
+            peers: vec![offer_peer],
+        }),
+    )
+    .expect("encode");
+    let resp = handle.handle_incoming_envelope(req, None).await.unwrap();
+    assert_eq!(resp.r#type, MsgType::PexOffer as u16);
+    // Verify the peer was ingested.
+    let records = handle.peer_records().await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].addr.port, 7006);
+}
+
+#[tokio::test]
+async fn handle_have_content_returns_ack() {
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let req = Envelope::from_typed(
+        1,
+        0x0001,
+        &WirePayload::HaveContent(crate::wire::HaveContent {
+            content_id: [42u8; 32],
+        }),
+    )
+    .expect("encode");
+    let resp = handle.handle_incoming_envelope(req, None).await.unwrap();
+    assert_eq!(resp.r#type, MsgType::HaveContent as u16);
+    assert!(resp.payload.is_empty());
+}
+
+#[tokio::test]
+async fn handle_relay_list_request_returns_empty() {
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let req = Envelope::from_typed(
+        1,
+        0x0001,
+        &WirePayload::RelayListRequest(crate::wire::RelayListRequest { max_count: 10 }),
+    )
+    .expect("encode");
+    let resp = handle.handle_incoming_envelope(req, None).await.unwrap();
+    assert_eq!(resp.r#type, MsgType::RelayListResponse as u16);
+    let decoded: crate::wire::RelayListResponse =
+        crate::cbor::from_slice(&resp.payload).expect("decode");
+    assert!(decoded.announcements.is_empty());
 }

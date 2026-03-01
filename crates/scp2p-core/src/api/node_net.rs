@@ -6,7 +6,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //! Network / sync / download / wire-serving operations on `NodeHandle`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ed25519_dalek::VerifyingKey;
@@ -17,7 +17,7 @@ use crate::{
     ids::{ContentId, ShareId},
     manifest::{ManifestV1, ShareVisibility},
     net_fetch::{
-        download_swarm_over_network, fetch_chunk_hashes_with_retry, fetch_manifest_with_retry,
+        download_swarm_to_file, fetch_chunk_hashes_with_retry, fetch_manifest_with_retry,
         FetchPolicy, PeerConnector, ProgressCallback, RelayAwareTransport, RequestTransport,
     },
     peer::PeerAddr,
@@ -25,8 +25,8 @@ use crate::{
     transport::{read_envelope, write_envelope},
     wire::{
         ChunkData, CommunityPublicShareList, CommunityStatus, Envelope, FindNode, FindNodeResult,
-        FindValueResult, MsgType, Providers, PublicShareList, RelayRegister, Store as WireStore,
-        WirePayload, FLAG_RESPONSE,
+        FindValueResult, MsgType, PexOffer, Providers, PublicShareList,
+        RelayListResponse, RelayRegister, Store as WireStore, WirePayload, FLAG_RESPONSE,
     },
 };
 
@@ -62,7 +62,7 @@ impl NodeHandle {
                 continue;
             };
 
-            let head: crate::manifest::ShareHead = serde_cbor::from_slice(&head_val.value)?;
+            let head: crate::manifest::ShareHead = crate::cbor::from_slice(&head_val.value)?;
             if let Some(pubkey) = share_pubkey {
                 head.verify_with_pubkey(pubkey)?;
             }
@@ -96,6 +96,12 @@ impl NodeHandle {
             }
         }
         drop(state);
+        {
+            let mut s = self.state.write().await;
+            s.dirty.subscriptions = true;
+            s.dirty.search_index = true;
+            s.dirty.manifests = true;
+        }
         persist_state(self).await
     }
 
@@ -158,6 +164,7 @@ impl NodeHandle {
                 state
                     .manifest_cache
                     .insert(head.latest_manifest_id, fetched.clone());
+                state.dirty.manifests = true;
                 drop(state);
                 persist_state(self).await?;
                 fetched
@@ -184,6 +191,9 @@ impl NodeHandle {
                     sub.latest_seq = head.latest_seq;
                     sub.latest_manifest_id = Some(head.latest_manifest_id);
                 }
+                state.dirty.subscriptions = true;
+                state.dirty.search_index = true;
+                state.dirty.manifests = true;
             }
             persist_state(self).await?;
         }
@@ -301,6 +311,7 @@ impl NodeHandle {
                     completed_chunks: vec![],
                 },
             );
+            state.dirty.partial_downloads = true;
         }
         persist_state(self).await
     }
@@ -317,6 +328,7 @@ impl NodeHandle {
                     partial.completed_chunks.push(chunk_index);
                 }
             }
+            state.dirty.partial_downloads = true;
         }
         persist_state(self).await
     }
@@ -325,6 +337,7 @@ impl NodeHandle {
         {
             let mut state = self.state.write().await;
             state.partial_downloads.remove(&content_id);
+            state.dirty.partial_downloads = true;
         }
         persist_state(self).await
     }
@@ -337,6 +350,7 @@ impl NodeHandle {
         {
             let mut state = self.state.write().await;
             state.encrypted_node_key = Some(encrypt_secret(key_material, passphrase)?);
+            state.dirty.node_key = true;
         }
         persist_state(self).await
     }
@@ -347,6 +361,57 @@ impl NodeHandle {
             return Ok(None);
         };
         Ok(Some(decrypt_secret(encrypted, passphrase)?))
+    }
+
+    /// Encrypt all in-memory publisher identity secrets with `passphrase`.
+    ///
+    /// After this call the plaintext secrets remain in memory (for
+    /// runtime use) but are persisted in encrypted form only.
+    pub async fn encrypt_publisher_identities(&self, passphrase: &str) -> anyhow::Result<()> {
+        {
+            let mut state = self.state.write().await;
+            let mut encrypted_map = HashMap::new();
+            for (label, secret) in &state.publisher_identities {
+                encrypted_map.insert(label.clone(), encrypt_secret(secret.as_ref(), passphrase)?);
+            }
+            state.encrypted_publisher_secrets = encrypted_map;
+            state.dirty.publisher_identities = true;
+        }
+        persist_state(self).await
+    }
+
+    /// Decrypt persisted publisher identity secrets that were encrypted
+    /// with [`encrypt_publisher_identities`].  After this call the
+    /// plaintext secrets are available for use by
+    /// [`ensure_publisher_identity`] and related APIs.
+    pub async fn unlock_publisher_identities(&self, passphrase: &str) -> anyhow::Result<usize> {
+        let persisted = {
+            let state = self.state.read().await;
+            state.store.load_state().await?
+        };
+        let mut decrypted_count = 0usize;
+        let mut state = self.state.write().await;
+        for identity in &persisted.publisher_identities {
+            if state.publisher_identities.contains_key(&identity.label) {
+                continue; // already unlocked
+            }
+            if let Some(encrypted) = &identity.encrypted_share_secret {
+                let plaintext = decrypt_secret(encrypted, passphrase)?;
+                if plaintext.len() != 32 {
+                    anyhow::bail!(
+                        "decrypted publisher secret for '{}' has wrong length",
+                        identity.label
+                    );
+                }
+                let mut secret = [0u8; 32];
+                secret.copy_from_slice(&plaintext);
+                state
+                    .publisher_identities
+                    .insert(identity.label.clone(), secret);
+                decrypted_count += 1;
+            }
+        }
+        Ok(decrypted_count)
     }
 
     pub async fn fetch_manifest_from_peers<C: PeerConnector>(
@@ -362,6 +427,8 @@ impl NodeHandle {
             let mut state = self.state.write().await;
             state.manifest_cache.insert(manifest_id, manifest.clone());
             state.search_index.index_manifest(&manifest);
+            state.dirty.manifests = true;
+            state.dirty.search_index = true;
         }
         persist_state(self).await?;
         Ok(manifest)
@@ -401,6 +468,7 @@ impl NodeHandle {
                     completed_chunks: vec![],
                 },
             );
+            state.dirty.partial_downloads = true;
             content
         };
         persist_state(self).await?;
@@ -411,7 +479,7 @@ impl NodeHandle {
             let mut state = self.state.write().await;
             let now = now_unix_secs()?;
             if let Some(val) = state.dht.find_value(content_provider_key(&content_id), now) {
-                if let Ok(providers) = serde_cbor::from_slice::<Providers>(&val.value) {
+                if let Ok(providers) = crate::cbor::from_slice::<Providers>(&val.value) {
                     for p in providers.providers {
                         if !all_peers.contains(&p) {
                             all_peers.push(p);
@@ -448,26 +516,30 @@ impl NodeHandle {
             content.chunks.clone()
         };
 
-        let bytes = download_swarm_over_network(
+        let target_pb = PathBuf::from(target_path);
+        download_swarm_to_file(
             &transport,
             &all_peers,
             content_id,
             &chunk_hashes,
             policy,
+            &target_pb,
             on_progress,
         )
         .await?;
-        std::fs::write(target_path, &bytes)?;
 
         // ── Gap 1: self-seed — register file path as provider (no blob copy) ──
         if let Some(addr) = self_addr {
-            self.register_content_by_path(addr, &bytes, PathBuf::from(target_path))
+            let bytes = std::fs::read(&target_pb)?;
+            self.register_content_by_path(addr, &bytes, target_pb)
                 .await?;
         }
 
         {
             let mut state = self.state.write().await;
             state.partial_downloads.remove(&content_id);
+            state.dirty.partial_downloads = true;
+            state.dirty.content_paths = true;
         }
         persist_state(self).await
     }
@@ -509,7 +581,7 @@ impl NodeHandle {
                         && resp.r#type == MsgType::RelayRegistered as u16
                     {
                         let registered: crate::wire::RelayRegistered =
-                            serde_cbor::from_slice(&resp.payload)?;
+                            crate::cbor::from_slice(&resp.payload)?;
                         return self
                             .run_relay_bridge(stream, registered.relay_slot_id, remote_peer)
                             .await;
@@ -576,7 +648,9 @@ impl NodeHandle {
             WirePayload::FindNode(msg) => self
                 .dht_find_node(msg)
                 .await
-                .and_then(|peers| serde_cbor::to_vec(&FindNodeResult { peers }).map_err(Into::into))
+                .and_then(|peers| {
+                    crate::cbor::to_vec(&FindNodeResult { peers }).map_err(Into::into)
+                })
                 .map(|payload| Envelope {
                     r#type: MsgType::FindNode as u16,
                     req_id,
@@ -617,7 +691,7 @@ impl NodeHandle {
                             closer_peers,
                         }
                     })
-                    .and_then(|result| serde_cbor::to_vec(&result).map_err(Into::into))
+                    .and_then(|result| crate::cbor::to_vec(&result).map_err(Into::into))
                     .map(|payload| Envelope {
                         r#type: MsgType::FindValue as u16,
                         req_id,
@@ -638,7 +712,7 @@ impl NodeHandle {
                     maybe
                         .ok_or_else(|| anyhow::anyhow!("manifest not found"))
                         .and_then(|bytes| {
-                            serde_cbor::to_vec(&crate::wire::ManifestData {
+                            crate::cbor::to_vec(&crate::wire::ManifestData {
                                 manifest_id: msg.manifest_id,
                                 bytes,
                             })
@@ -655,7 +729,7 @@ impl NodeHandle {
                 .list_local_public_shares(msg.max_entries as usize)
                 .await
                 .and_then(|shares| {
-                    serde_cbor::to_vec(&PublicShareList { shares }).map_err(Into::into)
+                    crate::cbor::to_vec(&PublicShareList { shares }).map_err(Into::into)
                 })
                 .map(|payload| Envelope {
                     r#type: MsgType::PublicShareList as u16,
@@ -664,24 +738,35 @@ impl NodeHandle {
                     payload,
                 }),
             WirePayload::GetCommunityStatus(msg) => {
-                let joined = match VerifyingKey::from_bytes(&msg.community_share_pubkey) {
-                    Ok(pubkey) if ShareId::from_pubkey(&pubkey).0 == msg.community_share_id => self
-                        .state
-                        .read()
-                        .await
-                        .communities
-                        .contains_key(&msg.community_share_id),
-                    _ => {
-                        return Some(error_envelope(
-                            req_type,
-                            req_id,
-                            "community share_id does not match share_pubkey",
-                        ));
-                    }
-                };
-                serde_cbor::to_vec(&CommunityStatus {
+                let (joined, proof) =
+                    match VerifyingKey::from_bytes(&msg.community_share_pubkey) {
+                        Ok(pubkey)
+                            if ShareId::from_pubkey(&pubkey).0 == msg.community_share_id =>
+                        {
+                            let state = self.state.read().await;
+                            match state.communities.get(&msg.community_share_id) {
+                                Some(membership) => {
+                                    let proof = membership
+                                        .token
+                                        .as_ref()
+                                        .and_then(|t| crate::cbor::to_vec(t).ok());
+                                    (true, proof)
+                                }
+                                None => (false, None),
+                            }
+                        }
+                        _ => {
+                            return Some(error_envelope(
+                                req_type,
+                                req_id,
+                                "community share_id does not match share_pubkey",
+                            ));
+                        }
+                    };
+                crate::cbor::to_vec(&CommunityStatus {
                     community_share_id: msg.community_share_id,
                     joined,
+                    membership_proof: proof,
                 })
                 .map_err(Into::into)
                 .map(|payload| Envelope {
@@ -699,7 +784,7 @@ impl NodeHandle {
                 )
                 .await
                 .and_then(|shares| {
-                    serde_cbor::to_vec(&CommunityPublicShareList {
+                    crate::cbor::to_vec(&CommunityPublicShareList {
                         community_share_id: msg.community_share_id,
                         shares,
                     })
@@ -718,7 +803,7 @@ impl NodeHandle {
                     maybe
                         .ok_or_else(|| anyhow::anyhow!("chunk not found"))
                         .and_then(|bytes| {
-                            serde_cbor::to_vec(&ChunkData {
+                            crate::cbor::to_vec(&ChunkData {
                                 content_id: msg.content_id,
                                 chunk_index: msg.chunk_index,
                                 bytes,
@@ -739,7 +824,7 @@ impl NodeHandle {
                     maybe
                         .ok_or_else(|| anyhow::anyhow!("chunk hashes not found"))
                         .and_then(|hashes| {
-                            serde_cbor::to_vec(&crate::wire::ChunkHashList {
+                            crate::cbor::to_vec(&crate::wire::ChunkHashList {
                                 content_id: msg.content_id,
                                 hashes,
                             })
@@ -765,7 +850,7 @@ impl NodeHandle {
                 };
                 self.relay_register_with_slot(peer.clone(), relay_slot_id)
                     .await
-                    .and_then(|registered| serde_cbor::to_vec(&registered).map_err(Into::into))
+                    .and_then(|registered| crate::cbor::to_vec(&registered).map_err(Into::into))
                     .map(|payload| Envelope {
                         r#type: MsgType::RelayRegistered as u16,
                         req_id,
@@ -836,7 +921,7 @@ impl NodeHandle {
                                 kind: msg.kind,
                                 payload: response_payload,
                             };
-                            serde_cbor::to_vec(&relay_stream_response)
+                            crate::cbor::to_vec(&relay_stream_response)
                                 .map_err(|e| anyhow::anyhow!(e))
                                 .map(|payload| Envelope {
                                     r#type: MsgType::RelayStream as u16,
@@ -851,7 +936,7 @@ impl NodeHandle {
                     // Fallback: in-process relay logic (no tunnel active).
                     self.relay_stream(peer.clone(), msg)
                         .await
-                        .and_then(|relayed| serde_cbor::to_vec(&relayed).map_err(Into::into))
+                        .and_then(|relayed| crate::cbor::to_vec(&relayed).map_err(Into::into))
                         .map(|payload| Envelope {
                             r#type: MsgType::RelayStream as u16,
                             req_id,
@@ -859,6 +944,65 @@ impl NodeHandle {
                             payload,
                         })
                 }
+            }
+            // ── PEX: ingest offered peers ────────────────────────────
+            WirePayload::PexOffer(msg) => {
+                let now = now_unix_secs().unwrap_or(0);
+                let mut state = self.state.write().await;
+                for peer in &msg.peers {
+                    state.peer_db.upsert_seen(peer.clone(), now);
+                }
+                state.dirty.peers = true;
+                // PexOffer is fire-and-forget; return empty ack.
+                Ok(Envelope {
+                    r#type: MsgType::PexOffer as u16,
+                    req_id,
+                    flags: FLAG_RESPONSE,
+                    payload: vec![],
+                })
+            }
+            // ── PEX: respond with sampled fresh peers ────────────────
+            WirePayload::PexRequest(msg) => {
+                let now = now_unix_secs().unwrap_or(0);
+                let state = self.state.read().await;
+                let peers = state.peer_db.sample_fresh(now, msg.max_peers as usize);
+                crate::cbor::to_vec(&PexOffer { peers })
+                    .map_err(Into::into)
+                    .map(|payload| Envelope {
+                        r#type: MsgType::PexOffer as u16,
+                        req_id,
+                        flags: FLAG_RESPONSE,
+                        payload,
+                    })
+            }
+            // ── Provider hint: peer advertises it has content ────────
+            WirePayload::HaveContent(_msg) => {
+                // Acknowledged but not stored — provider hints are
+                // managed via DHT STORE in the current architecture.
+                Ok(Envelope {
+                    r#type: MsgType::HaveContent as u16,
+                    req_id,
+                    flags: FLAG_RESPONSE,
+                    payload: vec![],
+                })
+            }
+            // ── Relay-PEX: respond with known relay announcements ────
+            WirePayload::RelayListRequest(msg) => {
+                let state = self.state.read().await;
+                let announcements = state
+                    .relay
+                    .known_announcements()
+                    .into_iter()
+                    .take(msg.max_count as usize)
+                    .collect();
+                crate::cbor::to_vec(&RelayListResponse { announcements })
+                    .map_err(Into::into)
+                    .map(|payload| Envelope {
+                        r#type: MsgType::RelayListResponse as u16,
+                        req_id,
+                        flags: FLAG_RESPONSE,
+                        payload,
+                    })
             }
             _ => Err(anyhow::anyhow!("unsupported message type")),
         };
@@ -873,7 +1017,7 @@ impl NodeHandle {
         Ok(state
             .manifest_cache
             .get(&manifest_id)
-            .map(serde_cbor::to_vec)
+            .map(crate::cbor::to_vec)
             .transpose()?)
     }
 
@@ -929,7 +1073,7 @@ impl NodeHandle {
             let mut providers: Providers = state
                 .dht
                 .find_value(content_provider_key(content_id), now)
-                .and_then(|v| serde_cbor::from_slice(&v.value).ok())
+                .and_then(|v| crate::cbor::from_slice(&v.value).ok())
                 .unwrap_or(Providers {
                     content_id: *content_id,
                     providers: vec![],
@@ -943,7 +1087,7 @@ impl NodeHandle {
 
             state.dht.store(
                 content_provider_key(content_id),
-                serde_cbor::to_vec(&providers)?,
+                crate::cbor::to_vec(&providers)?,
                 crate::dht::DEFAULT_TTL_SECS,
                 now,
             )?;
@@ -997,7 +1141,7 @@ impl NodeHandle {
                     // Fallback: if the publisher also stores it in
                     // `published_share_heads`, encode from there.
                     match state.published_share_heads.get(&share_id) {
-                        Some(head) => match serde_cbor::to_vec(head) {
+                        Some(head) => match crate::cbor::to_vec(head) {
                             Ok(enc) => enc,
                             Err(_) => continue,
                         },

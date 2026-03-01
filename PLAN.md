@@ -32,12 +32,13 @@ Spec mapping and gaps:
 - Milestone 5: local subscription-scoped search
 - Milestone 6: provider hints + verified swarm download foundations
 - Milestone 7: relay register/connect/stream primitives
+- Milestone 8: relay tunnel bridging for firewalled nodes (relay_via in PeerAddr, RelayTunnelRegistry, RelayAwareTransport, register_relay_tunnel, relay-tunneled downloads)
 - Parallel chunk downloading via `FuturesUnordered` (bounded concurrency, peer scoring, retry queue)
 - Seeder swarm: self-seed after download, DHT provider lookup before download, periodic re-announcement
 - Desktop Tauri frontend: unified Discover page, rewritten Dashboard, simplified Sidebar
 
 ### Test count
-**125 tests passing** (115 scp2p-core + 10 scp2p-desktop), 0 clippy warnings.
+**129 tests passing** (119 scp2p-core + 10 scp2p-desktop), 0 clippy warnings.
 
 ### Quality level
 - Functional prototype logic exists and is well covered by unit tests.
@@ -238,20 +239,39 @@ New tests: `download_from_peers_self_seeds_after_completion`, `reannounce_seeded
 
 Status: **In progress**
 
-- relay message handling wired in live TCP runtime dispatcher
-- simulated NAT-style relay integration coverage added
-- relay slot keepalive renewal baseline implemented
-- relay selection/rotation baseline implemented
-- relay quota baseline implemented with control-only default and explicit content opt-in
-- adaptive relay gating baseline implemented
+### Done
+- ✅ relay message handling wired in live TCP runtime dispatcher
+- ✅ simulated NAT-style relay integration coverage added
+- ✅ relay slot keepalive renewal baseline implemented
+- ✅ relay selection/rotation baseline implemented
+- ✅ relay quota baseline implemented with control-only default and explicit content opt-in
+- ✅ adaptive relay gating baseline implemented
+- ✅ `relay_via` field added to `PeerAddr` with backward-compatible CBOR serde
+- ✅ `RelayTunnelRegistry` — register/forward/remove bridge channels for firewalled peers
+- ✅ `run_relay_bridge` — relay node holds persistent TCP to firewalled node, forwards envelopes from downloaders
+- ✅ `register_relay_tunnel` — firewalled node connects to relay, registers tunnel, spawns `serve_wire_stream` on persistent connection
+- ✅ `RelayAwareTransport` — transparent relay-tunneled downloads (wraps `PeerConnector`)
+- ✅ `relayed_self_addr` — provider address wrapping with relay routing info
+- ✅ Desktop provider functions (`publish_files`, `publish_text_share`, `publish_folder`) use relay-wrapped addresses
+- ✅ End-to-end relay tunnel tests: registry unit test, address wrapping, chunk request through relay, full multi-chunk download through relay
 
-Current relay support is foundational only. Extend to:
+### Remaining
+
+#### Relay discovery (not yet implemented)
+- **LAN relay discovery**: `LanDiscoveryAnnouncement` currently only broadcasts `{ version, instance_id, tcp_port }` — does NOT include `relay: bool` capability. Firewalled LAN nodes cannot discover relay-capable peers without connecting and doing a handshake first.
+- **Peer capability persistence**: `PeerRecord` stores `{ addr, last_seen_unix }` only — capabilities from handshake (`relay`, `dht`, `store`, `content_seed`) are learned but discarded. Need to persist `Capabilities` in `PeerRecord` so relay-capable peers can be identified without reconnecting.
+- **DHT relay announcement**: No mechanism to publish "I am a relay" to the DHT. Needed so peers beyond the LAN/bootstrap can discover public relays.
+- **Relay swarm / network of relays**: Once an initial relay is found (LAN, bootstrap, or DHT), the network should surface other known relays for load balancing. A peer with `relay=true` should be able to return a list of other known relays.
+- **Sharing links with relay hints**: When generating a sharing link, if the publisher knows public relays, include them in the link so the recipient can tunnel through them immediately. See `RELAY_IN_SHARES_CONCEPT.md` for design notes.
+
+#### Hardening (deferred)
 - stream routing tables between requester and owner
 - keepalive + expiry renewal hardening
 - relay selection/rotation hardening under larger dynamic networks
 - optional relay throughput caps
 - control-only mode default
 - optional limited content relay mode with stricter dynamic quotas/reputation coupling
+- auto-registration at app startup when node detects it is firewalled
 
 ## 5. DHT Hardening Plan
 
