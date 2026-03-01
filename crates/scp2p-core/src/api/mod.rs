@@ -28,8 +28,8 @@ use tokio::sync::RwLock;
 
 use crate::{
     config::NodeConfig,
-    content::{chunk_hashes, ChunkedContent},
-    dht::{Dht, DEFAULT_TTL_SECS},
+    content::{ChunkedContent, chunk_hashes},
+    dht::{DEFAULT_TTL_SECS, Dht},
     dht_keys::share_head_key,
     ids::{ContentId, ShareId},
     manifest::{ManifestV1, PublicShareSummary, ShareHead, ShareKeypair, ShareVisibility},
@@ -39,8 +39,8 @@ use crate::{
     relay::{RelayManager, RelayTunnelRegistry},
     search::SearchIndex,
     store::{
-        EncryptedSecret, MemoryStore, PersistedCommunity, PersistedPartialDownload,
-        PersistedPublisherIdentity, PersistedState, PersistedSubscription, Store, DirtyFlags,
+        DirtyFlags, EncryptedSecret, MemoryStore, PersistedCommunity, PersistedPartialDownload,
+        PersistedPublisherIdentity, PersistedState, PersistedSubscription, Store,
     },
     wire::{PexOffer, PexRequest},
 };
@@ -146,10 +146,8 @@ impl CommunityMembershipToken {
         expires_at: u64,
     ) -> anyhow::Result<Self> {
         let community_pubkey = community_signing_key.verifying_key().to_bytes();
-        let community_share_id = ShareId::from_pubkey(
-            &VerifyingKey::from_bytes(&community_pubkey)?,
-        )
-        .0;
+        let community_share_id =
+            ShareId::from_pubkey(&VerifyingKey::from_bytes(&community_pubkey)?).0;
 
         let signable = MembershipTokenSignable(
             community_share_id,
@@ -170,11 +168,7 @@ impl CommunityMembershipToken {
 
     /// Verify this token against a community's public key and an
     /// optional `now_unix` timestamp (for expiry checking).
-    pub fn verify(
-        &self,
-        community_pubkey: &[u8; 32],
-        now_unix: Option<u64>,
-    ) -> anyhow::Result<()> {
+    pub fn verify(&self, community_pubkey: &[u8; 32], now_unix: Option<u64>) -> anyhow::Result<()> {
         // Verify the share_id matches the pubkey.
         let vk = VerifyingKey::from_bytes(community_pubkey)?;
         let expected_id = ShareId::from_pubkey(&vk).0;
@@ -183,10 +177,10 @@ impl CommunityMembershipToken {
         }
 
         // Verify expiry.
-        if let Some(now) = now_unix {
-            if now > self.expires_at {
-                anyhow::bail!("community membership token expired");
-            }
+        if let Some(now) = now_unix
+            && now > self.expires_at
+        {
+            anyhow::bail!("community membership token expired");
         }
 
         // Verify signature.
@@ -572,9 +566,10 @@ impl NodeState {
             .map(|(share_id, membership)| PersistedCommunity {
                 share_id: *share_id,
                 share_pubkey: membership.pubkey,
-                membership_token: membership.token.as_ref().and_then(|t| {
-                    crate::cbor::to_vec(t).ok()
-                }),
+                membership_token: membership
+                    .token
+                    .as_ref()
+                    .and_then(|t| crate::cbor::to_vec(t).ok()),
             })
             .collect();
         let publisher_identities = self
@@ -738,9 +733,10 @@ impl NodeHandle {
             .map(|(share_id, membership)| PersistedCommunity {
                 share_id: *share_id,
                 share_pubkey: membership.pubkey,
-                membership_token: membership.token.as_ref().and_then(|t| {
-                    crate::cbor::to_vec(t).ok()
-                }),
+                membership_token: membership
+                    .token
+                    .as_ref()
+                    .and_then(|t| crate::cbor::to_vec(t).ok()),
             })
             .collect()
     }

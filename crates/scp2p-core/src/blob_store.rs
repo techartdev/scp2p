@@ -84,8 +84,10 @@ mod tests {
         assert!(read_chunk_from_path(tmp.path(), 3).unwrap().is_none());
 
         // Non-existent file
-        assert!(read_chunk_from_path(Path::new("/no/such/file"), 0)
-            .unwrap()
-            .is_none());
+        assert!(
+            read_chunk_from_path(Path::new("/no/such/file"), 0)
+                .unwrap()
+                .is_none()
+        );
     }
 }

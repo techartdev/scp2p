@@ -6,7 +6,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use std::collections::HashMap;
 
-use rand::{seq::SliceRandom, SeedableRng};
+use rand::{SeedableRng, seq::SliceRandom};
 use serde::{Deserialize, Serialize};
 
 use crate::capabilities::Capabilities;

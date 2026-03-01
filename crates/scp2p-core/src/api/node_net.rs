@@ -17,25 +17,25 @@ use crate::{
     ids::{ContentId, ShareId},
     manifest::{ManifestV1, ShareVisibility},
     net_fetch::{
-        download_swarm_to_file, fetch_chunk_hashes_with_retry, fetch_manifest_with_retry,
         FetchPolicy, PeerConnector, ProgressCallback, RelayAwareTransport, RequestTransport,
+        download_swarm_to_file, fetch_chunk_hashes_with_retry, fetch_manifest_with_retry,
     },
     peer::PeerAddr,
-    store::{decrypt_secret, encrypt_secret, PersistedPartialDownload},
+    store::{PersistedPartialDownload, decrypt_secret, encrypt_secret},
     transport::{read_envelope, write_envelope},
     wire::{
-        ChunkData, CommunityPublicShareList, CommunityStatus, Envelope, FindNode, FindNodeResult,
-        FindValueResult, MsgType, PexOffer, Providers, PublicShareList,
-        RelayListResponse, RelayRegister, Store as WireStore, WirePayload, FLAG_RESPONSE,
+        ChunkData, CommunityPublicShareList, CommunityStatus, Envelope, FLAG_RESPONSE, FindNode,
+        FindNodeResult, FindValueResult, MsgType, PexOffer, Providers, PublicShareList,
+        RelayListResponse, RelayRegister, Store as WireStore, WirePayload,
     },
 };
 
 use super::{
+    NodeHandle, SearchPage, SearchPageQuery, SearchQuery, SearchResult, SearchTrustFilter,
     helpers::{
         build_search_snippet, error_envelope, merge_peer_list, now_unix_secs, persist_state,
         request_class, validate_dht_value_for_known_keyspaces,
     },
-    NodeHandle, SearchPage, SearchPageQuery, SearchQuery, SearchResult, SearchTrustFilter,
 };
 
 impl NodeHandle {
@@ -323,10 +323,10 @@ impl NodeHandle {
     ) -> anyhow::Result<()> {
         {
             let mut state = self.state.write().await;
-            if let Some(partial) = state.partial_downloads.get_mut(&content_id) {
-                if !partial.completed_chunks.contains(&chunk_index) {
-                    partial.completed_chunks.push(chunk_index);
-                }
+            if let Some(partial) = state.partial_downloads.get_mut(&content_id)
+                && !partial.completed_chunks.contains(&chunk_index)
+            {
+                partial.completed_chunks.push(chunk_index);
             }
             state.dirty.partial_downloads = true;
         }
@@ -478,12 +478,12 @@ impl NodeHandle {
         {
             let mut state = self.state.write().await;
             let now = now_unix_secs()?;
-            if let Some(val) = state.dht.find_value(content_provider_key(&content_id), now) {
-                if let Ok(providers) = crate::cbor::from_slice::<Providers>(&val.value) {
-                    for p in providers.providers {
-                        if !all_peers.contains(&p) {
-                            all_peers.push(p);
-                        }
+            if let Some(val) = state.dht.find_value(content_provider_key(&content_id), now)
+                && let Ok(providers) = crate::cbor::from_slice::<Providers>(&val.value)
+            {
+                for p in providers.providers {
+                    if !all_peers.contains(&p) {
+                        all_peers.push(p);
                     }
                 }
             }
@@ -575,18 +575,16 @@ impl NodeHandle {
 
             // If this was a tunnel RelayRegister and the response was
             // successful (RelayRegistered), transition to bridge mode.
-            if let Some(_reg) = tunnel_request {
-                if let Some(resp) = response {
-                    if resp.flags & FLAG_RESPONSE != 0
-                        && resp.r#type == MsgType::RelayRegistered as u16
-                    {
-                        let registered: crate::wire::RelayRegistered =
-                            crate::cbor::from_slice(&resp.payload)?;
-                        return self
-                            .run_relay_bridge(stream, registered.relay_slot_id, remote_peer)
-                            .await;
-                    }
-                }
+            if let Some(_reg) = tunnel_request
+                && let Some(resp) = response
+                && resp.flags & FLAG_RESPONSE != 0
+                && resp.r#type == MsgType::RelayRegistered as u16
+            {
+                let registered: crate::wire::RelayRegistered =
+                    crate::cbor::from_slice(&resp.payload)?;
+                return self
+                    .run_relay_bridge(stream, registered.relay_slot_id, remote_peer)
+                    .await;
             }
         }
     }
@@ -738,31 +736,28 @@ impl NodeHandle {
                     payload,
                 }),
             WirePayload::GetCommunityStatus(msg) => {
-                let (joined, proof) =
-                    match VerifyingKey::from_bytes(&msg.community_share_pubkey) {
-                        Ok(pubkey)
-                            if ShareId::from_pubkey(&pubkey).0 == msg.community_share_id =>
-                        {
-                            let state = self.state.read().await;
-                            match state.communities.get(&msg.community_share_id) {
-                                Some(membership) => {
-                                    let proof = membership
-                                        .token
-                                        .as_ref()
-                                        .and_then(|t| crate::cbor::to_vec(t).ok());
-                                    (true, proof)
-                                }
-                                None => (false, None),
+                let (joined, proof) = match VerifyingKey::from_bytes(&msg.community_share_pubkey) {
+                    Ok(pubkey) if ShareId::from_pubkey(&pubkey).0 == msg.community_share_id => {
+                        let state = self.state.read().await;
+                        match state.communities.get(&msg.community_share_id) {
+                            Some(membership) => {
+                                let proof = membership
+                                    .token
+                                    .as_ref()
+                                    .and_then(|t| crate::cbor::to_vec(t).ok());
+                                (true, proof)
                             }
+                            None => (false, None),
                         }
-                        _ => {
-                            return Some(error_envelope(
-                                req_type,
-                                req_id,
-                                "community share_id does not match share_pubkey",
-                            ));
-                        }
-                    };
+                    }
+                    _ => {
+                        return Some(error_envelope(
+                            req_type,
+                            req_id,
+                            "community share_id does not match share_pubkey",
+                        ));
+                    }
+                };
                 crate::cbor::to_vec(&CommunityStatus {
                     community_share_id: msg.community_share_id,
                     joined,

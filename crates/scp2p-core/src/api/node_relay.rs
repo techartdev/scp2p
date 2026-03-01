@@ -7,20 +7,20 @@
 //! Relay operations on `NodeHandle`: register, connect, stream, peer selection.
 
 use crate::{
-    net_fetch::{send_request_on_stream, PeerConnector},
+    net_fetch::{PeerConnector, send_request_on_stream},
     peer::PeerAddr,
     relay::RelayLimits,
     wire::{
-        Envelope, MsgType, RelayConnect, RelayPayloadKind as WireRelayPayloadKind, RelayRegister,
-        RelayRegistered, RelayStream, WirePayload, FLAG_RESPONSE,
+        Envelope, FLAG_RESPONSE, MsgType, RelayConnect, RelayPayloadKind as WireRelayPayloadKind,
+        RelayRegister, RelayRegistered, RelayStream, WirePayload,
     },
 };
 
 use super::{
+    AbuseLimits, ActiveRelaySlot, NodeHandle,
     helpers::{
         now_unix_secs, relay_payload_kind_to_internal, relay_payload_kind_to_wire, relay_peer_key,
     },
-    AbuseLimits, ActiveRelaySlot, NodeHandle,
 };
 
 impl NodeHandle {

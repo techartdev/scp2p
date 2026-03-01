@@ -4,7 +4,7 @@
 // Thin wrappers around `ciborium` providing `serde_cbor`-compatible
 // function signatures (`to_vec`, `from_slice`).
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// Convenience re-export of the ciborium `Value` type.
 pub use ciborium::Value;

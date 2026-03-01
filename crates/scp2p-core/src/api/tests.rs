@@ -5,6 +5,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use super::*;
+#[allow(deprecated)]
+use crate::transport_net::tcp_connect_session;
 use crate::{
     capabilities::Capabilities,
     ids::NodeId,
@@ -14,21 +16,20 @@ use crate::{
     relay::RelayLimits,
     store::MemoryStore,
     wire::{
-        CommunityStatus, Envelope, FindNode, FindNodeResult, FindValueResult, MsgType, Providers,
-        PublicShareList, RelayConnect, RelayPayloadKind as WireRelayPayloadKind, RelayRegister,
-        RelayRegistered, RelayStream, Store as WireStore, WirePayload, FLAG_ERROR, FLAG_RESPONSE,
+        CommunityStatus, Envelope, FLAG_ERROR, FLAG_RESPONSE, FindNode, FindNodeResult,
+        FindValueResult, MsgType, Providers, PublicShareList, RelayConnect,
+        RelayPayloadKind as WireRelayPayloadKind, RelayRegister, RelayRegistered, RelayStream,
+        Store as WireStore, WirePayload,
     },
 };
-#[allow(deprecated)]
-use crate::transport_net::tcp_connect_session;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -262,9 +263,10 @@ async fn dht_store_rejects_mismatched_share_head_key() {
         })
         .await
         .expect_err("must reject key mismatch");
-    assert!(err
-        .to_string()
-        .contains("share head value does not match share head key"));
+    assert!(
+        err.to_string()
+            .contains("share head value does not match share head key")
+    );
 }
 
 #[tokio::test]
@@ -480,11 +482,13 @@ async fn dht_iterative_find_value_ignores_mismatched_provider_key_value() {
         .await
         .expect("iterative query");
     assert!(found.is_none());
-    assert!(handle
-        .dht_find_value(key)
-        .await
-        .expect("local query")
-        .is_none());
+    assert!(
+        handle
+            .dht_find_value(key)
+            .await
+            .expect("local query")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -927,9 +931,11 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
         })
         .await
         .expect("search v1");
-    assert!(hits_v1
-        .iter()
-        .any(|hit| hit.content_id == desc_v1.content_id.0));
+    assert!(
+        hits_v1
+            .iter()
+            .any(|hit| hit.content_id == desc_v1.content_id.0)
+    );
 
     let target_v1 = std::env::temp_dir().join(format!(
         "scp2p_churn_v1_{}.bin",
@@ -1029,9 +1035,11 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
         })
         .await
         .expect("search v2");
-    assert!(hits_v2
-        .iter()
-        .any(|hit| hit.content_id == desc_v2.content_id.0));
+    assert!(
+        hits_v2
+            .iter()
+            .any(|hit| hit.content_id == desc_v2.content_id.0)
+    );
 
     let target_v2 = std::env::temp_dir().join(format!(
         "scp2p_churn_v2_{}.bin",
@@ -1905,11 +1913,13 @@ async fn search_page_supports_offset_limit_and_snippets() {
         .expect("search full page");
     assert_eq!(full_page.total, 3);
     assert_eq!(full_page.results.len(), 2);
-    assert!(full_page.results[0]
-        .snippet
-        .as_deref()
-        .map(|s| s.to_lowercase().contains("movie"))
-        .unwrap_or(false));
+    assert!(
+        full_page.results[0]
+            .snippet
+            .as_deref()
+            .map(|s| s.to_lowercase().contains("movie"))
+            .unwrap_or(false)
+    );
 }
 
 #[tokio::test]
@@ -2176,9 +2186,11 @@ async fn relay_selection_prefers_healthier_peers() {
 
     let selected = handle.select_relay_peers(2).await.expect("select list");
     assert!(!selected.is_empty());
-    assert!(selected
-        .iter()
-        .all(|peer| relay_peer_key(peer) != relay_peer_key(&bad_peer)));
+    assert!(
+        selected
+            .iter()
+            .all(|peer| relay_peer_key(peer) != relay_peer_key(&bad_peer))
+    );
 }
 
 #[tokio::test]
@@ -3276,40 +3288,52 @@ async fn five_node_dht_convergence_and_sync() {
     let c_addr = allocate_tcp_addr().await;
 
     // Start TCP services.
-    let pub_task = publisher.clone().start_tcp_dht_service(
-        pub_addr, pub_key.clone(), Capabilities::default(),
-    );
-    let a_task = node_a.clone().start_tcp_dht_service(
-        a_addr, a_key.clone(), Capabilities::default(),
-    );
-    let b_task = node_b.clone().start_tcp_dht_service(
-        b_addr, b_key.clone(), Capabilities::default(),
-    );
-    let c_task = node_c.clone().start_tcp_dht_service(
-        c_addr, c_key.clone(), Capabilities::default(),
-    );
+    let pub_task =
+        publisher
+            .clone()
+            .start_tcp_dht_service(pub_addr, pub_key.clone(), Capabilities::default());
+    let a_task =
+        node_a
+            .clone()
+            .start_tcp_dht_service(a_addr, a_key.clone(), Capabilities::default());
+    let b_task =
+        node_b
+            .clone()
+            .start_tcp_dht_service(b_addr, b_key.clone(), Capabilities::default());
+    let c_task =
+        node_c
+            .clone()
+            .start_tcp_dht_service(c_addr, c_key.clone(), Capabilities::default());
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     // Build PeerAddr structs.
     let pub_peer = PeerAddr {
-        ip: "127.0.0.1".parse().expect("ip"), port: pub_addr.port(),
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: pub_addr.port(),
         transport: TransportProtocol::Tcp,
-        pubkey_hint: Some(pub_key.verifying_key().to_bytes()), relay_via: None,
+        pubkey_hint: Some(pub_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
     let a_peer = PeerAddr {
-        ip: "127.0.0.1".parse().expect("ip"), port: a_addr.port(),
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: a_addr.port(),
         transport: TransportProtocol::Tcp,
-        pubkey_hint: Some(a_key.verifying_key().to_bytes()), relay_via: None,
+        pubkey_hint: Some(a_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
     let b_peer = PeerAddr {
-        ip: "127.0.0.1".parse().expect("ip"), port: b_addr.port(),
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: b_addr.port(),
         transport: TransportProtocol::Tcp,
-        pubkey_hint: Some(b_key.verifying_key().to_bytes()), relay_via: None,
+        pubkey_hint: Some(b_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
     let c_peer = PeerAddr {
-        ip: "127.0.0.1".parse().expect("ip"), port: c_addr.port(),
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: c_addr.port(),
         transport: TransportProtocol::Tcp,
-        pubkey_hint: Some(c_key.verifying_key().to_bytes()), relay_via: None,
+        pubkey_hint: Some(c_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
 
     // NodeId helpers.
@@ -3320,12 +3344,30 @@ async fn five_node_dht_convergence_and_sync() {
 
     // Wire up chain: Pub <-> A <-> B <-> C
     // Each node knows its immediate neighbors.
-    publisher.dht_upsert_peer(pub_nid, a_nid, a_peer.clone()).await.expect("pub->A");
-    node_a.dht_upsert_peer(a_nid, pub_nid, pub_peer.clone()).await.expect("A->pub");
-    node_a.dht_upsert_peer(a_nid, b_nid, b_peer.clone()).await.expect("A->B");
-    node_b.dht_upsert_peer(b_nid, a_nid, a_peer.clone()).await.expect("B->A");
-    node_b.dht_upsert_peer(b_nid, c_nid, c_peer.clone()).await.expect("B->C");
-    node_c.dht_upsert_peer(c_nid, b_nid, b_peer.clone()).await.expect("C->B");
+    publisher
+        .dht_upsert_peer(pub_nid, a_nid, a_peer.clone())
+        .await
+        .expect("pub->A");
+    node_a
+        .dht_upsert_peer(a_nid, pub_nid, pub_peer.clone())
+        .await
+        .expect("A->pub");
+    node_a
+        .dht_upsert_peer(a_nid, b_nid, b_peer.clone())
+        .await
+        .expect("A->B");
+    node_b
+        .dht_upsert_peer(b_nid, a_nid, a_peer.clone())
+        .await
+        .expect("B->A");
+    node_b
+        .dht_upsert_peer(b_nid, c_nid, c_peer.clone())
+        .await
+        .expect("B->C");
+    node_c
+        .dht_upsert_peer(c_nid, b_nid, b_peer.clone())
+        .await
+        .expect("C->B");
 
     // Publisher publishes a share.
     let share = ShareKeypair::new(SigningKey::generate(&mut rng));
@@ -3344,7 +3386,8 @@ async fn five_node_dht_convergence_and_sync() {
             content_id: [55u8; 32],
             size: 100,
             name: "convergence.txt".into(),
-            path: None, mime: None,
+            path: None,
+            mime: None,
             tags: vec!["dht".into()],
             chunk_count: 0,
             chunk_list_hash: [0u8; 32],
@@ -3352,12 +3395,16 @@ async fn five_node_dht_convergence_and_sync() {
         recommended_shares: vec![],
         signature: None,
     };
-    publisher.publish_share(manifest, &share).await.expect("publish");
+    publisher
+        .publish_share(manifest, &share)
+        .await
+        .expect("publish");
 
     // Subscriber subscribes and syncs via node C (which is 3 hops from publisher).
-    subscriber.subscribe_with_pubkey(
-        share.share_id(), Some(share.verifying_key().to_bytes())
-    ).await.expect("subscribe");
+    subscriber
+        .subscribe_with_pubkey(share.share_id(), Some(share.verifying_key().to_bytes()))
+        .await
+        .expect("subscribe");
 
     let sub_transport = TcpSessionTransport {
         signing_key: sub_key,
@@ -3371,10 +3418,16 @@ async fn five_node_dht_convergence_and_sync() {
 
     // Verify the subscriber received the manifest.
     let hits = subscriber
-        .search(SearchQuery { text: "convergence".into() })
+        .search(SearchQuery {
+            text: "convergence".into(),
+        })
         .await
         .expect("search");
-    assert_eq!(hits.len(), 1, "subscriber should find the item via DHT convergence");
+    assert_eq!(
+        hits.len(),
+        1,
+        "subscriber should find the item via DHT convergence"
+    );
     assert_eq!(hits[0].content_id, [55u8; 32]);
 
     pub_task.abort();
@@ -3402,23 +3455,29 @@ async fn multi_provider_concurrent_download() {
     let p1_addr = allocate_tcp_addr().await;
     let p2_addr = allocate_tcp_addr().await;
 
-    let p1_task = provider1.clone().start_tcp_dht_service(
-        p1_addr, p1_key.clone(), Capabilities::default(),
-    );
-    let p2_task = provider2.clone().start_tcp_dht_service(
-        p2_addr, p2_key.clone(), Capabilities::default(),
-    );
+    let p1_task =
+        provider1
+            .clone()
+            .start_tcp_dht_service(p1_addr, p1_key.clone(), Capabilities::default());
+    let p2_task =
+        provider2
+            .clone()
+            .start_tcp_dht_service(p2_addr, p2_key.clone(), Capabilities::default());
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let p1_peer = PeerAddr {
-        ip: "127.0.0.1".parse().expect("ip"), port: p1_addr.port(),
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: p1_addr.port(),
         transport: TransportProtocol::Tcp,
-        pubkey_hint: Some(p1_key.verifying_key().to_bytes()), relay_via: None,
+        pubkey_hint: Some(p1_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
     let p2_peer = PeerAddr {
-        ip: "127.0.0.1".parse().expect("ip"), port: p2_addr.port(),
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: p2_addr.port(),
         transport: TransportProtocol::Tcp,
-        pubkey_hint: Some(p2_key.verifying_key().to_bytes()), relay_via: None,
+        pubkey_hint: Some(p2_key.verifying_key().to_bytes()),
+        relay_via: None,
     };
 
     // Both providers register the same content.
@@ -3429,10 +3488,12 @@ async fn multi_provider_concurrent_download() {
 
     provider1
         .register_content_from_bytes(p1_peer.clone(), &payload, content_dir1.path())
-        .await.expect("register p1");
+        .await
+        .expect("register p1");
     provider2
         .register_content_from_bytes(p2_peer.clone(), &payload, content_dir2.path())
-        .await.expect("register p2");
+        .await
+        .expect("register p2");
 
     // Provider 1 publishes the share manifest.
     let share = ShareKeypair::new(SigningKey::generate(&mut rng));
@@ -3440,7 +3501,9 @@ async fn multi_provider_concurrent_download() {
         version: 1,
         share_pubkey: share.verifying_key().to_bytes(),
         share_id: share.share_id().0,
-        seq: 1, created_at: 1_700_000_600, expires_at: None,
+        seq: 1,
+        created_at: 1_700_000_600,
+        expires_at: None,
         title: Some("multi-provider".into()),
         description: Some("concurrent download test".into()),
         visibility: crate::manifest::ShareVisibility::Private,
@@ -3449,7 +3512,8 @@ async fn multi_provider_concurrent_download() {
             content_id: desc.content_id.0,
             size: payload.len() as u64,
             name: "multi-provider.bin".into(),
-            path: None, mime: None,
+            path: None,
+            mime: None,
             tags: vec!["multi".into()],
             chunk_count: desc.chunk_count,
             chunk_list_hash: desc.chunk_list_hash,
@@ -3457,12 +3521,16 @@ async fn multi_provider_concurrent_download() {
         recommended_shares: vec![],
         signature: None,
     };
-    provider1.publish_share(manifest, &share).await.expect("publish");
+    provider1
+        .publish_share(manifest, &share)
+        .await
+        .expect("publish");
 
     // Subscriber subscribes & syncs from provider1.
-    subscriber.subscribe_with_pubkey(
-        share.share_id(), Some(share.verifying_key().to_bytes())
-    ).await.expect("subscribe");
+    subscriber
+        .subscribe_with_pubkey(share.share_id(), Some(share.verifying_key().to_bytes()))
+        .await
+        .expect("subscribe");
 
     let transport = TcpSessionTransport {
         signing_key: sub_key,
@@ -3470,7 +3538,8 @@ async fn multi_provider_concurrent_download() {
     };
     subscriber
         .sync_subscriptions_over_dht(&transport, std::slice::from_ref(&p1_peer))
-        .await.expect("sync");
+        .await
+        .expect("sync");
 
     // Download with BOTH providers in the seed list.
     let target = std::env::temp_dir().join(format!(
@@ -3512,13 +3581,9 @@ fn community_membership_token_issue_and_verify() {
     let member_pubkey = member_key.verifying_key().to_bytes();
     let community_pubkey = community_key.verifying_key().to_bytes();
 
-    let token = CommunityMembershipToken::issue(
-        &community_key,
-        member_pubkey,
-        1_000_000,
-        2_000_000,
-    )
-    .expect("issue token");
+    let token =
+        CommunityMembershipToken::issue(&community_key, member_pubkey, 1_000_000, 2_000_000)
+            .expect("issue token");
 
     // Verify should succeed.
     token
@@ -3542,13 +3607,9 @@ fn community_membership_token_rejects_expired() {
     let member_pubkey = member_key.verifying_key().to_bytes();
     let community_pubkey = community_key.verifying_key().to_bytes();
 
-    let token = CommunityMembershipToken::issue(
-        &community_key,
-        member_pubkey,
-        1_000_000,
-        1_500_000,
-    )
-    .expect("issue token");
+    let token =
+        CommunityMembershipToken::issue(&community_key, member_pubkey, 1_000_000, 1_500_000)
+            .expect("issue token");
 
     let err = token
         .verify(&community_pubkey, Some(2_000_000))
@@ -3568,20 +3629,15 @@ fn community_membership_token_rejects_wrong_pubkey() {
     let member_pubkey = member_key.verifying_key().to_bytes();
     let wrong_pubkey = wrong_key.verifying_key().to_bytes();
 
-    let token = CommunityMembershipToken::issue(
-        &community_key,
-        member_pubkey,
-        1_000_000,
-        2_000_000,
-    )
-    .expect("issue token");
+    let token =
+        CommunityMembershipToken::issue(&community_key, member_pubkey, 1_000_000, 2_000_000)
+            .expect("issue token");
 
     let err = token
         .verify(&wrong_pubkey, None)
         .expect_err("wrong pubkey should fail");
     assert!(
-        err.to_string().contains("does not match")
-            || err.to_string().contains("signature"),
+        err.to_string().contains("does not match") || err.to_string().contains("signature"),
         "error should indicate mismatch or signature failure: {err}"
     );
 }
@@ -3597,17 +3653,11 @@ fn community_membership_token_roundtrip_cbor() {
     let member_pubkey = member_key.verifying_key().to_bytes();
     let community_pubkey = community_key.verifying_key().to_bytes();
 
-    let token = CommunityMembershipToken::issue(
-        &community_key,
-        member_pubkey,
-        100,
-        200,
-    )
-    .expect("issue token");
+    let token = CommunityMembershipToken::issue(&community_key, member_pubkey, 100, 200)
+        .expect("issue token");
 
     let bytes = crate::cbor::to_vec(&token).expect("encode token");
-    let decoded: CommunityMembershipToken =
-        crate::cbor::from_slice(&bytes).expect("decode token");
+    let decoded: CommunityMembershipToken = crate::cbor::from_slice(&bytes).expect("decode token");
     assert_eq!(decoded, token);
 
     // Decoded copy should also verify
@@ -3630,21 +3680,12 @@ async fn join_community_with_valid_token() {
     let node_key = SigningKey::generate(&mut rng);
     let node_pubkey = node_key.verifying_key().to_bytes();
 
-    let token = CommunityMembershipToken::issue(
-        &community_key,
-        node_pubkey,
-        100,
-        999_999_999,
-    )
-    .expect("issue token");
+    let token = CommunityMembershipToken::issue(&community_key, node_pubkey, 100, 999_999_999)
+        .expect("issue token");
 
     let handle = Node::start(NodeConfig::default()).await.expect("start");
     handle
-        .join_community_with_token(
-            community_share_id,
-            community_pubkey,
-            Some(token),
-        )
+        .join_community_with_token(community_share_id, community_pubkey, Some(token))
         .await
         .expect("join with valid token");
 
@@ -3672,29 +3713,19 @@ async fn join_community_with_invalid_token_rejected() {
     let node_pubkey = node_key.verifying_key().to_bytes();
 
     // Token signed by wrong key
-    let bad_token = CommunityMembershipToken::issue(
-        &wrong_key,
-        node_pubkey,
-        100,
-        999_999_999,
-    )
-    .expect("issue wrong token");
+    let bad_token = CommunityMembershipToken::issue(&wrong_key, node_pubkey, 100, 999_999_999)
+        .expect("issue wrong token");
     // Manually fix the community_share_id so the check reaches verification
     let mut patched = bad_token;
     patched.community_share_id = community_share_id.0;
 
     let handle = Node::start(NodeConfig::default()).await.expect("start");
     let err = handle
-        .join_community_with_token(
-            community_share_id,
-            community_pubkey,
-            Some(patched),
-        )
+        .join_community_with_token(community_share_id, community_pubkey, Some(patched))
         .await
         .expect_err("invalid token should be rejected");
     assert!(
-        err.to_string().contains("signature")
-            || err.to_string().contains("does not match"),
+        err.to_string().contains("signature") || err.to_string().contains("does not match"),
         "error: {err}"
     );
 }

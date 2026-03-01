@@ -20,14 +20,14 @@ use tokio::{
 };
 
 use crate::{
-    content::{compute_chunk_list_hash, verify_chunk, verify_content, CHUNK_SIZE},
+    content::{CHUNK_SIZE, compute_chunk_list_hash, verify_chunk, verify_content},
     ids::ContentId,
     manifest::ManifestV1,
     peer::PeerAddr,
     transport::{read_envelope, write_envelope},
     wire::{
-        ChunkData, ChunkHashList, Envelope, GetChunk, GetChunkHashes, GetManifest, ManifestData,
-        MsgType, WirePayload, FLAG_ERROR,
+        ChunkData, ChunkHashList, Envelope, FLAG_ERROR, GetChunk, GetChunkHashes, GetManifest,
+        ManifestData, MsgType, WirePayload,
     },
 };
 
@@ -752,10 +752,10 @@ fn pick_best_peer_index(
             Some(s) => s,
             None => continue,
         };
-        if let Some(until) = s.backoff_until {
-            if until > now {
-                continue;
-            }
+        if let Some(until) = s.backoff_until
+            && until > now
+        {
+            continue;
         }
         let candidate = (i, s.score, s.in_flight, s.requests);
         let bucket = if s.requests < policy.max_chunks_per_peer {
@@ -922,8 +922,8 @@ mod tests {
         future::Future,
         pin::Pin,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc,
+            atomic::{AtomicUsize, Ordering},
         },
     };
 
@@ -931,7 +931,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        content::{describe_content, CHUNK_SIZE},
+        content::{CHUNK_SIZE, describe_content},
         peer::TransportProtocol,
         wire::{GetChunk, GetManifest},
     };

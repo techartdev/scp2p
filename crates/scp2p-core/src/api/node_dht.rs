@@ -12,9 +12,11 @@ use ed25519_dalek::SigningKey;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+#[allow(deprecated)]
+use crate::transport_net::tcp_accept_session;
 use crate::{
     capabilities::Capabilities,
-    dht::{DhtInsertResult, DhtNodeRecord, DhtValue, ALPHA, DEFAULT_TTL_SECS, K, MAX_VALUE_SIZE},
+    dht::{ALPHA, DEFAULT_TTL_SECS, DhtInsertResult, DhtNodeRecord, DhtValue, K, MAX_VALUE_SIZE},
     dht_keys::share_head_key,
     ids::{NodeId, ShareId},
     manifest::ShareHead,
@@ -22,15 +24,13 @@ use crate::{
     peer::PeerAddr,
     wire::{FindNode, Store as WireStore},
 };
-#[allow(deprecated)]
-use crate::transport_net::tcp_accept_session;
 
 use super::{
+    NodeHandle,
     helpers::{
         merge_peer_list, now_unix_secs, peer_key, persist_state, query_find_node, query_find_value,
         replicate_store_to_closest, sort_peers_for_target, validate_dht_value_for_known_keyspaces,
     },
-    NodeHandle,
 };
 
 impl NodeHandle {
@@ -193,21 +193,20 @@ impl NodeHandle {
                     continue;
                 };
 
-                if let Some(remote) = result.value {
-                    if remote.key == key
-                        && remote.value.len() <= MAX_VALUE_SIZE
-                        && validate_dht_value_for_known_keyspaces(remote.key, &remote.value).is_ok()
-                    {
-                        let now = now_unix_secs()?;
-                        let mut state = self.state.write().await;
-                        state.dht.store(
-                            key,
-                            remote.value,
-                            remote.ttl_secs.max(DEFAULT_TTL_SECS),
-                            now,
-                        )?;
-                        return Ok(state.dht.find_value(key, now));
-                    }
+                if let Some(remote) = result.value
+                    && remote.key == key
+                    && remote.value.len() <= MAX_VALUE_SIZE
+                    && validate_dht_value_for_known_keyspaces(remote.key, &remote.value).is_ok()
+                {
+                    let now = now_unix_secs()?;
+                    let mut state = self.state.write().await;
+                    state.dht.store(
+                        key,
+                        remote.value,
+                        remote.ttl_secs.max(DEFAULT_TTL_SECS),
+                        now,
+                    )?;
+                    return Ok(state.dht.find_value(key, now));
                 }
                 discovered |= merge_peer_list(&mut peers, result.closer_peers);
             }
@@ -260,37 +259,36 @@ impl NodeHandle {
                     continue;
                 };
 
-                if let Some(remote) = result.value {
-                    if remote.key == key
-                        && remote.value.len() <= MAX_VALUE_SIZE
-                        && validate_dht_value_for_known_keyspaces(remote.key, &remote.value).is_ok()
+                if let Some(remote) = result.value
+                    && remote.key == key
+                    && remote.value.len() <= MAX_VALUE_SIZE
+                    && validate_dht_value_for_known_keyspaces(remote.key, &remote.value).is_ok()
+                {
+                    let head: ShareHead = crate::cbor::from_slice(&remote.value)?;
+                    if head.share_id != share_id.0 {
+                        continue;
+                    }
+                    if let Some(pubkey) = share_pubkey {
+                        head.verify_with_pubkey(pubkey)?;
+                    }
+                    if best
+                        .as_ref()
+                        .map(|current| {
+                            head.latest_seq > current.latest_seq
+                                || (head.latest_seq == current.latest_seq
+                                    && head.updated_at > current.updated_at)
+                        })
+                        .unwrap_or(true)
                     {
-                        let head: ShareHead = crate::cbor::from_slice(&remote.value)?;
-                        if head.share_id != share_id.0 {
-                            continue;
-                        }
-                        if let Some(pubkey) = share_pubkey {
-                            head.verify_with_pubkey(pubkey)?;
-                        }
-                        if best
-                            .as_ref()
-                            .map(|current| {
-                                head.latest_seq > current.latest_seq
-                                    || (head.latest_seq == current.latest_seq
-                                        && head.updated_at > current.updated_at)
-                            })
-                            .unwrap_or(true)
-                        {
-                            best = Some(head.clone());
-                            let now = now_unix_secs()?;
-                            let mut state = self.state.write().await;
-                            state.dht.store(
-                                key,
-                                crate::cbor::to_vec(&head)?,
-                                remote.ttl_secs.max(DEFAULT_TTL_SECS),
-                                now,
-                            )?;
-                        }
+                        best = Some(head.clone());
+                        let now = now_unix_secs()?;
+                        let mut state = self.state.write().await;
+                        state.dht.store(
+                            key,
+                            crate::cbor::to_vec(&head)?,
+                            remote.ttl_secs.max(DEFAULT_TTL_SECS),
+                            now,
+                        )?;
                     }
                 }
                 discovered |= merge_peer_list(&mut peers, result.closer_peers);

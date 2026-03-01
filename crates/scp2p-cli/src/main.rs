@@ -17,9 +17,9 @@ use rand::rngs::OsRng;
 #[allow(deprecated)]
 use scp2p_core::transport_net::tcp_connect_session;
 use scp2p_core::{
-    describe_content, BoxedStream, Capabilities, DirectRequestTransport, FetchPolicy, ItemV1,
-    ManifestV1, Node, NodeConfig, NodeId, PeerAddr, PeerConnector, SearchQuery, ShareId,
-    ShareKeypair, ShareVisibility, SqliteStore, Store, TransportProtocol,
+    BoxedStream, Capabilities, DirectRequestTransport, FetchPolicy, ItemV1, ManifestV1, Node,
+    NodeConfig, NodeId, PeerAddr, PeerConnector, SearchQuery, ShareId, ShareKeypair,
+    ShareVisibility, SqliteStore, Store, TransportProtocol, describe_content,
 };
 
 #[derive(Parser)]

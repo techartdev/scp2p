@@ -12,12 +12,12 @@ use std::{
 
 use async_trait::async_trait;
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
     Key, XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit},
 };
 use pbkdf2::pbkdf2_hmac;
 use rand::RngCore;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -484,9 +484,7 @@ fn load_state_sync(conn: &Connection) -> anyhow::Result<PersistedState> {
                 });
             }
             if !items.is_empty() {
-                state.search_index = Some(
-                    crate::search::SearchIndex::from_items(items).snapshot(),
-                );
+                state.search_index = Some(crate::search::SearchIndex::from_items(items).snapshot());
             }
         } else {
             state.search_index = load_metadata_cbor(conn, "search_index")?;
@@ -797,8 +795,8 @@ fn blob_to_array<const N: usize>(blob: &[u8], field: &str) -> anyhow::Result<[u8
 }
 
 fn hex_to_array<const N: usize>(hex_str: &str, field: &str) -> anyhow::Result<[u8; N]> {
-    let bytes = hex::decode(hex_str)
-        .map_err(|e| anyhow::anyhow!("invalid hex in {}: {}", field, e))?;
+    let bytes =
+        hex::decode(hex_str).map_err(|e| anyhow::anyhow!("invalid hex in {}: {}", field, e))?;
     blob_to_array::<N>(&bytes, field)
 }
 

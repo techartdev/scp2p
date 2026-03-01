@@ -9,15 +9,15 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::Context;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
-use rand::{rngs::OsRng, RngCore};
-use scp2p_core::{
-    describe_content, BoxedStream, Capabilities,
-    DirectRequestTransport, FetchPolicy, ItemV1, ManifestV1, Node, NodeConfig, NodeHandle,
-    OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord, PublicShareSummary, SearchPageQuery,
-    ShareItemInfo, ShareVisibility, SqliteStore, Store, TransportProtocol,
-};
+use rand::{RngCore, rngs::OsRng};
 #[allow(deprecated)]
 use scp2p_core::transport_net::tcp_connect_session;
+use scp2p_core::{
+    BoxedStream, Capabilities, DirectRequestTransport, FetchPolicy, ItemV1, ManifestV1, Node,
+    NodeConfig, NodeHandle, OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord,
+    PublicShareSummary, SearchPageQuery, ShareItemInfo, ShareVisibility, SqliteStore, Store,
+    TransportProtocol, describe_content,
+};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -335,10 +335,10 @@ impl DesktopAppState {
                 }
             }
         }
-        if views.is_empty() {
-            if let Some(err) = first_err {
-                return Err(err);
-            }
+        if views.is_empty()
+            && let Some(err) = first_err
+        {
+            return Err(err);
         }
         views.sort_by(|a, b| {
             b.latest_seq
@@ -436,10 +436,11 @@ impl DesktopAppState {
                 .then(a.title.cmp(&b.title))
                 .then(a.share_id_hex.cmp(&b.share_id_hex))
         });
-        if participants.is_empty() && public_shares.is_empty() {
-            if let Some(err) = first_err {
-                return Err(err);
-            }
+        if participants.is_empty()
+            && public_shares.is_empty()
+            && let Some(err) = first_err
+        {
+            return Err(err);
         }
         Ok(CommunityBrowseView {
             community_share_id_hex: hex::encode(community.share_id),

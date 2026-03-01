@@ -5,7 +5,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use crate::{
-    content::{verify_chunk, verify_content, CHUNK_SIZE},
+    content::{CHUNK_SIZE, verify_chunk, verify_content},
     ids::ContentId,
     peer::PeerAddr,
 };
@@ -31,11 +31,11 @@ pub fn download_swarm(
 
         for offset in 0..providers.len() {
             let provider_idx = (idx + offset) % providers.len();
-            if let Some(candidate) = chunk_from_provider(&providers[provider_idx], idx) {
-                if verify_chunk(expected_hash, candidate).is_ok() {
-                    chunk = Some(candidate.to_vec());
-                    break;
-                }
+            if let Some(candidate) = chunk_from_provider(&providers[provider_idx], idx)
+                && verify_chunk(expected_hash, candidate).is_ok()
+            {
+                chunk = Some(candidate.to_vec());
+                break;
             }
         }
 

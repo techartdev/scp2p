@@ -20,9 +20,9 @@ use crate::{
     wire::{
         ChunkData, CommunityPublicShareList, CommunityStatus, Envelope, FindNode, FindValue,
         GetChunk, GetCommunityStatus, GetManifest, HaveContent, ListCommunityPublicShares,
-        ListPublicShares, ManifestData, PexOffer, PexRequest, Providers, PublicShareList,
-        RelayConnect, RelayRegister, RelayRegistered, RelayStream, Store, WirePayload,
-        MAX_ENVELOPE_BYTES, MAX_ENVELOPE_PAYLOAD_BYTES,
+        ListPublicShares, MAX_ENVELOPE_BYTES, MAX_ENVELOPE_PAYLOAD_BYTES, ManifestData, PexOffer,
+        PexRequest, Providers, PublicShareList, RelayConnect, RelayRegister, RelayRegistered,
+        RelayStream, Store, WirePayload,
     },
 };
 
@@ -112,13 +112,13 @@ fn default_protocol_version() -> u16 {
 /// is included so that a MITM cannot substitute a different ephemeral key.
 #[derive(Serialize)]
 struct HandshakeSigningTuple(
-    [u8; 32],          // 0: node_pubkey
-    Capabilities,      // 1: capabilities
-    [u8; 32],          // 2: nonce
-    Option<[u8; 32]>,  // 3: echoed_nonce
-    u64,               // 4: timestamp_unix_secs
-    u16,               // 5: protocol_version
-    Option<[u8; 32]>,  // 6: ephemeral_pubkey (X25519)
+    [u8; 32],         // 0: node_pubkey
+    Capabilities,     // 1: capabilities
+    [u8; 32],         // 2: nonce
+    Option<[u8; 32]>, // 3: echoed_nonce
+    u64,              // 4: timestamp_unix_secs
+    u16,              // 5: protocol_version
+    Option<[u8; 32]>, // 6: ephemeral_pubkey (X25519)
 );
 
 /// Generate an ephemeral X25519 keypair for forward-secret key exchange.
@@ -181,10 +181,10 @@ where
     if server_hello.echoed_nonce != Some(local_nonce) {
         anyhow::bail!("server handshake does not bind initiator nonce");
     }
-    if let Some(expected) = expected_remote_pubkey {
-        if server_hello.node_pubkey != expected {
-            anyhow::bail!("remote pubkey mismatch");
-        }
+    if let Some(expected) = expected_remote_pubkey
+        && server_hello.node_pubkey != expected
+    {
+        anyhow::bail!("remote pubkey mismatch");
     }
 
     // Step 3 – ClientAck (echo server nonce)
@@ -256,10 +256,10 @@ where
         tracker.check_and_record(client_hello.nonce, now)?;
     }
 
-    if let Some(expected) = expected_remote_pubkey {
-        if client_hello.node_pubkey != expected {
-            anyhow::bail!("remote pubkey mismatch");
-        }
+    if let Some(expected) = expected_remote_pubkey
+        && client_hello.node_pubkey != expected
+    {
+        anyhow::bail!("remote pubkey mismatch");
     }
 
     // Step 2 – ServerHello (echo client nonce)
@@ -505,7 +505,7 @@ pub trait WireDispatcher {
         msg: GetCommunityStatus,
     ) -> anyhow::Result<DispatchResult>;
     async fn on_community_status(&mut self, msg: CommunityStatus)
-        -> anyhow::Result<DispatchResult>;
+    -> anyhow::Result<DispatchResult>;
     async fn on_list_community_public_shares(
         &mut self,
         msg: ListCommunityPublicShares,
@@ -516,7 +516,7 @@ pub trait WireDispatcher {
     ) -> anyhow::Result<DispatchResult>;
     async fn on_relay_register(&mut self, msg: RelayRegister) -> anyhow::Result<DispatchResult>;
     async fn on_relay_registered(&mut self, msg: RelayRegistered)
-        -> anyhow::Result<DispatchResult>;
+    -> anyhow::Result<DispatchResult>;
     async fn on_relay_connect(&mut self, msg: RelayConnect) -> anyhow::Result<DispatchResult>;
     async fn on_relay_stream(&mut self, msg: RelayStream) -> anyhow::Result<DispatchResult>;
     async fn on_relay_list_request(
@@ -738,7 +738,7 @@ pub fn now_unix_secs() -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand::{SeedableRng, rngs::StdRng};
 
     use super::*;
     use crate::wire::{ChunkHashList, GetChunkHashes, MsgType};
@@ -1018,9 +1018,10 @@ mod tests {
         )
         .await
         .expect_err("must reject mismatched echoed nonce");
-        assert!(err
-            .to_string()
-            .contains("server handshake does not bind initiator nonce"));
+        assert!(
+            err.to_string()
+                .contains("server handshake does not bind initiator nonce")
+        );
 
         server.await.expect("server task");
     }
@@ -1040,9 +1041,10 @@ mod tests {
         )
         .expect("hello");
         let err = verify_hello(&hello).expect_err("stale timestamp must fail");
-        assert!(err
-            .to_string()
-            .contains("handshake timestamp outside allowed clock skew"));
+        assert!(
+            err.to_string()
+                .contains("handshake timestamp outside allowed clock skew")
+        );
     }
 
     #[test]
@@ -1060,9 +1062,10 @@ mod tests {
         )
         .expect("hello");
         let err = verify_hello(&hello).expect_err("future timestamp must fail");
-        assert!(err
-            .to_string()
-            .contains("handshake timestamp outside allowed clock skew"));
+        assert!(
+            err.to_string()
+                .contains("handshake timestamp outside allowed clock skew")
+        );
     }
 
     #[tokio::test]
@@ -1096,8 +1099,14 @@ mod tests {
         // an ack with the *wrong* echoed nonce.
         let client_task = tokio::spawn(async move {
             // Step 1 – send valid ClientHello
-            let hello = signed_hello(&client_key, Capabilities::default(), client_nonce, None, None)
-                .expect("client hello");
+            let hello = signed_hello(
+                &client_key,
+                Capabilities::default(),
+                client_nonce,
+                None,
+                None,
+            )
+            .expect("client hello");
             write_handshake_hello(&mut client_io, &hello)
                 .await
                 .expect("send hello");
@@ -1131,9 +1140,10 @@ mod tests {
         )
         .await
         .expect_err("responder must reject wrong ack nonce");
-        assert!(err
-            .to_string()
-            .contains("client ack does not bind responder nonce"));
+        assert!(
+            err.to_string()
+                .contains("client ack does not bind responder nonce")
+        );
 
         client_task.await.expect("client task");
     }
@@ -1153,8 +1163,14 @@ mod tests {
 
         let client_task = tokio::spawn(async move {
             // Step 1 – valid ClientHello
-            let hello = signed_hello(&client_key, Capabilities::default(), client_nonce, None, None)
-                .expect("client hello");
+            let hello = signed_hello(
+                &client_key,
+                Capabilities::default(),
+                client_nonce,
+                None,
+                None,
+            )
+            .expect("client hello");
             write_handshake_hello(&mut client_io, &hello)
                 .await
                 .expect("send hello");
@@ -1188,9 +1204,10 @@ mod tests {
         )
         .await
         .expect_err("responder must reject ack from different pubkey");
-        assert!(err
-            .to_string()
-            .contains("client ack pubkey does not match initial hello"));
+        assert!(
+            err.to_string()
+                .contains("client ack pubkey does not match initial hello")
+        );
 
         client_task.await.expect("client task");
     }

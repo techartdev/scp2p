@@ -24,7 +24,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::{
     capabilities::Capabilities,
-    transport::{generate_nonce, handshake_initiator, handshake_responder, AuthenticatedSession},
+    transport::{AuthenticatedSession, generate_nonce, handshake_initiator, handshake_responder},
 };
 
 /// Accept an incoming **plain TCP** session.
@@ -343,12 +343,12 @@ impl AsyncWrite for QuicBiStream {
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand::{SeedableRng, rngs::StdRng};
 
     use super::*;
     use crate::{
         transport::{
-            dispatch_envelope, read_envelope, write_envelope, DispatchResult, WireDispatcher,
+            DispatchResult, WireDispatcher, dispatch_envelope, read_envelope, write_envelope,
         },
         wire::{Envelope, MsgType, PexOffer, PexRequest, WirePayload},
     };

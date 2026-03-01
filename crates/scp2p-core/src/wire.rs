@@ -20,9 +20,7 @@ mod int_cbor {
 
     /// Extract a `Vec<(Value, Value)>` map from a ciborium `Value`,
     /// accepting both CBOR maps and legacy serde struct maps.
-    pub fn into_map(
-        val: Value,
-    ) -> Result<Vec<(Value, Value)>, String> {
+    pub fn into_map(val: Value) -> Result<Vec<(Value, Value)>, String> {
         match val {
             Value::Map(m) => Ok(m),
             other => Err(format!("expected CBOR map, got {:?}", other)),
@@ -37,7 +35,9 @@ mod int_cbor {
     ) -> Option<&'a Value> {
         map.iter()
             .find(|(k, _)| {
-                k.as_integer().map(|i| i128::from(i) == int_key as i128).unwrap_or(false)
+                k.as_integer()
+                    .map(|i| i128::from(i) == int_key as i128)
+                    .unwrap_or(false)
                     || k.as_text().map(|s| s == str_key).unwrap_or(false)
             })
             .map(|(_, v)| v)
@@ -49,8 +49,8 @@ mod int_cbor {
         int_key: i64,
         str_key: &str,
     ) -> Result<[u8; N], String> {
-        let val = find_field(map, int_key, str_key)
-            .ok_or_else(|| format!("missing field {str_key}"))?;
+        let val =
+            find_field(map, int_key, str_key).ok_or_else(|| format!("missing field {str_key}"))?;
         let bytes = val
             .as_bytes()
             .ok_or_else(|| format!("field {str_key}: expected bytes"))?;
@@ -71,37 +71,28 @@ mod int_cbor {
         int_key: i64,
         str_key: &str,
     ) -> Result<Vec<u8>, String> {
-        let val = find_field(map, int_key, str_key)
-            .ok_or_else(|| format!("missing field {str_key}"))?;
+        let val =
+            find_field(map, int_key, str_key).ok_or_else(|| format!("missing field {str_key}"))?;
         val.as_bytes()
             .cloned()
             .ok_or_else(|| format!("field {str_key}: expected bytes"))
     }
 
     /// Extract a required unsigned integer field.
-    pub fn extract_u64(
-        map: &[(Value, Value)],
-        int_key: i64,
-        str_key: &str,
-    ) -> Result<u64, String> {
-        let val = find_field(map, int_key, str_key)
-            .ok_or_else(|| format!("missing field {str_key}"))?;
+    pub fn extract_u64(map: &[(Value, Value)], int_key: i64, str_key: &str) -> Result<u64, String> {
+        let val =
+            find_field(map, int_key, str_key).ok_or_else(|| format!("missing field {str_key}"))?;
         match val.as_integer() {
             Some(i) => {
                 let n: i128 = i.into();
-                u64::try_from(n)
-                    .map_err(|_| format!("field {str_key}: integer out of u64 range"))
+                u64::try_from(n).map_err(|_| format!("field {str_key}: integer out of u64 range"))
             }
             None => Err(format!("field {str_key}: expected integer")),
         }
     }
 
     /// Extract a required u32 field.
-    pub fn extract_u32(
-        map: &[(Value, Value)],
-        int_key: i64,
-        str_key: &str,
-    ) -> Result<u32, String> {
+    pub fn extract_u32(map: &[(Value, Value)], int_key: i64, str_key: &str) -> Result<u32, String> {
         extract_u64(map, int_key, str_key)?
             .try_into()
             .map_err(|_| format!("field {str_key}: integer out of u32 range"))
@@ -114,7 +105,10 @@ mod int_cbor {
 
     /// Encode a u64 as `(integer_key, Value::Integer)` pair.
     pub fn kv_u64(key: i64, n: u64) -> (Value, Value) {
-        (Value::Integer(key.into()), Value::Integer((n as i64).into()))
+        (
+            Value::Integer(key.into()),
+            Value::Integer((n as i64).into()),
+        )
     }
 
     /// Encode a u32 as `(integer_key, Value::Integer)` pair.
@@ -123,15 +117,11 @@ mod int_cbor {
     }
 
     /// Encode a serde-serializable value as `(integer_key, Value)` pair.
-    pub fn kv_serde<T: serde::Serialize>(
-        key: i64,
-        val: &T,
-    ) -> Result<(Value, Value), String> {
+    pub fn kv_serde<T: serde::Serialize>(key: i64, val: &T) -> Result<(Value, Value), String> {
         // Serialize to CBOR bytes, then parse back as Value.
-        let cbor_bytes = crate::cbor::to_vec(val)
-            .map_err(|e| format!("serialize nested: {e}"))?;
-        let v: Value = crate::cbor::from_slice(&cbor_bytes)
-            .map_err(|e| format!("parse nested value: {e}"))?;
+        let cbor_bytes = crate::cbor::to_vec(val).map_err(|e| format!("serialize nested: {e}"))?;
+        let v: Value =
+            crate::cbor::from_slice(&cbor_bytes).map_err(|e| format!("parse nested value: {e}"))?;
         Ok((Value::Integer(key.into()), v))
     }
 
@@ -141,8 +131,8 @@ mod int_cbor {
         int_key: i64,
         str_key: &str,
     ) -> Result<T, String> {
-        let val = find_field(map, int_key, str_key)
-            .ok_or_else(|| format!("missing field {str_key}"))?;
+        let val =
+            find_field(map, int_key, str_key).ok_or_else(|| format!("missing field {str_key}"))?;
         // Round-trip through CBOR bytes.
         let cbor_bytes = crate::cbor::to_vec(val)
             .map_err(|e| format!("field {str_key}: serialize for deser: {e}"))?;
@@ -362,10 +352,8 @@ pub struct FindNode {
 
 impl Serialize for FindNode {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        ciborium::Value::Map(vec![
-            int_cbor::kv_bytes(0, &self.target_node_id),
-        ])
-        .serialize(serializer)
+        ciborium::Value::Map(vec![int_cbor::kv_bytes(0, &self.target_node_id)])
+            .serialize(serializer)
     }
 }
 
@@ -400,8 +388,7 @@ impl<'de> Deserialize<'de> for FindNodeResult {
         let val = ciborium::Value::deserialize(deserializer)?;
         let map = int_cbor::into_map(val).map_err(serde::de::Error::custom)?;
         Ok(FindNodeResult {
-            peers: int_cbor::deser_value(&map, 0, "peers")
-                .map_err(serde::de::Error::custom)?,
+            peers: int_cbor::deser_value(&map, 0, "peers").map_err(serde::de::Error::custom)?,
         })
     }
 }
@@ -414,10 +401,7 @@ pub struct FindValue {
 
 impl Serialize for FindValue {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        ciborium::Value::Map(vec![
-            int_cbor::kv_bytes(0, &self.key),
-        ])
-        .serialize(serializer)
+        ciborium::Value::Map(vec![int_cbor::kv_bytes(0, &self.key)]).serialize(serializer)
     }
 }
 
@@ -426,8 +410,7 @@ impl<'de> Deserialize<'de> for FindValue {
         let val = ciborium::Value::deserialize(deserializer)?;
         let map = int_cbor::into_map(val).map_err(serde::de::Error::custom)?;
         Ok(FindValue {
-            key: int_cbor::extract_byte_array(&map, 0, "key")
-                .map_err(serde::de::Error::custom)?,
+            key: int_cbor::extract_byte_array(&map, 0, "key").map_err(serde::de::Error::custom)?,
         })
     }
 }
@@ -456,10 +439,8 @@ impl<'de> Deserialize<'de> for Store {
         let val = ciborium::Value::deserialize(deserializer)?;
         let map = int_cbor::into_map(val).map_err(serde::de::Error::custom)?;
         Ok(Store {
-            key: int_cbor::extract_byte_array(&map, 0, "key")
-                .map_err(serde::de::Error::custom)?,
-            value: int_cbor::extract_bytes(&map, 1, "value")
-                .map_err(serde::de::Error::custom)?,
+            key: int_cbor::extract_byte_array(&map, 0, "key").map_err(serde::de::Error::custom)?,
+            value: int_cbor::extract_bytes(&map, 1, "value").map_err(serde::de::Error::custom)?,
             ttl_secs: int_cbor::extract_u64(&map, 2, "ttl_secs")
                 .map_err(serde::de::Error::custom)?,
         })
@@ -494,10 +475,9 @@ impl<'de> Deserialize<'de> for FindValueResult {
         let value_field = int_cbor::find_field(&map, 0, "value");
         let value = match value_field {
             Some(ciborium::Value::Null) | None => None,
-            Some(_) => Some(
-                int_cbor::deser_value(&map, 0, "value")
-                    .map_err(serde::de::Error::custom)?,
-            ),
+            Some(_) => {
+                Some(int_cbor::deser_value(&map, 0, "value").map_err(serde::de::Error::custom)?)
+            }
         };
         Ok(FindValueResult {
             value,
@@ -670,8 +650,7 @@ impl<'de> Deserialize<'de> for ChunkData {
                 .map_err(serde::de::Error::custom)?,
             chunk_index: int_cbor::extract_u32(&map, 1, "chunk_index")
                 .map_err(serde::de::Error::custom)?,
-            bytes: int_cbor::extract_bytes(&map, 2, "bytes")
-                .map_err(serde::de::Error::custom)?,
+            bytes: int_cbor::extract_bytes(&map, 2, "bytes").map_err(serde::de::Error::custom)?,
         })
     }
 }
@@ -684,10 +663,7 @@ pub struct GetChunkHashes {
 
 impl Serialize for GetChunkHashes {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        ciborium::Value::Map(vec![
-            int_cbor::kv_bytes(0, &self.content_id),
-        ])
-        .serialize(serializer)
+        ciborium::Value::Map(vec![int_cbor::kv_bytes(0, &self.content_id)]).serialize(serializer)
     }
 }
 
@@ -726,8 +702,7 @@ impl<'de> Deserialize<'de> for ChunkHashList {
         Ok(ChunkHashList {
             content_id: int_cbor::extract_byte_array(&map, 0, "content_id")
                 .map_err(serde::de::Error::custom)?,
-            hashes: int_cbor::deser_value(&map, 1, "hashes")
-                .map_err(serde::de::Error::custom)?,
+            hashes: int_cbor::deser_value(&map, 1, "hashes").map_err(serde::de::Error::custom)?,
         })
     }
 }
@@ -980,15 +955,13 @@ mod tests {
             bytes: vec![10, 20, 30],
         };
         let data_bytes = crate::cbor::to_vec(&data).expect("encode");
-        let data_val: ciborium::Value =
-            crate::cbor::from_slice(&data_bytes).expect("parse");
+        let data_val: ciborium::Value = crate::cbor::from_slice(&data_bytes).expect("parse");
         let data_map = data_val.as_map().expect("should be map");
         assert_eq!(data_map.len(), 3);
         for (k, _) in data_map {
             assert!(k.as_integer().is_some(), "all keys should be integers");
         }
-        let data_rt: ChunkData =
-            crate::cbor::from_slice(&data_bytes).expect("roundtrip");
+        let data_rt: ChunkData = crate::cbor::from_slice(&data_bytes).expect("roundtrip");
         assert_eq!(data_rt, data);
     }
 
