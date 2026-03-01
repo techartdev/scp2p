@@ -1,5 +1,7 @@
 # SCP2P: Subscribed Catalog P2P
 
+[🌐 scp2p.com](https://scp2p.com/)
+
 Welcome to **SCP2P** (Subscribed Catalog P2P) — a decentralized, cryptographically-secure communication and data sharing protocol designed for the modern web.
 
 SCP2P is built on a simple yet powerful idea: **you should own your data and your discovery.** Unlike traditional platforms that rely on central servers or global uncurated search, SCP2P empowers individuals and communities to build their own private or public networks of trust.
@@ -150,6 +152,7 @@ cargo test
 
 SCP2P is open source and community-driven. We welcome contributors, testers, and visionaries.
 
+- **Official Website:** [scp2p.com](https://scp2p.com/)
 - **Found an issue?** Open a GitHub Issue.
 - **Want to contribute?** Check out `AGENTS.md` and `PLAN.md` for current priorities.
 - **Guidelines:** Please read our [Code of Conduct](CODE_OF_CONDUCT.md) and [Security Policy](SECURITY.md).
