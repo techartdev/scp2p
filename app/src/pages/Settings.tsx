@@ -11,16 +11,21 @@ import { Button } from "@/components/ui/Button";
 import { Input, TextArea } from "@/components/ui/Input";
 import { PageHeader, PageContent } from "@/components/layout/Layout";
 import * as cmd from "@/lib/commands";
-import type { DesktopClientConfig } from "@/lib/types";
+import type { DesktopClientConfig, RuntimeStatus } from "@/lib/types";
 
 const CONFIG_FILE = "scp2p-desktop-config.cbor";
 
-export function Settings() {
+interface SettingsProps {
+  status: RuntimeStatus | null;
+}
+
+export function Settings({ status }: SettingsProps) {
   const [config, setConfig] = useState<DesktopClientConfig>({
     state_db_path: "scp2p-desktop.db",
     bind_quic: null,
     bind_tcp: "0.0.0.0:7001",
     bootstrap_peers: [],
+    auto_start: false,
   });
   const [bootstrapText, setBootstrapText] = useState("");
   const [loading, setLoading] = useState(false);
@@ -151,7 +156,7 @@ export function Settings() {
                 })
               }
               placeholder="0.0.0.0:7000"
-              hint="QUIC/UDP listen address (optional)"
+              hint="QUIC/UDP listen address (reserved for future use; not yet active)"
               className="font-mono text-xs"
             />
           </div>
@@ -175,6 +180,32 @@ export function Settings() {
         </Card>
       </div>
 
+      {/* Auto-start */}
+      <Card className="mt-6">
+        <CardHeader
+          title="Startup"
+          subtitle="Node auto-start preference"
+          icon={<Server className="h-4 w-4" />}
+        />
+        <label className="flex items-center gap-3 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={config.auto_start}
+            onChange={(e) =>
+              setConfig({ ...config, auto_start: e.target.checked })
+            }
+            className="h-4 w-4 rounded border-border bg-surface text-accent focus:ring-accent/50"
+          />
+          <div>
+            <p className="text-sm text-text-primary">Auto-start node on launch</p>
+            <p className="text-xs text-text-muted">
+              Starts the node automatically when the app opens, using the saved
+              configuration above.
+            </p>
+          </div>
+        </label>
+      </Card>
+
       {/* Info section */}
       <Card className="mt-6">
         <CardHeader
@@ -185,11 +216,11 @@ export function Settings() {
         <div className="grid grid-cols-3 gap-4 text-xs text-text-muted">
           <div>
             <p className="font-medium text-text-secondary mb-1">Version</p>
-            <p>0.1.0</p>
+            <p>{status?.app_version || "—"}</p>
           </div>
           <div>
             <p className="font-medium text-text-secondary mb-1">Protocol</p>
-            <p>SCP2P v0.1</p>
+            <p>{status?.protocol_version ? `v${status.protocol_version}` : "—"}</p>
           </div>
           <div>
             <p className="font-medium text-text-secondary mb-1">Runtime</p>

@@ -95,7 +95,8 @@ The API is currently centered around `Node` and `NodeHandle`.
 - `NodeHandle::dht_republish_once(...)`
 - `NodeHandle::start_dht_republish_loop(...)`
 - `NodeHandle::start_subscription_sync_loop(...)`
-- `NodeHandle::start_tcp_dht_service(...)`
+- `NodeHandle::start_tls_dht_service(...)`
+- `NodeHandle::start_quic_dht_service(...)`
 
 ### Subscriptions / manifests
 - `NodeHandle::subscribe(share_id)`
@@ -150,19 +151,19 @@ The handshake uses a **3-message** mutual-authentication flow:
 2. **ServerHello ←** responder sends pubkey, capabilities, nonce, echoing the client's nonce.
 3. **ClientAck  →** initiator echoes the server's nonce, proving both sides are channel-bound.
 
-All three messages are Ed25519-signed `HandshakeHello` structs.  Frame lengths
-use a 4-byte **big-endian** (network byte order) prefix.
+All three messages are Ed25519-signed `HandshakeHello` structs.  X25519 ephemeral
+key exchange is mandatory; a shared session secret is derived via ECDH for forward
+secrecy.  Frame lengths use a 4-byte **big-endian** (network byte order) prefix.
 
 - `handshake_initiator(...)` — performs steps 1-3 on the client side.
 - `handshake_responder(...)` — performs steps 1-3 on the server side.
 - `read_envelope(...)` / `write_envelope(...)`
 - `dispatch_envelope(...)`
 - `run_message_loop(...)`
-- `tcp_accept_session(...)` / `tcp_connect_session(...)`
 - `build_tls_server_handle(...)`
-- `tls_accept_session(...)` / `tls_connect_session(...)`
+- `tls_accept_session(...)` / `tls_connect_session(...)` / `tls_connect_session_insecure(...)`
 - `start_quic_server(...)`
-- `quic_accept_bi_session(...)` / `quic_connect_bi_session(...)`
+- `quic_accept_bi_session(...)` / `quic_connect_bi_session(...)` / `quic_connect_bi_session_insecure(...)`
 
 ### Network fetch primitives (spec section 9 foundations)
 - `FetchPolicy`
@@ -203,6 +204,7 @@ use a 4-byte **big-endian** (network byte order) prefix.
   - nearest-node lookup by XOR distance
   - per-bucket routing with K-limited bucket membership
   - TTL-based value storage with value-size enforcement
+  - ping-before-evict: liveness probe before overwriting stale bucket entries
 - Iterative network query foundations:
   - `FIND_NODE` iterative lookup (`alpha=3`)
   - `FIND_VALUE` iterative lookup (`alpha=3`)
@@ -285,6 +287,16 @@ Not yet implemented as production-ready behavior:
 - `499`: `HAVE_CONTENT`
 - `500`: `GET_CHUNK`
 - `501`: `CHUNK_DATA`
+- `502`: `GET_CHUNK_HASHES`
+- `503`: `CHUNK_HASH_LIST`
+- `600`: `LIST_PUBLIC_SHARES`
+- `601`: `PUBLIC_SHARE_LIST`
+- `602`: `GET_COMMUNITY_STATUS`
+- `603`: `COMMUNITY_STATUS`
+- `604`: `LIST_COMMUNITY_PUBLIC_SHARES`
+- `605`: `COMMUNITY_PUBLIC_SHARE_LIST`
+- `700`: `RELAY_LIST_REQUEST`
+- `701`: `RELAY_LIST_RESPONSE`
 
 Compatibility policy for this registry:
 

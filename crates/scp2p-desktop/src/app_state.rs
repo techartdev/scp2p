@@ -10,13 +10,12 @@ use anyhow::Context;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use rand::{RngCore, rngs::OsRng};
-#[allow(deprecated)]
-use scp2p_core::transport_net::tcp_connect_session;
 use scp2p_core::{
     BoxedStream, Capabilities, DirectRequestTransport, FetchPolicy, ItemV1, ManifestV1, Node,
     NodeConfig, NodeHandle, OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord,
     PublicShareSummary, SearchPageQuery, ShareItemInfo, ShareVisibility, SqliteStore, Store,
-    TransportProtocol, describe_content,
+    TransportProtocol, build_tls_server_handle, describe_content, quic_connect_bi_session_insecure,
+    start_quic_server, tls_connect_session_insecure,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -40,7 +39,8 @@ struct RuntimeState {
     node: Option<NodeHandle>,
     state_db_path: Option<PathBuf>,
     content_data_dir: Option<PathBuf>,
-    tcp_service_task: Option<JoinHandle<anyhow::Result<()>>>,
+    tls_service_task: Option<JoinHandle<anyhow::Result<()>>>,
+    quic_service_task: Option<JoinHandle<anyhow::Result<()>>>,
     lan_discovery_task: Option<JoinHandle<anyhow::Result<()>>>,
     last_public_shares: Vec<PublicShareView>,
 }
@@ -66,19 +66,29 @@ struct DesktopSessionConnector {
 #[async_trait]
 impl PeerConnector for DesktopSessionConnector {
     async fn connect(&self, peer: &PeerAddr) -> anyhow::Result<BoxedStream> {
-        if peer.transport != TransportProtocol::Tcp {
-            anyhow::bail!("desktop connector only supports tcp peers");
-        }
         let remote = std::net::SocketAddr::new(peer.ip, peer.port);
-        #[allow(deprecated)]
-        let (stream, _) = tcp_connect_session(
-            remote,
-            &self.signing_key,
-            self.capabilities.clone(),
-            peer.pubkey_hint,
-        )
-        .await?;
-        Ok(Box::new(stream) as BoxedStream)
+        match peer.transport {
+            TransportProtocol::Tcp => {
+                let (stream, _) = tls_connect_session_insecure(
+                    remote,
+                    &self.signing_key,
+                    self.capabilities.clone(),
+                    peer.pubkey_hint,
+                )
+                .await?;
+                Ok(Box::new(stream) as BoxedStream)
+            }
+            TransportProtocol::Quic => {
+                let session = quic_connect_bi_session_insecure(
+                    remote,
+                    &self.signing_key,
+                    self.capabilities.clone(),
+                    peer.pubkey_hint,
+                )
+                .await?;
+                Ok(Box::new(session.stream) as BoxedStream)
+            }
+        }
     }
 }
 
@@ -109,14 +119,17 @@ impl DesktopAppState {
 
         let handle = Node::start_with_store(config, store).await?;
         let mut state = self.inner.write().await;
+        let mut rng = OsRng;
+        let service_key = SigningKey::generate(&mut rng);
+        let caps = Capabilities::default();
         if let Some(bind_tcp) = request.bind_tcp {
-            let mut rng = OsRng;
-            let service_key = SigningKey::generate(&mut rng);
-            let caps = Capabilities::default();
-            state.tcp_service_task = Some(handle.clone().start_tcp_dht_service(
+            let tls_server =
+                Arc::new(build_tls_server_handle().context("build TLS server handle")?);
+            state.tls_service_task = Some(handle.clone().start_tls_dht_service(
                 bind_tcp,
-                service_key,
+                service_key.clone(),
                 caps.clone(),
+                tls_server,
             ));
             let mut instance_id = [0u8; 16];
             OsRng.fill_bytes(&mut instance_id);
@@ -124,8 +137,16 @@ impl DesktopAppState {
                 handle.clone(),
                 bind_tcp.port(),
                 instance_id,
-                caps,
+                caps.clone(),
             )));
+        }
+        if let Some(bind_quic) = request.bind_quic {
+            let quic_server = start_quic_server(bind_quic).context("start QUIC server")?;
+            state.quic_service_task = Some(handle.clone().start_quic_dht_service(
+                quic_server,
+                service_key,
+                caps,
+            ));
         }
         state.node = Some(handle);
         state.state_db_path = Some(db_path);
@@ -136,7 +157,10 @@ impl DesktopAppState {
 
     pub async fn stop_node(&self) -> RuntimeStatus {
         let mut state = self.inner.write().await;
-        if let Some(task) = state.tcp_service_task.take() {
+        if let Some(task) = state.tls_service_task.take() {
+            task.abort();
+        }
+        if let Some(task) = state.quic_service_task.take() {
             task.abort();
         }
         if let Some(task) = state.lan_discovery_task.take() {
@@ -179,15 +203,7 @@ impl DesktopAppState {
                 .as_ref()
                 .map(|cfg| cfg.bootstrap_peers.clone())
                 .unwrap_or_default(),
-            warnings: config
-                .as_ref()
-                .and_then(|cfg| {
-                    cfg.bind_quic.map(|_| {
-                        "QUIC listener is not started by the Windows shell yet".to_string()
-                    })
-                })
-                .into_iter()
-                .collect(),
+            warnings: Vec::new(),
         })
     }
 
@@ -244,6 +260,34 @@ impl DesktopAppState {
         node.join_community(scp2p_core::ShareId(share_id), share_pubkey)
             .await?;
         self.community_views().await
+    }
+
+    pub async fn leave_community(&self, share_id_hex: &str) -> anyhow::Result<Vec<CommunityView>> {
+        let node = self.node_handle().await?;
+        let share_id = parse_hex_32(share_id_hex, "share_id")?;
+        node.leave_community(scp2p_core::ShareId(share_id)).await?;
+        self.community_views().await
+    }
+
+    /// Auto-start the node from saved config if `auto_start` is enabled.
+    /// Returns `Some(status)` if the node was started, `None` if auto-start
+    /// is disabled or no config file exists.
+    pub async fn auto_start_node(
+        &self,
+        config_path: &str,
+    ) -> anyhow::Result<Option<RuntimeStatus>> {
+        let config = self.load_client_config(config_path).await?;
+        if !config.auto_start {
+            return Ok(None);
+        }
+        let request = StartNodeRequest {
+            state_db_path: config.state_db_path,
+            bind_quic: config.bind_quic,
+            bind_tcp: config.bind_tcp,
+            bootstrap_peers: config.bootstrap_peers,
+        };
+        let status = self.start_node(request).await?;
+        Ok(Some(status))
     }
 
     pub async fn subscribe_share(
@@ -1112,6 +1156,7 @@ mod tests {
             bind_quic: "127.0.0.1:7400".parse().ok(),
             bind_tcp: "127.0.0.1:7401".parse().ok(),
             bootstrap_peers: vec!["127.0.0.1:7501".to_string()],
+            auto_start: false,
         };
 
         state

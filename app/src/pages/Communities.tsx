@@ -7,6 +7,8 @@ import {
   Eye,
   ChevronRight,
   Bookmark,
+  LogOut,
+  Link,
 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -15,18 +17,32 @@ import { Badge } from "@/components/ui/Badge";
 import { HashDisplay } from "@/components/ui/HashDisplay";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Modal } from "@/components/ui/Modal";
+import { NodeRequiredOverlay } from "@/components/NodeRequiredOverlay";
 import { PageHeader, PageContent } from "@/components/layout/Layout";
 import * as cmd from "@/lib/commands";
-import type { CommunityView, CommunityBrowseView } from "@/lib/types";
+import { decodeShareLink, isShareLink } from "@/lib/shareLink";
+import type {
+  CommunityView,
+  CommunityBrowseView,
+  RuntimeStatus,
+  PageId,
+} from "@/lib/types";
 
-export function Communities() {
+interface CommunitiesProps {
+  status: RuntimeStatus | null;
+  onNavigate: (page: PageId) => void;
+}
+
+export function Communities({ status, onNavigate }: CommunitiesProps) {
   const [communities, setCommunities] = useState<CommunityView[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showJoin, setShowJoin] = useState(false);
+  const [joinInput, setJoinInput] = useState("");
   const [joinId, setJoinId] = useState("");
   const [joinPubkey, setJoinPubkey] = useState("");
   const [joining, setJoining] = useState(false);
+  const [leaving, setLeaving] = useState<string | null>(null);
   const [browseData, setBrowseData] = useState<CommunityBrowseView | null>(
     null
   );
@@ -55,12 +71,41 @@ export function Communities() {
       const result = await cmd.joinCommunity(joinId.trim(), joinPubkey.trim());
       setCommunities(result);
       setShowJoin(false);
+      setJoinInput("");
       setJoinId("");
       setJoinPubkey("");
     } catch (e) {
       setError(String(e));
     }
     setJoining(false);
+  };
+
+  /** Parse scp2p:// link and auto-fill the join fields. */
+  const handleJoinInputChange = (value: string) => {
+    setJoinInput(value);
+    if (isShareLink(value)) {
+      try {
+        const { shareIdHex, sharePubkeyHex } = decodeShareLink(value);
+        setJoinId(shareIdHex);
+        setJoinPubkey(sharePubkeyHex);
+      } catch {
+        // invalid link — leave manual fields as-is
+      }
+    }
+  };
+
+  const handleLeave = async (shareIdHex: string) => {
+    setLeaving(shareIdHex);
+    try {
+      const result = await cmd.leaveCommunity(shareIdHex);
+      setCommunities(result);
+      if (browseData?.community_share_id_hex === shareIdHex) {
+        setBrowseData(null);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+    setLeaving(null);
   };
 
   const handleBrowse = async (shareIdHex: string) => {
@@ -75,7 +120,8 @@ export function Communities() {
   };
 
   return (
-    <PageContent>
+    <NodeRequiredOverlay status={status} onNavigate={onNavigate}>
+      <PageContent>
       <PageHeader
         title="Communities"
         subtitle="Join and browse peer communities"
@@ -155,6 +201,15 @@ export function Communities() {
                   loading={browsing}
                 >
                   Browse
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  icon={<LogOut className="h-3.5 w-3.5" />}
+                  onClick={() => handleLeave(community.share_id_hex)}
+                  loading={leaving === community.share_id_hex}
+                >
+                  Leave
                 </Button>
               </div>
             </Card>
@@ -284,25 +339,36 @@ export function Communities() {
       >
         <div className="space-y-4">
           <p className="text-sm text-text-secondary">
-            Enter the community's Share ID and public key to join. You'll be
-            able to discover other participants and browse public shares.
+            Paste a <code className="text-accent">scp2p://s/...</code> share
+            link, or enter the community's Share ID and public key manually.
           </p>
           <Input
-            label="Share ID (hex)"
-            placeholder="Enter community share ID..."
-            value={joinId}
-            onChange={(e) => setJoinId(e.target.value)}
-            className="font-mono text-xs"
+            label="Share Link (recommended)"
+            placeholder="scp2p://s/..."
+            value={joinInput}
+            onChange={(e) => handleJoinInputChange(e.target.value)}
+            icon={<Link className="h-3.5 w-3.5" />}
+            hint="Paste a share link to auto-fill the fields below"
           />
-          <Input
-            label="Share Public Key (hex)"
-            placeholder="Enter community public key..."
-            value={joinPubkey}
-            onChange={(e) => setJoinPubkey(e.target.value)}
-            className="font-mono text-xs"
-          />
+          <div className="border-t border-border pt-3 space-y-3">
+            <Input
+              label="Share ID (hex)"
+              placeholder="Enter community share ID..."
+              value={joinId}
+              onChange={(e) => setJoinId(e.target.value)}
+              className="font-mono text-xs"
+            />
+            <Input
+              label="Share Public Key (hex)"
+              placeholder="Enter community public key..."
+              value={joinPubkey}
+              onChange={(e) => setJoinPubkey(e.target.value)}
+              className="font-mono text-xs"
+            />
+          </div>
         </div>
       </Modal>
     </PageContent>
+    </NodeRequiredOverlay>
   );
 }

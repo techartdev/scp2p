@@ -80,11 +80,10 @@ pub use transport::{
     WireDispatcher, dispatch_envelope, generate_nonce, handshake_initiator, handshake_responder,
     read_envelope, run_message_loop, write_envelope,
 };
-#[allow(deprecated)]
 pub use transport_net::{
     QuicBiStream, QuicClientSession, QuicServerHandle, TlsServerHandle, build_tls_server_handle,
-    quic_accept_bi_session, quic_connect_bi_session, start_quic_server, tcp_accept_session,
-    tcp_connect_session, tls_accept_session, tls_connect_session,
+    quic_accept_bi_session, quic_connect_bi_session, quic_connect_bi_session_insecure,
+    start_quic_server, tls_accept_session, tls_connect_session, tls_connect_session_insecure,
 };
 
 #[cfg(test)]

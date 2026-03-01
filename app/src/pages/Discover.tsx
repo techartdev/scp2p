@@ -35,11 +35,12 @@ import { Badge } from "@/components/ui/Badge";
 import { HashDisplay } from "@/components/ui/HashDisplay";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Modal } from "@/components/ui/Modal";
+import { NodeRequiredOverlay } from "@/components/NodeRequiredOverlay";
 import { DownloadQueue } from "@/components/DownloadQueue";
 import type { DownloadJob } from "@/components/DownloadQueue";
 import * as cmd from "@/lib/commands";
 import { decodeShareLink, isShareLink } from "@/lib/shareLink";
-import type { SubscriptionView, PublicShareView, ShareItemView, PeerView } from "@/lib/types";
+import type { SubscriptionView, PublicShareView, ShareItemView, PeerView, RuntimeStatus, PageId } from "@/lib/types";
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -321,7 +322,12 @@ function TreeRow({
 
 /* ── Main component ──────────────────────────────────────────────────── */
 
-export function Discover() {
+interface DiscoverProps {
+  status: RuntimeStatus | null;
+  onNavigate: (page: PageId) => void;
+}
+
+export function Discover({ status, onNavigate }: DiscoverProps) {
   // Left panel state
   const [subs, setSubs] = useState<SubscriptionView[]>([]);
   const [publicShares, setPublicShares] = useState<PublicShareView[]>([]);
@@ -690,6 +696,7 @@ export function Discover() {
   const hasQueueJobs = downloadJobs.length > 0;
 
   return (
+    <NodeRequiredOverlay status={status} onNavigate={onNavigate}>
     <div ref={containerRef} className="flex flex-col h-full overflow-hidden">
       {/* ── Top area: share list + file browser ────────────────────────── */}
       <div className="flex overflow-hidden" style={{ flex: hasQueueJobs ? `1 1 0` : '1 1 0', minHeight: 200 }}>
@@ -1121,5 +1128,6 @@ export function Discover() {
         </div>
       </Modal>
     </div>
+    </NodeRequiredOverlay>
   );
 }

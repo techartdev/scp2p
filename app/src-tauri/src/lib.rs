@@ -63,6 +63,16 @@ async fn load_client_config(
         .map_err(|e| format!("{e:#}"))
 }
 
+#[tauri::command]
+async fn auto_start_node(
+    state: tauri::State<'_, AppState>,
+    config_path: String,
+) -> Result<Option<RuntimeStatus>, String> {
+    commands::auto_start_node(&state.0, config_path)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 // ── Peers ───────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -126,6 +136,16 @@ async fn join_community(
     share_pubkey_hex: String,
 ) -> Result<Vec<CommunityView>, String> {
     commands::join_community(&state.0, share_id_hex, share_pubkey_hex)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn leave_community(
+    state: tauri::State<'_, AppState>,
+    share_id_hex: String,
+) -> Result<Vec<CommunityView>, String> {
+    commands::leave_community(&state.0, share_id_hex)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -261,13 +281,25 @@ async fn download_share_items(
     content_ids_hex: Vec<String>,
     target_dir: String,
 ) -> Result<Vec<String>, String> {
+    // Clone the content IDs so we can track which item is currently downloading.
+    let ids_for_progress = content_ids_hex.clone();
+    let current_index = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let progress_cb: scp2p_core::ProgressCallback = {
         let app = app.clone();
+        let idx = current_index.clone();
+        let ids = ids_for_progress;
         Box::new(move |completed_chunks, total_chunks, bytes_downloaded| {
+            let i = idx.load(std::sync::atomic::Ordering::Relaxed);
+            let content_id = ids.get(i).cloned().unwrap_or_default();
+            // When we see completed == total for a non-zero total, advance
+            // to the next item for subsequent callbacks.
+            if total_chunks > 0 && completed_chunks == total_chunks && i + 1 < ids.len() {
+                idx.store(i + 1, std::sync::atomic::Ordering::Relaxed);
+            }
             let _ = app.emit(
                 "download-progress",
                 DownloadProgress {
-                    content_id_hex: String::new(),
+                    content_id_hex: content_id,
                     completed_chunks,
                     total_chunks,
                     bytes_downloaded,
@@ -330,6 +362,7 @@ pub fn run() {
             runtime_status,
             save_client_config,
             load_client_config,
+            auto_start_node,
             list_peers,
             list_subscriptions,
             subscribe_share,
@@ -337,6 +370,7 @@ pub fn run() {
             sync_now,
             list_communities,
             join_community,
+            leave_community,
             browse_community,
             search_catalogs,
             browse_public_shares,

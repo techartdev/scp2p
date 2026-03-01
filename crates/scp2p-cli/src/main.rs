@@ -14,12 +14,11 @@ use async_trait::async_trait;
 use clap::{Parser, Subcommand};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-#[allow(deprecated)]
-use scp2p_core::transport_net::tcp_connect_session;
 use scp2p_core::{
     BoxedStream, Capabilities, DirectRequestTransport, FetchPolicy, ItemV1, ManifestV1, Node,
     NodeConfig, NodeId, PeerAddr, PeerConnector, SearchQuery, ShareId, ShareKeypair,
-    ShareVisibility, SqliteStore, Store, TransportProtocol, describe_content,
+    ShareVisibility, SqliteStore, Store, TransportProtocol, build_tls_server_handle,
+    describe_content, quic_connect_bi_session_insecure, tls_connect_session_insecure,
 };
 
 #[derive(Parser)]
@@ -141,20 +140,30 @@ struct CliSessionConnector {
 #[async_trait]
 impl PeerConnector for CliSessionConnector {
     async fn connect(&self, peer: &PeerAddr) -> anyhow::Result<BoxedStream> {
-        if peer.transport != TransportProtocol::Tcp {
-            anyhow::bail!("cli session connector only supports tcp peers");
-        }
         let remote = SocketAddr::new(peer.ip, peer.port);
         let expected = peer.pubkey_hint;
-        #[allow(deprecated)]
-        let (stream, _session) = tcp_connect_session(
-            remote,
-            &self.signing_key,
-            self.capabilities.clone(),
-            expected,
-        )
-        .await?;
-        Ok(Box::new(stream) as BoxedStream)
+        match peer.transport {
+            TransportProtocol::Tcp => {
+                let (stream, _session) = tls_connect_session_insecure(
+                    remote,
+                    &self.signing_key,
+                    self.capabilities.clone(),
+                    expected,
+                )
+                .await?;
+                Ok(Box::new(stream) as BoxedStream)
+            }
+            TransportProtocol::Quic => {
+                let session = quic_connect_bi_session_insecure(
+                    remote,
+                    &self.signing_key,
+                    self.capabilities.clone(),
+                    expected,
+                )
+                .await?;
+                Ok(Box::new(session.stream) as BoxedStream)
+            }
+        }
     }
 }
 
@@ -190,10 +199,12 @@ async fn main() -> anyhow::Result<()> {
             let node = open_node(&state_db, &bootstrap).await?;
             let mut rng = OsRng;
             let node_key = SigningKey::generate(&mut rng);
-            let _service = node.clone().start_tcp_dht_service(
+            let tls_server = Arc::new(build_tls_server_handle().expect("build TLS server handle"));
+            let _service = node.clone().start_tls_dht_service(
                 "0.0.0.0:7001".parse()?,
                 node_key,
                 scp2p_core::Capabilities::default(),
+                tls_server,
             );
             let peers = bootstrap
                 .iter()

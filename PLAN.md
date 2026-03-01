@@ -38,7 +38,7 @@ Spec mapping and gaps:
 - Desktop Tauri frontend: unified Discover page, rewritten Dashboard, simplified Sidebar
 
 ### Test count
-**129 tests passing** (119 scp2p-core + 10 scp2p-desktop), 0 clippy warnings.
+**169 tests passing** (157 scp2p-core + 12 scp2p-desktop), 0 clippy warnings.
 
 ### Quality level
 - Functional prototype logic exists and is well covered by unit tests.
@@ -105,20 +105,19 @@ Remaining work:
 ### C) Transport and session security
 Status: **Done (foundational implementation complete)**
 
-- QUIC runtime foundations implemented
-- TLS-over-TCP fallback foundations implemented
+- QUIC runtime fully wired: `start_quic_server`, `quic_accept_bi_session`, `quic_connect_bi_session`, `quic_connect_bi_session_insecure`, `start_quic_dht_service`
+- TLS-over-TCP fully wired: `build_tls_server_handle`, `tls_accept_session`, `tls_connect_session`, `tls_connect_session_insecure`, `start_tls_dht_service`
+- All deprecated plain-TCP code removed (no `tcp_accept_session`, `tcp_connect_session`, `start_tcp_dht_service`)
 - **3-message handshake** (ClientHello → ServerHello → ClientAck) implemented; both nonces are mutually echoed, fully binding the channel
+- **X25519 ephemeral key exchange is mandatory**; session secret derived via ECDH for forward secrecy
 - identity-bound handshake verification (`remote_node_pubkey` binding) implemented
-- `protocol_version: u16` field in handshake; current version is 1
+- `protocol_version: u16` field in handshake (required, no serde default); current version is 1
 - bootstrap peer address parsing supports `quic://` and `tcp://` prefixes
 - message send/recv loop + dispatcher for all envelope `type` values implemented
 - backpressure/max message size checks implemented for framed envelopes
 - handshake timestamp freshness/skew validation added
 - frame length prefix documented as big-endian (network byte order)
-
-Critical spec alignment:
-- define and freeze a stable `type: u16` registry for message kinds
-- ensure deterministic encoding for all signed payloads
+- No legacy backward-compatibility code remains (string-key CBOR fallback removed, optional ephemeral key removed)
 
 ### D) Persistence layer and boundaries
 Status: **In progress**
@@ -132,7 +131,7 @@ Implemented:
 - all SQLite I/O runs inside `tokio::task::spawn_blocking` (no async blocking)
 - `CURRENT_SCHEMA_VERSION` constant + migration runner in `ensure_schema`; schema version persisted in metadata table
 - all writes use UPSERT (`INSERT … ON CONFLICT DO UPDATE`) with stale-key pruning — no more DELETE+INSERT
-- all legacy fallback code removed (no old `scp2p_state` table, no legacy migration helpers)
+- chunk hashes are computed lazily on first request (not at startup), eliminating O(total-content-size) startup cost
 
 Remaining work:
 - harden versioning/migration around persisted community membership and publisher identity slices when those object models stabilize in the spec

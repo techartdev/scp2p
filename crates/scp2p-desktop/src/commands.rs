@@ -206,3 +206,17 @@ pub async fn update_my_share_visibility(
         .update_my_share_visibility(&share_id_hex, visibility)
         .await
 }
+
+pub async fn leave_community(
+    app_state: &DesktopAppState,
+    share_id_hex: String,
+) -> anyhow::Result<Vec<CommunityView>> {
+    app_state.leave_community(&share_id_hex).await
+}
+
+pub async fn auto_start_node(
+    app_state: &DesktopAppState,
+    config_path: String,
+) -> anyhow::Result<Option<RuntimeStatus>> {
+    app_state.auto_start_node(&config_path).await
+}

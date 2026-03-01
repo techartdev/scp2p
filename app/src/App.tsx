@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Dashboard } from "@/pages/Dashboard";
 import { Discover } from "@/pages/Discover";
@@ -9,9 +9,12 @@ import { Settings } from "@/pages/Settings";
 import * as cmd from "@/lib/commands";
 import type { RuntimeStatus, PageId } from "@/lib/types";
 
+const CONFIG_FILE = "scp2p-desktop-config.cbor";
+
 export default function App() {
   const [page, setPage] = useState<PageId>("dashboard");
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
+  const autoStartAttempted = useRef(false);
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -21,6 +24,8 @@ export default function App() {
       // node may not be ready yet
       setStatus({
         running: false,
+        app_version: "",
+        protocol_version: 0,
         state_db_path: null,
         bind_quic: null,
         bind_tcp: null,
@@ -28,6 +33,22 @@ export default function App() {
         warnings: [],
       });
     }
+  }, []);
+
+  // Auto-start node on first launch if config has auto_start enabled
+  useEffect(() => {
+    if (autoStartAttempted.current) return;
+    autoStartAttempted.current = true;
+    (async () => {
+      try {
+        const result = await cmd.autoStartNode(CONFIG_FILE);
+        if (result) {
+          setStatus(result);
+        }
+      } catch {
+        // auto-start failed — user will start manually
+      }
+    })();
   }, []);
 
   useEffect(() => {
@@ -48,15 +69,15 @@ export default function App() {
           />
         );
       case "discover":
-        return <Discover />;
+        return <Discover status={status} onNavigate={setPage} />;
       case "communities":
-        return <Communities />;
+        return <Communities status={status} onNavigate={setPage} />;
       case "search":
-        return <SearchPage />;
+        return <SearchPage status={status} onNavigate={setPage} />;
       case "my-shares":
-        return <MyShares />;
+        return <MyShares status={status} onNavigate={setPage} />;
       case "settings":
-        return <Settings />;
+        return <Settings status={status} />;
       default:
         return (
           <Dashboard
@@ -74,6 +95,7 @@ export default function App() {
         currentPage={page}
         onNavigate={setPage}
         nodeRunning={status?.running ?? false}
+        appVersion={status?.app_version}
       />
       <div className="flex-1 flex flex-col overflow-hidden">
         {/* Top chrome bar - subtle gradient line */}

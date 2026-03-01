@@ -28,7 +28,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     config::NodeConfig,
-    content::{ChunkedContent, chunk_hashes},
+    content::ChunkedContent,
     dht::{DEFAULT_TTL_SECS, Dht},
     dht_keys::share_head_key,
     ids::{ContentId, ShareId},
@@ -476,23 +476,15 @@ impl NodeState {
         for manifest in manifests.values() {
             rebuilt_search_index.index_manifest(manifest);
             for item in &manifest.items {
-                // Recompute chunk hashes from the file path (preferred) or
-                // legacy blob store so the node can serve GetChunkHashes
-                // requests after a restart.
-                let chunks = if let Some(path) = content_paths.get(&item.content_id) {
-                    // Read file and compute chunk hashes on the fly.
-                    std::fs::read(path)
-                        .ok()
-                        .map(|bytes| chunk_hashes(&bytes))
-                        .unwrap_or_default()
-                } else {
-                    vec![]
-                };
+                // Register content metadata without reading files from disk.
+                // Chunk hashes are computed lazily on first request via
+                // `chunk_hash_list()`, avoiding O(total-content-size) startup
+                // cost.
                 content_catalog.insert(
                     item.content_id,
                     ChunkedContent {
                         content_id: ContentId(item.content_id),
-                        chunks,
+                        chunks: vec![],
                         chunk_count: item.chunk_count,
                         chunk_list_hash: item.chunk_list_hash,
                     },

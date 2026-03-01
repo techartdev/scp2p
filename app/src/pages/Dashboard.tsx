@@ -11,6 +11,7 @@ import {
   AlertTriangle,
   Clock,
   Compass,
+  Settings,
 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -23,8 +24,11 @@ import type {
   PeerView,
   SubscriptionView,
   CommunityView,
+  DesktopClientConfig,
   PageId,
 } from "@/lib/types";
+
+const CONFIG_FILE = "scp2p-desktop-config.cbor";
 
 interface DashboardProps {
   status: RuntimeStatus | null;
@@ -47,6 +51,7 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
   const [communities, setCommunities] = useState<CommunityView[]>([]);
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
   const loadStats = useCallback(async () => {
     if (!status?.running) return;
@@ -70,16 +75,31 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
 
   const handleStart = async () => {
     setStarting(true);
+    setStartError(null);
     try {
+      // Load saved config; fall back to defaults if no config file exists.
+      let config: DesktopClientConfig;
+      try {
+        config = await cmd.loadClientConfig(CONFIG_FILE);
+      } catch {
+        config = {
+          state_db_path: "scp2p-desktop.db",
+          bind_quic: null,
+          bind_tcp: "0.0.0.0:7001",
+          bootstrap_peers: [],
+          auto_start: false,
+        };
+      }
       await cmd.startNode({
-        state_db_path: "scp2p-desktop.db",
-        bind_quic: null,
-        bind_tcp: "0.0.0.0:7001",
-        bootstrap_peers: [],
+        state_db_path: config.state_db_path,
+        bind_quic: config.bind_quic,
+        bind_tcp: config.bind_tcp,
+        bootstrap_peers: config.bootstrap_peers,
       });
       onRefresh();
       await loadStats();
     } catch (e) {
+      setStartError(String(e));
       console.error("start failed:", e);
     }
     setStarting(false);
@@ -185,6 +205,11 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
                     {status.state_db_path}
                   </span>
                 )}
+                {status?.app_version && (
+                  <span className="text-xs text-text-muted">
+                    v{status.app_version}
+                  </span>
+                )}
               </div>
             </div>
           </div>
@@ -208,6 +233,23 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
           </div>
         )}
       </Card>
+
+      {/* Start error */}
+      {startError && (
+        <Card className="mb-4 border-danger/30">
+          <div className="flex items-center justify-between">
+            <p className="text-sm text-danger">{startError}</p>
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={<Settings className="h-3.5 w-3.5" />}
+              onClick={() => onNavigate("settings")}
+            >
+              Open Settings
+            </Button>
+          </div>
+        </Card>
+      )}
 
       {/* Stats grid */}
       <div className="grid grid-cols-3 gap-4 mb-6">

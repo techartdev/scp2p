@@ -12,8 +12,9 @@ use ed25519_dalek::SigningKey;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-#[allow(deprecated)]
-use crate::transport_net::tcp_accept_session;
+use crate::transport_net::{
+    QuicServerHandle, TlsServerHandle, quic_accept_bi_session, tls_accept_session,
+};
 use crate::{
     capabilities::Capabilities,
     dht::{ALPHA, DEFAULT_TTL_SECS, DhtInsertResult, DhtNodeRecord, DhtValue, K, MAX_VALUE_SIZE},
@@ -50,15 +51,39 @@ impl NodeHandle {
             local_target,
         );
 
-        // For now, when a ping-before-evict result is returned we
-        // silently drop the new node (conservative: keeps existing
-        // stable nodes).  Full async ping integration belongs in the
-        // networking layer.
         match result {
             DhtInsertResult::Inserted => {}
-            DhtInsertResult::PendingEviction { .. } => {
-                // TODO: ping stale_node, call complete_eviction on
-                // failure, refresh_node on success.
+            DhtInsertResult::PendingEviction {
+                stale_node,
+                new_node,
+                bucket_idx,
+            } => {
+                // Ping-before-evict: spawn a background task to probe
+                // the stale node.  A successful TCP connect (within a
+                // short timeout) is treated as "alive" — the stale node
+                // is refreshed and the new node dropped.  On failure the
+                // stale node is evicted and replaced by the new one.
+                let handle = self.clone();
+                tokio::spawn(async move {
+                    let remote =
+                        std::net::SocketAddr::new(stale_node.addr.ip, stale_node.addr.port);
+                    let alive = tokio::time::timeout(
+                        Duration::from_millis(1500),
+                        tokio::net::TcpStream::connect(remote),
+                    )
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+
+                    let mut state = handle.state.write().await;
+                    if alive {
+                        let ts = now_unix_secs().unwrap_or(0);
+                        state.dht.refresh_node(&stale_node.node_id, ts);
+                    } else {
+                        state
+                            .dht
+                            .complete_eviction(bucket_idx, stale_node.node_id, *new_node);
+                    }
+                });
             }
             DhtInsertResult::RejectedSubnetLimit => {}
         }
@@ -375,19 +400,29 @@ impl NodeHandle {
         })
     }
 
-    pub fn start_tcp_dht_service(
+    /// Start a **TLS-over-TCP** listener that accepts incoming sessions.
+    ///
+    /// The returned task listens on `bind_addr`, wraps every accepted
+    /// TCP stream in a TLS session using the provided server handle,
+    /// then runs the SCP2P handshake and dispatches messages.
+    pub fn start_tls_dht_service(
         self,
         bind_addr: SocketAddr,
         local_signing_key: SigningKey,
         capabilities: Capabilities,
+        tls_server: Arc<TlsServerHandle>,
     ) -> JoinHandle<anyhow::Result<()>> {
         tokio::spawn(async move {
             let listener = TcpListener::bind(bind_addr).await?;
             loop {
-                #[allow(deprecated)]
-                let accepted =
-                    tcp_accept_session(&listener, &local_signing_key, capabilities.clone(), None)
-                        .await;
+                let accepted = tls_accept_session(
+                    &listener,
+                    &tls_server,
+                    &local_signing_key,
+                    capabilities.clone(),
+                    None,
+                )
+                .await;
                 let Ok((stream, session, remote_addr)) = accepted else {
                     continue;
                 };
@@ -395,6 +430,44 @@ impl NodeHandle {
                     ip: remote_addr.ip(),
                     port: remote_addr.port(),
                     transport: crate::peer::TransportProtocol::Tcp,
+                    pubkey_hint: Some(session.remote_node_pubkey),
+                    relay_via: None,
+                };
+                let node = self.clone();
+                tokio::spawn(async move {
+                    let _ = node.serve_wire_stream(stream, Some(remote_peer)).await;
+                });
+            }
+        })
+    }
+
+    /// Start a **QUIC/UDP** listener that accepts incoming sessions.
+    ///
+    /// The returned task accepts bidirectional QUIC streams on the
+    /// given server endpoint, runs the SCP2P handshake, and dispatches
+    /// messages.
+    pub fn start_quic_dht_service(
+        self,
+        quic_server: QuicServerHandle,
+        local_signing_key: SigningKey,
+        capabilities: Capabilities,
+    ) -> JoinHandle<anyhow::Result<()>> {
+        tokio::spawn(async move {
+            loop {
+                let accepted = quic_accept_bi_session(
+                    &quic_server,
+                    &local_signing_key,
+                    capabilities.clone(),
+                    None,
+                )
+                .await;
+                let Ok((stream, session, remote_addr)) = accepted else {
+                    continue;
+                };
+                let remote_peer = PeerAddr {
+                    ip: remote_addr.ip(),
+                    port: remote_addr.port(),
+                    transport: crate::peer::TransportProtocol::Quic,
                     pubkey_hint: Some(session.remote_node_pubkey),
                     relay_via: None,
                 };

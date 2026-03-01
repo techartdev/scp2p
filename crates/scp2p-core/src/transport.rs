@@ -84,7 +84,7 @@ pub struct AuthenticatedSession {
     /// Shared session secret derived from ephemeral X25519 key exchange.
     /// Provides forward secrecy: even if long-term Ed25519 keys are
     /// compromised later, previously recorded sessions cannot be replayed.
-    pub session_secret: Option<[u8; 32]>,
+    pub session_secret: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,17 +95,10 @@ struct HandshakeHello {
     pub echoed_nonce: Option<[u8; 32]>,
     pub timestamp_unix_secs: u64,
     /// Wire-protocol version advertised by the sender.
-    #[serde(default = "default_protocol_version")]
     pub protocol_version: u16,
     /// Ephemeral X25519 public key for forward-secret key exchange.
-    /// `None` only when talking to a legacy peer that predates this field.
-    #[serde(default)]
-    pub ephemeral_pubkey: Option<[u8; 32]>,
+    pub ephemeral_pubkey: [u8; 32],
     pub signature: Vec<u8>,
-}
-
-fn default_protocol_version() -> u16 {
-    1
 }
 
 /// Fields signed during handshake. The ephemeral X25519 public key (field 6)
@@ -118,7 +111,7 @@ struct HandshakeSigningTuple(
     Option<[u8; 32]>, // 3: echoed_nonce
     u64,              // 4: timestamp_unix_secs
     u16,              // 5: protocol_version
-    Option<[u8; 32]>, // 6: ephemeral_pubkey (X25519)
+    [u8; 32],         // 6: ephemeral_pubkey (X25519)
 );
 
 /// Generate an ephemeral X25519 keypair for forward-secret key exchange.
@@ -171,7 +164,7 @@ where
         capabilities.clone(),
         local_nonce,
         None,
-        Some(eph_pubkey),
+        eph_pubkey,
     )?;
     write_handshake_hello(io, &client_hello).await?;
 
@@ -193,23 +186,16 @@ where
         capabilities,
         local_nonce,
         Some(server_hello.nonce),
-        Some(eph_pubkey),
+        eph_pubkey,
     )?;
     write_handshake_hello(io, &ack).await?;
 
     // Derive session secret from X25519 DH
-    let session_secret = match server_hello.ephemeral_pubkey {
-        Some(remote_eph) => {
-            let remote_pub = X25519PublicKey::from(remote_eph);
-            let dh_shared = eph_secret.diffie_hellman(&remote_pub);
-            Some(derive_session_secret(
-                dh_shared.as_bytes(),
-                &local_nonce,
-                &server_hello.nonce,
-            ))
-        }
-        None => None, // legacy peer without ephemeral key support
-    };
+    let remote_eph = server_hello.ephemeral_pubkey;
+    let remote_pub = X25519PublicKey::from(remote_eph);
+    let dh_shared = eph_secret.diffie_hellman(&remote_pub);
+    let session_secret =
+        derive_session_secret(dh_shared.as_bytes(), &local_nonce, &server_hello.nonce);
 
     let session = AuthenticatedSession {
         remote_node_pubkey: server_hello.node_pubkey,
@@ -268,7 +254,7 @@ where
         capabilities,
         local_nonce,
         Some(client_hello.nonce),
-        Some(eph_pubkey),
+        eph_pubkey,
     )?;
     write_handshake_hello(io, &server_hello).await?;
 
@@ -283,18 +269,11 @@ where
     }
 
     // Derive session secret from X25519 DH
-    let session_secret = match client_hello.ephemeral_pubkey {
-        Some(remote_eph) => {
-            let remote_pub = X25519PublicKey::from(remote_eph);
-            let dh_shared = eph_secret.diffie_hellman(&remote_pub);
-            Some(derive_session_secret(
-                dh_shared.as_bytes(),
-                &client_hello.nonce,
-                &local_nonce,
-            ))
-        }
-        None => None, // legacy peer without ephemeral key support
-    };
+    let remote_eph = client_hello.ephemeral_pubkey;
+    let remote_pub = X25519PublicKey::from(remote_eph);
+    let dh_shared = eph_secret.diffie_hellman(&remote_pub);
+    let session_secret =
+        derive_session_secret(dh_shared.as_bytes(), &client_hello.nonce, &local_nonce);
 
     let session = AuthenticatedSession {
         remote_node_pubkey: client_hello.node_pubkey,
@@ -328,7 +307,7 @@ fn signed_hello(
     capabilities: Capabilities,
     nonce: [u8; 32],
     echoed_nonce: Option<[u8; 32]>,
-    ephemeral_pubkey: Option<[u8; 32]>,
+    ephemeral_pubkey: [u8; 32],
 ) -> anyhow::Result<HandshakeHello> {
     signed_hello_at(
         signing_key,
@@ -346,7 +325,7 @@ fn signed_hello_at(
     nonce: [u8; 32],
     echoed_nonce: Option<[u8; 32]>,
     timestamp_unix_secs: u64,
-    ephemeral_pubkey: Option<[u8; 32]>,
+    ephemeral_pubkey: [u8; 32],
 ) -> anyhow::Result<HandshakeHello> {
     let pubkey = signing_key.verifying_key().to_bytes();
     let signable = HandshakeSigningTuple(
@@ -1000,7 +979,7 @@ mod tests {
                 Capabilities::default(),
                 [9u8; 32],
                 Some([7u8; 32]),
-                None,
+                [0u8; 32],
             )
             .expect("sign wrong hello");
             let _ = client;
@@ -1037,7 +1016,7 @@ mod tests {
             [3u8; 32],
             None,
             now.saturating_sub(HANDSHAKE_MAX_CLOCK_SKEW_SECS + 1),
-            None,
+            [0u8; 32],
         )
         .expect("hello");
         let err = verify_hello(&hello).expect_err("stale timestamp must fail");
@@ -1058,7 +1037,7 @@ mod tests {
             [4u8; 32],
             None,
             now + HANDSHAKE_MAX_CLOCK_SKEW_SECS + 1,
-            None,
+            [0u8; 32],
         )
         .expect("hello");
         let err = verify_hello(&hello).expect_err("future timestamp must fail");
@@ -1104,7 +1083,7 @@ mod tests {
                 Capabilities::default(),
                 client_nonce,
                 None,
-                None,
+                [0u8; 32],
             )
             .expect("client hello");
             write_handshake_hello(&mut client_io, &hello)
@@ -1122,7 +1101,7 @@ mod tests {
                 Capabilities::default(),
                 client_nonce,
                 Some([0xFFu8; 32]), // wrong nonce
-                None,
+                [0u8; 32],
             )
             .expect("bad ack");
             write_handshake_hello(&mut client_io, &bad_ack)
@@ -1168,7 +1147,7 @@ mod tests {
                 Capabilities::default(),
                 client_nonce,
                 None,
-                None,
+                [0u8; 32],
             )
             .expect("client hello");
             write_handshake_hello(&mut client_io, &hello)
@@ -1186,7 +1165,7 @@ mod tests {
                 Capabilities::default(),
                 client_nonce,
                 Some(server.nonce),
-                None,
+                [0u8; 32],
             )
             .expect("imposter ack");
             write_handshake_hello(&mut client_io, &bad_ack)
@@ -1248,20 +1227,9 @@ mod tests {
 
         let server_session = server.await.expect("join").expect("server handshake");
 
-        // Both sides should have derived a session secret
-        assert!(
-            client_session.session_secret.is_some(),
-            "client should have session secret"
-        );
-        assert!(
-            server_session.session_secret.is_some(),
-            "server should have session secret"
-        );
-
         // The secrets must match
         assert_eq!(
-            client_session.session_secret.unwrap(),
-            server_session.session_secret.unwrap(),
+            client_session.session_secret, server_session.session_secret,
             "session secrets must match"
         );
 
@@ -1294,13 +1262,11 @@ mod tests {
         let server_session2 = server2.await.expect("join").expect("server handshake 2");
 
         assert_ne!(
-            client_session.session_secret.unwrap(),
-            session2.session_secret.unwrap(),
+            client_session.session_secret, session2.session_secret,
             "different handshakes must produce different session secrets"
         );
         assert_eq!(
-            session2.session_secret.unwrap(),
-            server_session2.session_secret.unwrap(),
+            session2.session_secret, server_session2.session_secret,
             "second handshake secrets must match"
         );
     }

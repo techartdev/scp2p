@@ -12,14 +12,12 @@ use crate::{manifest::PublicShareSummary, peer::PeerAddr};
 // ── Integer-keyed CBOR helpers ──────────────────────────────────────────
 //
 // High-frequency wire payloads are encoded as CBOR maps with integer keys
-// (rather than string field names) to reduce bandwidth.  The deserialization
-// helpers accept both integer and string keys for backward compatibility.
+// (rather than string field names) to reduce bandwidth.
 
 mod int_cbor {
     use ciborium::Value;
 
-    /// Extract a `Vec<(Value, Value)>` map from a ciborium `Value`,
-    /// accepting both CBOR maps and legacy serde struct maps.
+    /// Extract a `Vec<(Value, Value)>` map from a ciborium `Value`.
     pub fn into_map(val: Value) -> Result<Vec<(Value, Value)>, String> {
         match val {
             Value::Map(m) => Ok(m),
@@ -27,18 +25,20 @@ mod int_cbor {
         }
     }
 
-    /// Find a field in a CBOR map by integer key, falling back to a string key.
+    /// Find a field in a CBOR map by integer key.
+    ///
+    /// The `str_key` parameter is unused for matching but kept as a
+    /// label for error messages in callers.
     pub fn find_field<'a>(
         map: &'a [(Value, Value)],
         int_key: i64,
-        str_key: &str,
+        _str_key: &str,
     ) -> Option<&'a Value> {
         map.iter()
             .find(|(k, _)| {
                 k.as_integer()
                     .map(|i| i128::from(i) == int_key as i128)
                     .unwrap_or(false)
-                    || k.as_text().map(|s| s == str_key).unwrap_or(false)
             })
             .map(|(_, v)| v)
     }
@@ -897,43 +897,6 @@ mod tests {
         }
     }
 
-    /// Verify backward compatibility: FindNode decodes from string-keyed maps.
-    #[test]
-    fn int_cbor_find_node_backward_compat_string_keys() {
-        // Build a string-keyed CBOR map manually (old format)
-        let legacy = ciborium::Value::Map(vec![(
-            ciborium::Value::Text("target_node_id".into()),
-            ciborium::Value::Bytes(vec![0xCC; 20]),
-        )]);
-        let bytes = crate::cbor::to_vec(&legacy).expect("encode legacy");
-        let decoded: FindNode = crate::cbor::from_slice(&bytes).expect("decode legacy");
-        assert_eq!(decoded.target_node_id, [0xCC; 20]);
-    }
-
-    /// Verify backward compatibility: Store decodes from string-keyed maps.
-    #[test]
-    fn int_cbor_store_backward_compat_string_keys() {
-        let legacy = ciborium::Value::Map(vec![
-            (
-                ciborium::Value::Text("key".into()),
-                ciborium::Value::Bytes(vec![0xDD; 32]),
-            ),
-            (
-                ciborium::Value::Text("value".into()),
-                ciborium::Value::Bytes(vec![4, 5, 6]),
-            ),
-            (
-                ciborium::Value::Text("ttl_secs".into()),
-                ciborium::Value::Integer(120.into()),
-            ),
-        ]);
-        let bytes = crate::cbor::to_vec(&legacy).expect("encode legacy");
-        let decoded: Store = crate::cbor::from_slice(&bytes).expect("decode legacy");
-        assert_eq!(decoded.key, [0xDD; 32]);
-        assert_eq!(decoded.value, vec![4, 5, 6]);
-        assert_eq!(decoded.ttl_secs, 120);
-    }
-
     /// Verify GetChunk and ChunkData use integer keys and roundtrip correctly.
     #[test]
     fn int_cbor_chunk_messages_integer_keys_and_roundtrip() {
@@ -963,19 +926,6 @@ mod tests {
         }
         let data_rt: ChunkData = crate::cbor::from_slice(&data_bytes).expect("roundtrip");
         assert_eq!(data_rt, data);
-    }
-
-    /// Verify ChunkHashList backward compat from string keys.
-    #[test]
-    fn int_cbor_chunk_hash_list_backward_compat() {
-        // Build legacy string-keyed map for GetChunkHashes
-        let legacy = ciborium::Value::Map(vec![(
-            ciborium::Value::Text("content_id".into()),
-            ciborium::Value::Bytes(vec![0x11; 32]),
-        )]);
-        let bytes = crate::cbor::to_vec(&legacy).expect("encode");
-        let decoded: GetChunkHashes = crate::cbor::from_slice(&bytes).expect("decode");
-        assert_eq!(decoded.content_id, [0x11; 32]);
     }
 
     #[test]

@@ -46,6 +46,12 @@ export async function loadClientConfig(
   return invoke("load_client_config", { path });
 }
 
+export async function autoStartNode(
+  configPath: string
+): Promise<RuntimeStatus | null> {
+  return invoke("auto_start_node", { configPath });
+}
+
 // ── Peers ───────────────────────────────────────────────────────────────
 
 export async function listPeers(): Promise<PeerView[]> {
@@ -85,6 +91,12 @@ export async function joinCommunity(
   sharePubkeyHex: string
 ): Promise<CommunityView[]> {
   return invoke("join_community", { shareIdHex, sharePubkeyHex });
+}
+
+export async function leaveCommunity(
+  shareIdHex: string
+): Promise<CommunityView[]> {
+  return invoke("leave_community", { shareIdHex });
 }
 
 export async function browseCommunity(

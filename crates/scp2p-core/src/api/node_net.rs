@@ -1029,15 +1029,42 @@ impl NodeHandle {
     }
 
     /// Return the chunk hash list for a locally-stored content object.
+    ///
+    /// If chunk hashes are not yet computed (e.g. after a cold restart),
+    /// they are derived lazily from the file on disk and cached in the
+    /// content catalog for subsequent requests.
     async fn chunk_hash_list(&self, content_id: [u8; 32]) -> anyhow::Result<Option<Vec<[u8; 32]>>> {
-        let state = self.state.read().await;
-        Ok(state.content_catalog.get(&content_id).and_then(|c| {
-            if c.chunks.is_empty() {
-                None
-            } else {
-                Some(c.chunks.clone())
+        // Fast path: already cached.
+        {
+            let state = self.state.read().await;
+            if let Some(c) = state.content_catalog.get(&content_id)
+                && !c.chunks.is_empty()
+            {
+                return Ok(Some(c.chunks.clone()));
             }
-        }))
+        }
+
+        // Slow path: compute from file on disk, then cache.
+        let mut state = self.state.write().await;
+        // Re-check under write lock (another task may have raced).
+        if let Some(c) = state.content_catalog.get(&content_id)
+            && !c.chunks.is_empty()
+        {
+            return Ok(Some(c.chunks.clone()));
+        }
+        let path = match state.content_paths.get(&content_id) {
+            Some(p) => p.clone(),
+            None => return Ok(None),
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let chunks = crate::content::chunk_hashes(&bytes);
+        if let Some(entry) = state.content_catalog.get_mut(&content_id) {
+            entry.chunks = chunks.clone();
+        }
+        Ok(Some(chunks))
     }
 
     /// Re-announce all locally seeded content in the DHT.

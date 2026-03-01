@@ -13,6 +13,7 @@ interface SidebarProps {
   currentPage: PageId;
   onNavigate: (page: PageId) => void;
   nodeRunning: boolean;
+  appVersion?: string;
 }
 
 interface NavItem {
@@ -59,7 +60,7 @@ const navItems: NavItem[] = [
   },
 ];
 
-export function Sidebar({ currentPage, onNavigate, nodeRunning }: SidebarProps) {
+export function Sidebar({ currentPage, onNavigate, nodeRunning, appVersion }: SidebarProps) {
   let lastSection = "";
 
   return (
@@ -74,7 +75,7 @@ export function Sidebar({ currentPage, onNavigate, nodeRunning }: SidebarProps) 
             SCP2P
           </h1>
           <p className="text-[10px] text-text-muted leading-none mt-0.5">
-            v0.1.0
+            {appVersion ? `v${appVersion}` : "v0.1.0"}
           </p>
         </div>
       </div>

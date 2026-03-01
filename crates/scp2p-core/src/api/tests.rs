@@ -5,8 +5,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use super::*;
-#[allow(deprecated)]
-use crate::transport_net::tcp_connect_session;
+use crate::transport_net::{build_tls_server_handle, tls_connect_session_insecure};
 use crate::{
     capabilities::Capabilities,
     ids::NodeId,
@@ -69,18 +68,17 @@ impl RequestTransport for MockDhtTransport {
     }
 }
 
-struct TcpSessionTransport {
+struct TlsSessionTransport {
     signing_key: SigningKey,
     capabilities: Capabilities,
 }
 
 #[async_trait]
-impl PeerConnector for TcpSessionTransport {
+impl PeerConnector for TlsSessionTransport {
     async fn connect(&self, peer: &PeerAddr) -> anyhow::Result<BoxedStream> {
         let remote = std::net::SocketAddr::new(peer.ip, peer.port);
         let expected = peer.pubkey_hint;
-        #[allow(deprecated)]
-        let (stream, _session) = tcp_connect_session(
+        let (stream, _session) = tls_connect_session_insecure(
             remote,
             &self.signing_key,
             self.capabilities.clone(),
@@ -602,7 +600,7 @@ async fn dht_iterative_find_share_head_rejects_tampered_signature_with_known_pub
 }
 
 #[tokio::test]
-async fn tcp_runtime_serves_dht_and_manifest_for_subscription_sync() {
+async fn tls_runtime_serves_dht_and_manifest_for_subscription_sync() {
     let server_handle = Node::start(NodeConfig::default())
         .await
         .expect("start server");
@@ -620,10 +618,12 @@ async fn tcp_runtime_serves_dht_and_manifest_for_subscription_sync() {
     let bind_addr = port_probe.local_addr().expect("probe addr");
     drop(port_probe);
 
-    let server_task = server_handle.clone().start_tcp_dht_service(
+    let tls_server = Arc::new(build_tls_server_handle().expect("tls"));
+    let server_task = server_handle.clone().start_tls_dht_service(
         bind_addr,
         server_node_key.clone(),
         Capabilities::default(),
+        tls_server.clone(),
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -669,7 +669,7 @@ async fn tcp_runtime_serves_dht_and_manifest_for_subscription_sync() {
         pubkey_hint: Some(server_node_key.verifying_key().to_bytes()),
         relay_via: None,
     };
-    let transport = TcpSessionTransport {
+    let transport = TlsSessionTransport {
         signing_key: client_node_key,
         capabilities: Capabilities::default(),
     };
@@ -691,7 +691,7 @@ async fn tcp_runtime_serves_dht_and_manifest_for_subscription_sync() {
 }
 
 #[tokio::test]
-async fn tcp_runtime_serves_chunk_data_for_network_download() {
+async fn tls_runtime_serves_chunk_data_for_network_download() {
     let server_handle = Node::start(NodeConfig::default())
         .await
         .expect("start server");
@@ -709,10 +709,12 @@ async fn tcp_runtime_serves_chunk_data_for_network_download() {
     let bind_addr = port_probe.local_addr().expect("probe addr");
     drop(port_probe);
 
-    let server_task = server_handle.clone().start_tcp_dht_service(
+    let tls_server = Arc::new(build_tls_server_handle().expect("tls"));
+    let server_task = server_handle.clone().start_tls_dht_service(
         bind_addr,
         server_node_key.clone(),
         Capabilities::default(),
+        tls_server.clone(),
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -766,7 +768,7 @@ async fn tcp_runtime_serves_chunk_data_for_network_download() {
         .await
         .expect("subscribe");
 
-    let transport = TcpSessionTransport {
+    let transport = TlsSessionTransport {
         signing_key: client_node_key,
         capabilities: Capabilities::default(),
     };
@@ -829,15 +831,18 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
     let publisher_addr = publisher_probe.local_addr().expect("publisher probe addr");
     drop(publisher_probe);
 
-    let bootstrap_task = bootstrap_handle.clone().start_tcp_dht_service(
+    let tls_server = Arc::new(build_tls_server_handle().expect("tls"));
+    let bootstrap_task = bootstrap_handle.clone().start_tls_dht_service(
         bootstrap_addr,
         bootstrap_node_key,
         Capabilities::default(),
+        tls_server.clone(),
     );
-    let mut publisher_task = publisher_handle.clone().start_tcp_dht_service(
+    let mut publisher_task = publisher_handle.clone().start_tls_dht_service(
         publisher_addr,
         publisher_node_key.clone(),
         Capabilities::default(),
+        tls_server.clone(),
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -906,7 +911,7 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
         .await
         .expect("subscribe");
     let seed_peers = vec![bootstrap_peer.clone(), publisher_peer.clone()];
-    let transport = TcpSessionTransport {
+    let transport = TlsSessionTransport {
         signing_key: subscriber_node_key,
         capabilities: Capabilities::default(),
     };
@@ -1008,10 +1013,11 @@ async fn multi_node_churn_recovers_sync_search_and_download() {
     };
     assert_eq!(seq_while_offline, 1);
 
-    publisher_task = publisher_handle.clone().start_tcp_dht_service(
+    publisher_task = publisher_handle.clone().start_tls_dht_service(
         publisher_addr,
         publisher_node_key,
         Capabilities::default(),
+        tls_server.clone(),
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -1112,15 +1118,18 @@ async fn multi_node_churn_soak_is_configurable() {
     let publisher_addr = publisher_probe.local_addr().expect("publisher probe addr");
     drop(publisher_probe);
 
-    let bootstrap_task = bootstrap_handle.clone().start_tcp_dht_service(
+    let tls_server = Arc::new(build_tls_server_handle().expect("tls"));
+    let bootstrap_task = bootstrap_handle.clone().start_tls_dht_service(
         bootstrap_addr,
         bootstrap_node_key,
         Capabilities::default(),
+        tls_server.clone(),
     );
-    let mut publisher_task = publisher_handle.clone().start_tcp_dht_service(
+    let mut publisher_task = publisher_handle.clone().start_tls_dht_service(
         publisher_addr,
         publisher_node_key.clone(),
         Capabilities::default(),
+        tls_server.clone(),
     );
     tokio::time::sleep(Duration::from_millis(75)).await;
 
@@ -1210,10 +1219,11 @@ async fn multi_node_churn_soak_is_configurable() {
             .await
             .expect("publish");
 
-        publisher_task = publisher_handle.clone().start_tcp_dht_service(
+        publisher_task = publisher_handle.clone().start_tls_dht_service(
             publisher_addr,
             publisher_node_key.clone(),
             Capabilities::default(),
+            tls_server.clone(),
         );
         tokio::time::sleep(Duration::from_millis(75)).await;
 
@@ -1226,7 +1236,7 @@ async fn multi_node_churn_soak_is_configurable() {
             }
 
             let requester_key = SigningKey::generate(&mut rng);
-            let transport = TcpSessionTransport {
+            let transport = TlsSessionTransport {
                 signing_key: requester_key,
                 capabilities: Capabilities::default(),
             };
@@ -2327,7 +2337,7 @@ async fn incoming_request_rate_limits_are_enforced() {
 }
 
 #[tokio::test]
-async fn tcp_runtime_supports_relay_for_simulated_nat_peers() {
+async fn tls_runtime_supports_relay_for_simulated_nat_peers() {
     let relay_handle = Node::start(NodeConfig::default())
         .await
         .expect("start relay");
@@ -2342,10 +2352,12 @@ async fn tcp_runtime_supports_relay_for_simulated_nat_peers() {
     let bind_addr = probe.local_addr().expect("probe addr");
     drop(probe);
 
-    let relay_task = relay_handle.clone().start_tcp_dht_service(
+    let tls_server = Arc::new(build_tls_server_handle().expect("tls"));
+    let relay_task = relay_handle.clone().start_tls_dht_service(
         bind_addr,
         relay_node_key.clone(),
         Capabilities::default(),
+        tls_server.clone(),
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2357,11 +2369,11 @@ async fn tcp_runtime_supports_relay_for_simulated_nat_peers() {
         relay_via: None,
     };
 
-    let owner_transport = TcpSessionTransport {
+    let owner_transport = TlsSessionTransport {
         signing_key: owner_key,
         capabilities: Capabilities::default(),
     };
-    let requester_transport = TcpSessionTransport {
+    let requester_transport = TlsSessionTransport {
         signing_key: requester_key,
         capabilities: Capabilities::default(),
     };
@@ -2556,10 +2568,12 @@ async fn download_from_peers_self_seeds_after_completion() {
     let bind_addr = port_probe.local_addr().expect("probe addr");
     drop(port_probe);
 
-    let server_task = server_handle.clone().start_tcp_dht_service(
+    let tls_server = Arc::new(build_tls_server_handle().expect("tls"));
+    let server_task = server_handle.clone().start_tls_dht_service(
         bind_addr,
         server_node_key.clone(),
         Capabilities::default(),
+        tls_server.clone(),
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -2613,7 +2627,7 @@ async fn download_from_peers_self_seeds_after_completion() {
         .await
         .expect("subscribe");
 
-    let transport = TcpSessionTransport {
+    let transport = TlsSessionTransport {
         signing_key: client_node_key,
         capabilities: Capabilities::default(),
     };
@@ -2763,7 +2777,7 @@ async fn reannounce_share_heads_only_refreshes_public_subscriptions() {
     let handle = Node::start(NodeConfig::default()).await.expect("start");
     let mut rng = OsRng;
 
-    // ── Set up a public share and a private share ──
+    // â”€â”€ Set up a public share and a private share â”€â”€
     let public_kp = ShareKeypair::new(SigningKey::generate(&mut rng));
     let private_kp = ShareKeypair::new(SigningKey::generate(&mut rng));
 
@@ -2890,9 +2904,9 @@ async fn reannounce_share_heads_only_refreshes_public_subscriptions() {
     }
 }
 
-// ── Relay tunnel tests ──────────────────────────────────────────
+// â”€â”€ Relay tunnel tests â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-/// `RelayTunnelRegistry` register → forward → remove roundtrip.
+/// `RelayTunnelRegistry` register â†’ forward â†’ remove roundtrip.
 #[tokio::test]
 async fn relay_tunnel_registry_register_forward_remove() {
     use crate::relay::RelayTunnelRegistry;
@@ -2957,7 +2971,7 @@ async fn relayed_self_addr_wraps_with_relay_route() {
         relay_via: None,
     };
 
-    // Without active relay — should pass through unchanged.
+    // Without active relay â€” should pass through unchanged.
     let result = handle.relayed_self_addr(direct_addr.clone()).await;
     assert_eq!(result.relay_via, None);
     assert_eq!(result, direct_addr);
@@ -2993,7 +3007,7 @@ async fn relayed_self_addr_wraps_with_relay_route() {
 /// relay and receives the chunk data from the firewalled node.
 #[tokio::test]
 async fn tcp_relay_tunnel_forwards_chunk_request_to_firewalled_node() {
-    // ── Set up the relay node R ──
+    // â”€â”€ Set up the relay node R â”€â”€
     let relay_handle = Node::start(NodeConfig::default())
         .await
         .expect("start relay");
@@ -3006,10 +3020,12 @@ async fn tcp_relay_tunnel_forwards_chunk_request_to_firewalled_node() {
     let relay_bind = relay_probe.local_addr().expect("relay bind addr");
     drop(relay_probe);
 
-    let relay_task = relay_handle.clone().start_tcp_dht_service(
+    let tls_server = Arc::new(build_tls_server_handle().expect("tls"));
+    let relay_task = relay_handle.clone().start_tls_dht_service(
         relay_bind,
         relay_node_key.clone(),
         Capabilities::default(),
+        tls_server.clone(),
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -3021,7 +3037,7 @@ async fn tcp_relay_tunnel_forwards_chunk_request_to_firewalled_node() {
         relay_via: None,
     };
 
-    // ── Set up the firewalled node F ──
+    // â”€â”€ Set up the firewalled node F â”€â”€
     let fw_handle = Node::start(NodeConfig::default())
         .await
         .expect("start firewalled");
@@ -3033,7 +3049,7 @@ async fn tcp_relay_tunnel_forwards_chunk_request_to_firewalled_node() {
     let desc = crate::content::describe_content(&payload);
     let fw_direct_addr = PeerAddr {
         ip: "127.0.0.1".parse().expect("ip"),
-        port: 1, // doesn't matter — firewalled, not directly reachable
+        port: 1, // doesn't matter â€” firewalled, not directly reachable
         transport: TransportProtocol::Tcp,
         pubkey_hint: None,
         relay_via: None,
@@ -3043,8 +3059,8 @@ async fn tcp_relay_tunnel_forwards_chunk_request_to_firewalled_node() {
         .await
         .expect("register content on firewalled node");
 
-    // Register relay tunnel (F → R).
-    let fw_connector = TcpSessionTransport {
+    // Register relay tunnel (F â†’ R).
+    let fw_connector = TlsSessionTransport {
         signing_key: fw_key,
         capabilities: Capabilities::default(),
     };
@@ -3066,9 +3082,9 @@ async fn tcp_relay_tunnel_forwards_chunk_request_to_firewalled_node() {
         }),
     };
 
-    // ── Downloader D sends a GetChunk request through the relay ──
+    // â”€â”€ Downloader D sends a GetChunk request through the relay â”€â”€
     let dl_key = SigningKey::generate(&mut rng);
-    let dl_connector = TcpSessionTransport {
+    let dl_connector = TlsSessionTransport {
         signing_key: dl_key,
         capabilities: Capabilities::default(),
     };
@@ -3127,7 +3143,7 @@ async fn tcp_relay_tunnel_forwards_chunk_request_to_firewalled_node() {
 /// content through the relay using `download_from_peers`.
 #[tokio::test]
 async fn tcp_relay_tunnel_full_content_download() {
-    // ── Relay node R ──
+    // â”€â”€ Relay node R â”€â”€
     let relay_handle = Node::start(NodeConfig::default())
         .await
         .expect("start relay");
@@ -3140,10 +3156,12 @@ async fn tcp_relay_tunnel_full_content_download() {
     let relay_bind = relay_probe.local_addr().expect("relay addr");
     drop(relay_probe);
 
-    let relay_task = relay_handle.clone().start_tcp_dht_service(
+    let tls_server = Arc::new(build_tls_server_handle().expect("tls"));
+    let relay_task = relay_handle.clone().start_tls_dht_service(
         relay_bind,
         relay_node_key.clone(),
         Capabilities::default(),
+        tls_server.clone(),
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -3155,7 +3173,7 @@ async fn tcp_relay_tunnel_full_content_download() {
         relay_via: None,
     };
 
-    // ── Firewalled node F ──
+    // â”€â”€ Firewalled node F â”€â”€
     let fw_handle = Node::start(NodeConfig::default())
         .await
         .expect("start firewalled");
@@ -3178,8 +3196,8 @@ async fn tcp_relay_tunnel_full_content_download() {
         .await
         .expect("register content");
 
-    // Tunnel F → R.
-    let fw_connector = TcpSessionTransport {
+    // Tunnel F â†’ R.
+    let fw_connector = TlsSessionTransport {
         signing_key: fw_key,
         capabilities: Capabilities::default(),
     };
@@ -3197,12 +3215,12 @@ async fn tcp_relay_tunnel_full_content_download() {
         ..fw_direct_addr
     };
 
-    // ── Downloader D ──
+    // â”€â”€ Downloader D â”€â”€
     let dl_handle = Node::start(NodeConfig::default())
         .await
         .expect("start downloader");
     let dl_key = SigningKey::generate(&mut rng);
-    let dl_connector = TcpSessionTransport {
+    let dl_connector = TlsSessionTransport {
         signing_key: dl_key,
         capabilities: Capabilities::default(),
     };
@@ -3287,23 +3305,32 @@ async fn five_node_dht_convergence_and_sync() {
     let b_addr = allocate_tcp_addr().await;
     let c_addr = allocate_tcp_addr().await;
 
-    // Start TCP services.
-    let pub_task =
-        publisher
-            .clone()
-            .start_tcp_dht_service(pub_addr, pub_key.clone(), Capabilities::default());
-    let a_task =
-        node_a
-            .clone()
-            .start_tcp_dht_service(a_addr, a_key.clone(), Capabilities::default());
-    let b_task =
-        node_b
-            .clone()
-            .start_tcp_dht_service(b_addr, b_key.clone(), Capabilities::default());
-    let c_task =
-        node_c
-            .clone()
-            .start_tcp_dht_service(c_addr, c_key.clone(), Capabilities::default());
+    // Start TLS services.
+    let tls_server = Arc::new(build_tls_server_handle().expect("tls"));
+    let pub_task = publisher.clone().start_tls_dht_service(
+        pub_addr,
+        pub_key.clone(),
+        Capabilities::default(),
+        tls_server.clone(),
+    );
+    let a_task = node_a.clone().start_tls_dht_service(
+        a_addr,
+        a_key.clone(),
+        Capabilities::default(),
+        tls_server.clone(),
+    );
+    let b_task = node_b.clone().start_tls_dht_service(
+        b_addr,
+        b_key.clone(),
+        Capabilities::default(),
+        tls_server.clone(),
+    );
+    let c_task = node_c.clone().start_tls_dht_service(
+        c_addr,
+        c_key.clone(),
+        Capabilities::default(),
+        tls_server.clone(),
+    );
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     // Build PeerAddr structs.
@@ -3406,11 +3433,11 @@ async fn five_node_dht_convergence_and_sync() {
         .await
         .expect("subscribe");
 
-    let sub_transport = TcpSessionTransport {
+    let sub_transport = TlsSessionTransport {
         signing_key: sub_key,
         capabilities: Capabilities::default(),
     };
-    // Subscriber only knows about node_c directly — must route through C->B->A->Pub.
+    // Subscriber only knows about node_c directly â€” must route through C->B->A->Pub.
     subscriber
         .sync_subscriptions_over_dht(&sub_transport, &[c_peer])
         .await
@@ -3455,14 +3482,19 @@ async fn multi_provider_concurrent_download() {
     let p1_addr = allocate_tcp_addr().await;
     let p2_addr = allocate_tcp_addr().await;
 
-    let p1_task =
-        provider1
-            .clone()
-            .start_tcp_dht_service(p1_addr, p1_key.clone(), Capabilities::default());
-    let p2_task =
-        provider2
-            .clone()
-            .start_tcp_dht_service(p2_addr, p2_key.clone(), Capabilities::default());
+    let tls_server = Arc::new(build_tls_server_handle().expect("tls"));
+    let p1_task = provider1.clone().start_tls_dht_service(
+        p1_addr,
+        p1_key.clone(),
+        Capabilities::default(),
+        tls_server.clone(),
+    );
+    let p2_task = provider2.clone().start_tls_dht_service(
+        p2_addr,
+        p2_key.clone(),
+        Capabilities::default(),
+        tls_server.clone(),
+    );
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let p1_peer = PeerAddr {
@@ -3532,7 +3564,7 @@ async fn multi_provider_concurrent_download() {
         .await
         .expect("subscribe");
 
-    let transport = TcpSessionTransport {
+    let transport = TlsSessionTransport {
         signing_key: sub_key,
         capabilities: Capabilities::default(),
     };
@@ -3568,7 +3600,7 @@ async fn multi_provider_concurrent_download() {
     p2_task.abort();
 }
 
-// ── Community membership token tests (§4.2) ─────────────────────────
+// â”€â”€ Community membership token tests (Â§4.2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 #[test]
 fn community_membership_token_issue_and_verify() {
@@ -3730,7 +3762,7 @@ async fn join_community_with_invalid_token_rejected() {
     );
 }
 
-// ── §4.13 Handler coverage for PEX / HaveContent / RelayList ──
+// â”€â”€ Â§4.13 Handler coverage for PEX / HaveContent / RelayList â”€â”€
 
 #[tokio::test]
 async fn handle_pex_request_returns_pex_offer() {

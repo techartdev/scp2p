@@ -29,9 +29,10 @@ import { HashDisplay } from "@/components/ui/HashDisplay";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Modal } from "@/components/ui/Modal";
 import { PageHeader, PageContent } from "@/components/layout/Layout";
+import { NodeRequiredOverlay } from "@/components/NodeRequiredOverlay";
 import { encodeShareLink } from "@/lib/shareLink";
 import * as cmd from "@/lib/commands";
-import type { OwnedShareView, PublishVisibility } from "@/lib/types";
+import type { OwnedShareView, PublishVisibility, RuntimeStatus, PageId } from "@/lib/types";
 
 type PublishMode = "files" | "folder";
 
@@ -40,7 +41,12 @@ function fileBaseName(path: string): string {
   return path.split(sep).pop() ?? path;
 }
 
-export function MyShares() {
+interface MySharesProps {
+  status: RuntimeStatus | null;
+  onNavigate: (page: PageId) => void;
+}
+
+export function MyShares({ status, onNavigate }: MySharesProps) {
   const [shares, setShares] = useState<OwnedShareView[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -137,6 +143,7 @@ export function MyShares() {
   };
 
   return (
+    <NodeRequiredOverlay status={status} onNavigate={onNavigate}>
     <PageContent>
       <PageHeader
         title="My Shares"
@@ -444,6 +451,7 @@ export function MyShares() {
         />
       )}
     </PageContent>
+    </NodeRequiredOverlay>
   );
 }
 

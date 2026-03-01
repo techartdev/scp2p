@@ -27,71 +27,6 @@ use crate::{
     transport::{AuthenticatedSession, generate_nonce, handshake_initiator, handshake_responder},
 };
 
-/// Accept an incoming **plain TCP** session.
-///
-/// # Deprecation
-///
-/// **This function is deprecated and insecure for production use.**
-/// After the handshake, all subsequent envelopes travel in cleartext — any
-/// network observer can read protocol messages, content chunks, and metadata.
-///
-/// Use [`tls_accept_session`] or [`quic_accept_bi_session`] instead.
-/// Plain TCP should only be used for local development or on trusted LANs.
-#[deprecated(
-    since = "0.1.0",
-    note = "Plain TCP is unencrypted post-handshake. Use tls_accept_session or quic_accept_bi_session instead."
-)]
-pub async fn tcp_accept_session(
-    listener: &TcpListener,
-    local_signing_key: &SigningKey,
-    capabilities: Capabilities,
-    expected_remote_pubkey: Option<[u8; 32]>,
-) -> anyhow::Result<(TcpStream, AuthenticatedSession, SocketAddr)> {
-    let (mut stream, remote_addr) = listener.accept().await?;
-    let session = handshake_responder(
-        &mut stream,
-        local_signing_key,
-        capabilities,
-        generate_nonce(),
-        expected_remote_pubkey,
-        None,
-    )
-    .await?;
-    Ok((stream, session, remote_addr))
-}
-
-/// Connect to a remote peer over **plain TCP**.
-///
-/// # Deprecation
-///
-/// **This function is deprecated and insecure for production use.**
-/// After the handshake, all subsequent envelopes travel in cleartext — any
-/// network observer can read protocol messages, content chunks, and metadata.
-///
-/// Use [`tls_connect_session`] or [`quic_connect_bi_session`] instead.
-/// Plain TCP should only be used for local development or on trusted LANs.
-#[deprecated(
-    since = "0.1.0",
-    note = "Plain TCP is unencrypted post-handshake. Use tls_connect_session or quic_connect_bi_session instead."
-)]
-pub async fn tcp_connect_session(
-    remote_addr: SocketAddr,
-    local_signing_key: &SigningKey,
-    capabilities: Capabilities,
-    expected_remote_pubkey: Option<[u8; 32]>,
-) -> anyhow::Result<(TcpStream, AuthenticatedSession)> {
-    let mut stream = TcpStream::connect(remote_addr).await?;
-    let session = handshake_initiator(
-        &mut stream,
-        local_signing_key,
-        capabilities,
-        generate_nonce(),
-        expected_remote_pubkey,
-    )
-    .await?;
-    Ok((stream, session))
-}
-
 pub struct TlsServerHandle {
     acceptor: TlsAcceptor,
     pub server_certificate_der: Vec<u8>,
@@ -203,13 +138,14 @@ pub async fn quic_accept_bi_session(
     local_signing_key: &SigningKey,
     capabilities: Capabilities,
     expected_remote_pubkey: Option<[u8; 32]>,
-) -> anyhow::Result<(QuicBiStream, AuthenticatedSession)> {
+) -> anyhow::Result<(QuicBiStream, AuthenticatedSession, SocketAddr)> {
     let incoming = server
         .endpoint
         .accept()
         .await
         .ok_or_else(|| anyhow::anyhow!("quic endpoint closed before accept"))?;
     let connection = incoming.await?;
+    let remote_addr = connection.remote_address();
     let (send, recv) = connection.accept_bi().await?;
     let mut stream = QuicBiStream { send, recv };
     let session = handshake_responder(
@@ -221,7 +157,7 @@ pub async fn quic_accept_bi_session(
         None,
     )
     .await?;
-    Ok((stream, session))
+    Ok((stream, session, remote_addr))
 }
 
 pub struct QuicClientSession {
@@ -286,6 +222,135 @@ fn build_quic_client_config(trusted_server_certificate_der: &[u8]) -> anyhow::Re
     Ok(ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(rustls_client)?,
     )))
+}
+
+// ---------------------------------------------------------------------------
+// P2P-oriented "insecure" TLS/QUIC connect — skip certificate verification.
+//
+// In SCP2P the TLS layer provides confidentiality only.  Peer identity is
+// established by the SCP2P handshake (ed25519 signature exchange) that runs
+// on top of TLS/QUIC, so verifying the server's self-signed certificate
+// is unnecessary.
+// ---------------------------------------------------------------------------
+
+/// TLS `ServerCertVerifier` that accepts any certificate.
+///
+/// This is safe in SCP2P because the ed25519 handshake (running inside the
+/// encrypted TLS tunnel) authenticates the remote peer independently.
+#[derive(Debug)]
+struct NoVerifyServerCerts;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerifyServerCerts {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Connect to a remote peer over TLS without verifying the server certificate.
+///
+/// Appropriate for P2P connections where the SCP2P handshake provides
+/// ed25519-based peer authentication.  TLS is used only for encryption.
+pub async fn tls_connect_session_insecure(
+    remote_addr: SocketAddr,
+    local_signing_key: &SigningKey,
+    capabilities: Capabilities,
+    expected_remote_pubkey: Option<[u8; 32]>,
+) -> anyhow::Result<(
+    tokio_rustls::client::TlsStream<TcpStream>,
+    AuthenticatedSession,
+)> {
+    ensure_rustls_crypto_provider();
+    let client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifyServerCerts))
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client_config));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())
+        .context("invalid tls server name")?;
+
+    let tcp_stream = TcpStream::connect(remote_addr).await?;
+    let mut tls_stream = connector.connect(server_name, tcp_stream).await?;
+    let session = handshake_initiator(
+        &mut tls_stream,
+        local_signing_key,
+        capabilities,
+        generate_nonce(),
+        expected_remote_pubkey,
+    )
+    .await?;
+    Ok((tls_stream, session))
+}
+
+/// Connect to a remote peer over QUIC without verifying the server certificate.
+///
+/// Appropriate for P2P connections where the SCP2P handshake provides
+/// ed25519-based peer authentication.  QUIC/TLS is used only for encryption.
+pub async fn quic_connect_bi_session_insecure(
+    remote_addr: SocketAddr,
+    local_signing_key: &SigningKey,
+    capabilities: Capabilities,
+    expected_remote_pubkey: Option<[u8; 32]>,
+) -> anyhow::Result<QuicClientSession> {
+    ensure_rustls_crypto_provider();
+    let client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerifyServerCerts))
+        .with_no_client_auth();
+    let quinn_client = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(client_config)?,
+    ));
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse().expect("valid socket"))?;
+    endpoint.set_default_client_config(quinn_client);
+
+    let connecting = endpoint.connect(remote_addr, "localhost")?;
+    let connection = connecting.await?;
+    let (send, recv) = connection.open_bi().await?;
+    let mut stream = QuicBiStream { send, recv };
+    let session = handshake_initiator(
+        &mut stream,
+        local_signing_key,
+        capabilities,
+        generate_nonce(),
+        expected_remote_pubkey,
+    )
+    .await?;
+
+    Ok(QuicClientSession {
+        _endpoint: endpoint,
+        stream,
+        session,
+    })
 }
 
 fn ensure_rustls_crypto_provider() {
@@ -507,56 +572,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(deprecated)]
-    async fn tcp_runtime_session_and_dispatch_roundtrip() {
-        let mut rng = StdRng::seed_from_u64(123);
-        let client_key = SigningKey::generate(&mut rng);
-        let server_key = SigningKey::generate(&mut rng);
-        let client_pub = client_key.verifying_key().to_bytes();
-        let server_pub = server_key.verifying_key().to_bytes();
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let server_addr = listener.local_addr().expect("local addr");
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _session, _addr) = tcp_accept_session(
-                &listener,
-                &server_key,
-                Capabilities::default(),
-                Some(client_pub),
-            )
-            .await
-            .expect("accept session");
-            let request = read_envelope(&mut stream).await.expect("read request");
-            let mut responder = PexResponder;
-            let response = dispatch_envelope(&mut responder, request)
-                .await
-                .expect("dispatch")
-                .expect("response");
-            write_envelope(&mut stream, &response)
-                .await
-                .expect("write response");
-        });
-
-        let (mut stream, session) = tcp_connect_session(
-            server_addr,
-            &client_key,
-            Capabilities::default(),
-            Some(server_pub),
-        )
-        .await
-        .expect("connect session");
-        assert_eq!(session.remote_node_pubkey, server_pub);
-
-        let req = Envelope::from_typed(1, 0, &WirePayload::PexRequest(PexRequest { max_peers: 2 }))
-            .expect("request");
-        write_envelope(&mut stream, &req).await.expect("write req");
-        let resp = read_envelope(&mut stream).await.expect("read resp");
-        assert_eq!(resp.r#type, MsgType::PexOffer as u16);
-
-        server.await.expect("join");
-    }
-
-    #[tokio::test]
     async fn quic_runtime_session_and_dispatch_roundtrip() {
         let mut rng = StdRng::seed_from_u64(777);
         let client_key = SigningKey::generate(&mut rng);
@@ -569,7 +584,7 @@ mod tests {
         let trusted_cert = server.server_certificate_der.clone();
 
         let server_task = tokio::spawn(async move {
-            let (mut stream, _session) = quic_accept_bi_session(
+            let (mut stream, _session, _addr) = quic_accept_bi_session(
                 &server,
                 &server_key,
                 Capabilities::default(),

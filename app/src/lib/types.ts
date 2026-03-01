@@ -9,6 +9,8 @@ export interface StartNodeRequest {
 
 export interface RuntimeStatus {
   running: boolean;
+  app_version: string;
+  protocol_version: number;
   state_db_path: string | null;
   bind_quic: string | null;
   bind_tcp: string | null;
@@ -21,6 +23,7 @@ export interface DesktopClientConfig {
   bind_quic: string | null;
   bind_tcp: string | null;
   bootstrap_peers: string[];
+  auto_start: boolean;
 }
 
 export interface PeerView {

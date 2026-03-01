@@ -24,6 +24,9 @@ pub struct DesktopClientConfig {
     pub bind_tcp: Option<SocketAddr>,
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
+    /// When true, the desktop app will start the node automatically on launch.
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 impl Default for DesktopClientConfig {
@@ -34,6 +37,7 @@ impl Default for DesktopClientConfig {
             bind_quic: config.bind_quic,
             bind_tcp: config.bind_tcp,
             bootstrap_peers: config.bootstrap_peers,
+            auto_start: false,
         }
     }
 }
