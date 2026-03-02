@@ -12,5 +12,5 @@ hex.workspace = true
 rand.workspace = true
 serde.workspace = true
 ciborium.workspace = true
-scp2p-core = { path = "../scp2p-core" }
+scp2p-core = { path = "../scp2p-core", version = "0.1.0" }
 tokio.workspace = true
