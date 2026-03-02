@@ -18,10 +18,16 @@ Prerequisites:
 Commands:
 
 ```bash
+# Run all tests
 cargo test --workspace
-cargo run -p scp2p-cli -- gen-identity
-cargo run -p scp2p-cli -- print-ids
-cargo run -p scp2p-cli -- start
+
+# Start the interactive CLI (opens a menu-driven shell)
+cargo run -p scp2p-cli
+
+# Start with a specific database and a bootstrap peer
+cargo run -p scp2p-cli -- --db ~/mydata.db --bootstrap 10.0.0.1:7001
+
+# Start the desktop Tauri app
 cargo run -p scp2p-desktop
 ```
 
@@ -54,23 +60,96 @@ Windows desktop shell notes:
 
 ## 3. CLI usage
 
-### `scp2p gen-identity`
-Generates an Ed25519 keypair and prints:
-- `private_key` (hex)
-- `public_key` (hex)
+The `scp2p` CLI is an **interactive shell**. There are no subcommands to memorise — start the binary and navigate all operations through arrow-key menus.
 
-### `scp2p print-ids`
-Generates a temporary keypair and prints:
-- `node_id` (SHA-256(pubkey) truncated to 160-bit)
-- `share_id` (SHA-256(pubkey) 256-bit)
+### Starting the CLI
 
-### `scp2p start`
-Starts a node and runs until Ctrl+C.
+```bash
+# Defaults: database = scp2p.db in cwd, TCP port = 7001
+scp2p
 
-Options:
-- `--bootstrap <IP:PORT>` (repeatable): bootstrap TCP peers used for iterative DHT sync/republish loops
-- `--sync-interval-secs <u64>`: periodic signed subscription sync interval (default `30`)
-- `--republish-interval-secs <u64>`: periodic DHT republish interval (default `300`)
+# Explicit options
+scp2p --db ~/mydata.db --port 7002 --bootstrap 10.0.0.1:7001,10.0.0.2:7001
+
+# Development via Cargo
+cargo run -p scp2p-cli -- --bootstrap 10.0.0.1:7001
+```
+
+All flags have environment variable equivalents:
+
+| Flag | Env variable | Default |
+|---|---|---|
+| `--db <PATH>` | `SCP2P_DB` | `scp2p.db` |
+| `--port <PORT>` | `SCP2P_PORT` | `7001` |
+| `--bootstrap <IP:PORT>` | `SCP2P_BOOTSTRAP` (comma-separated) | (empty) |
+
+### Startup sequence
+
+On launch the CLI:
+1. Opens (or creates) the SQLite database.
+2. Restores persisted node identity.
+3. Starts a background TCP listener on `0.0.0.0:<port>`.
+4. Prints a welcome banner with your **Node ID** and **Share ID**.
+5. Enters the main menu loop.
+
+### Main menu
+
+```
+  ╔══════════════════════════════════════════╗
+  ║        SCP2P Interactive Shell           ║
+  ╚══════════════════════════════════════════╝
+  Node ID  : <hex>
+  Share ID : <hex>
+
+  What would you like to do?
+> 📋  Status
+  📤  Publish files
+  📁  Publish folder
+  📚  Browse / inspect a share
+  🔔  Subscriptions
+  🔍  Search
+  ⬇   Download by content ID
+  ⬇   Download share
+  🔄  Sync now
+  🔑  Generate new keypair
+  ❌  Quit
+```
+
+Navigate with **↑ ↓** arrow keys, **Enter** to select. Press **Escape** or **Ctrl+C** inside any prompt to cancel and return to the main menu without exiting.
+
+### Menu options
+
+**📋 Status**
+Shows node ID, share ID, database path, listening port, subscription count, cached manifest count, and in-progress partial download count.
+
+**📤 Publish files**
+Prompts for a share title, file paths (comma-separated), and visibility (`private`/`public`). Publishes a new share manifest and prints the share ID and manifest ID.
+
+**📁 Publish folder**
+Prompts for a folder path, title, and visibility. Recursively includes all files in the directory as a single share.
+
+**📚 Browse / inspect a share**
+Shows a picker of all locally cached manifests for quick selection, or lets you enter a share ID manually. Displays all items with name, size, and content ID.
+
+**🔔 Subscriptions** → sub-menu:
+- *List subscriptions* — prints share ID, latest sequence number, and manifest ID for each active subscription.
+- *Subscribe to a new share* — prompts for a share ID (hex) and an optional share public key.
+- *Sync subscriptions now* — triggers an immediate sync (delegates to **Sync now**).
+
+**🔍 Search**
+Prompts for a text query, runs it against the local subscription-scoped search index, and shows ranked results with share ID, content ID, and item name.
+
+**⬇ Download by content ID**
+Prompts for a content ID (64 hex chars), an output file path, and optional extra peer addresses. Downloads and verifies the content from the peer swarm.
+
+**⬇ Download share**
+Prompts for a share ID and output directory, lists all items in that share, and lets you pick which ones to download (by number, or "all"). Shows a spinner while transferring.
+
+**🔄 Sync now**
+Syncs all subscriptions over the DHT using configured bootstrap peers. Prompts for peer addresses if none are configured.
+
+**🔑 Generate new keypair**
+Generates a fresh Ed25519 keypair and prints the private key, public key, derived node ID, and derived share ID. Useful when creating a new publisher identity outside the default.
 
 ## 4. Core API overview (`scp2p-core`)
 

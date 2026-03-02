@@ -129,7 +129,32 @@ We believe that decentralized communication should be as easy to install and use
 The project is structured as a Rust workspace:
 
 - `crates/scp2p-core`: The heart of the protocol.
+- `crates/scp2p-cli`: Interactive command-line client.
+- `crates/scp2p-relay`: Headless relay / DHT node binary.
 - `app/`: The Tauri + React desktop application.
+
+### Interactive CLI
+
+The `scp2p` CLI is a fully interactive shell — no subcommands to memorise. Launch it and navigate everything through arrow-key menus:
+
+```bash
+# Start with defaults (creates scp2p.db in the current directory)
+cargo run -p scp2p-cli
+
+# With a bootstrap peer
+cargo run -p scp2p-cli -- --bootstrap 192.168.1.10:7001
+```
+
+Available operations from the menu:
+- **Publish** files or a whole folder as a new share (private or public)
+- **Browse** any locally cached share and inspect its items
+- **Subscribe** to shares and manage subscriptions
+- **Search** across your subscriptions locally
+- **Download** content by ID or pull an entire share to a directory
+- **Sync** subscriptions against the network
+- **Generate** new Ed25519 keypairs
+
+See [DOCS.md](DOCS.md#3-cli-usage) for the full reference.
 
 ### Desktop Application
 
@@ -145,6 +170,16 @@ npm install
 # Start the app in development mode
 npm run tauri dev
 ```
+
+### Standalone Relay
+
+To run a headless relay/DHT node (no UI, suitable for servers):
+
+```bash
+cargo run -p scp2p-relay
+```
+
+See [`crates/scp2p-relay/README.md`](crates/scp2p-relay/README.md) for full relay configuration.
 
 ### Core Library Tests
 ```bash
