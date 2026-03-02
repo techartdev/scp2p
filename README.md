@@ -1,6 +1,12 @@
 # SCP2P: Subscribed Catalog P2P
 
-[🌐 scp2p.com](https://scp2p.com/)
+<p align="center">
+  <a href="https://scp2p.com/">
+  <img width="400" height="150" src="https://scp2p.com/assets/logo.svg">
+  <br> https://scp2p.com/
+  </a>
+</p>
+
 
 Welcome to **SCP2P** (Subscribed Catalog P2P) — a decentralized, cryptographically-secure communication and data sharing protocol designed for the modern web.
 
