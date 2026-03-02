@@ -23,7 +23,7 @@ use crate::{
 use super::{
     NodeHandle, NodeState, ShareItemInfo,
     helpers::{
-        check_manifest_limits, collect_files_recursive, mime_from_extension, normalize_item_path,
+        collect_files_recursive, mime_from_extension, normalize_item_path,
         now_unix_secs, persist_state,
     },
 };
@@ -34,7 +34,7 @@ impl NodeHandle {
         mut manifest: ManifestV1,
         publisher: &ShareKeypair,
     ) -> anyhow::Result<[u8; 32]> {
-        check_manifest_limits(&manifest)?;
+        manifest.check_limits()?;
         manifest.sign(publisher)?;
         manifest.verify()?;
         let manifest_id = manifest.manifest_id()?.0;

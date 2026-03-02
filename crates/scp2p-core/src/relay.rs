@@ -155,6 +155,37 @@ impl RelayAnnouncement {
     pub fn is_fresh(&self, now_unix: u64) -> bool {
         now_unix < self.expires_at
     }
+
+    /// Build and sign a new relay announcement.
+    ///
+    /// `ttl_secs` is clamped to `RELAY_ANNOUNCEMENT_MAX_TTL_SECS`.
+    /// The signature is produced with the provided `signing_key`.
+    pub fn new_signed(
+        signing_key: &ed25519_dalek::SigningKey,
+        relay_addrs: Vec<PeerAddr>,
+        capabilities: Capabilities,
+        capacity: RelayCapacity,
+        issued_at: u64,
+        ttl_secs: u64,
+    ) -> anyhow::Result<Self> {
+        use ed25519_dalek::Signer as _;
+        let ttl = ttl_secs.min(RELAY_ANNOUNCEMENT_MAX_TTL_SECS);
+        let expires_at = issued_at.saturating_add(ttl);
+        let relay_pubkey = signing_key.verifying_key().to_bytes();
+        let mut ann = RelayAnnouncement {
+            relay_pubkey,
+            relay_addrs,
+            capabilities,
+            capacity,
+            issued_at,
+            expires_at,
+            signature: vec![],
+        };
+        let sig: ed25519_dalek::Signature = signing_key.sign(&ann.signing_bytes());
+        ann.signature = sig.to_bytes().to_vec();
+        ann.validate_structure()?;
+        Ok(ann)
+    }
 }
 
 /// Compute the DHT rendezvous key index for a relay in a given bucket.
@@ -348,6 +379,10 @@ pub struct RelayManager {
     /// grant fresh quotas.
     usage: HashMap<String, RelayUsage>,
     limits: RelayLimits,
+    /// Locally cached relay announcements, keyed by relay pubkey.
+    /// Populated via `ingest_announcement` from Relay-PEX responses
+    /// and DHT lookups (§4.9).
+    announcements: HashMap<[u8; 32], RelayAnnouncement>,
 }
 
 impl RelayManager {
@@ -355,12 +390,35 @@ impl RelayManager {
         self.limits = limits;
     }
 
-    /// Return known relay announcements for Relay-PEX responses.
-    ///
-    /// Currently returns an empty list — relay announcement ingestion
-    /// and caching will be added as part of relay discovery (§4.9).
+    /// Return all cached relay announcements for Relay-PEX responses.
     pub fn known_announcements(&self) -> Vec<RelayAnnouncement> {
-        Vec::new()
+        self.announcements.values().cloned().collect()
+    }
+
+    /// Validate and store a relay announcement in the local cache.
+    ///
+    /// Performs full structural + signature verification. Fresh announcements
+    /// replace older ones for the same relay pubkey. Stale entries are pruned
+    /// after each successful ingestion (§4.9).
+    pub fn ingest_announcement(
+        &mut self,
+        ann: RelayAnnouncement,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        ann.validate_structure()?;
+        if !ann.is_fresh(now) {
+            anyhow::bail!("relay announcement is already expired");
+        }
+        ann.verify_signature()?;
+        // Replace any existing entry for this relay pubkey.
+        self.announcements.insert(ann.relay_pubkey, ann);
+        self.prune_stale_announcements(now);
+        Ok(())
+    }
+
+    /// Remove announcements whose `expires_at` is in the past.
+    pub fn prune_stale_announcements(&mut self, now: u64) {
+        self.announcements.retain(|_, ann| ann.is_fresh(now));
     }
 
     pub fn register(&mut self, owner_peer: String, now: u64) -> RelaySlot {
@@ -446,8 +504,13 @@ impl RelayManager {
             // Owner is sending → route to the connected requester.
             slot.requester_peer
                 .ok_or_else(|| anyhow::anyhow!("no requester connected to relay slot"))?
-        } else {
+        } else if slot.requester_peer.as_ref() == Some(&from_peer) {
+            // Requester is sending → route to the owner.
             slot.owner_peer
+        } else {
+            // Reject: sender is neither the slot owner nor the
+            // registered requester — unauthorized relay access.
+            anyhow::bail!("unauthorized peer for relay slot");
         };
 
         Ok(RelayStream {
@@ -663,6 +726,52 @@ mod tests {
             )
             .expect_err("content relay disabled");
         assert!(err.to_string().contains("disabled"));
+    }
+
+    #[test]
+    fn unauthorized_peer_is_rejected_from_relay_stream() {
+        let mut relay = RelayManager::default();
+        let slot = relay.register("peer-a".into(), 100);
+        relay
+            .connect("peer-b".into(), slot.relay_slot_id, 101)
+            .expect("connect");
+
+        // Owner can stream.
+        relay
+            .relay_stream(
+                slot.relay_slot_id,
+                1,
+                RelayPayloadKind::Control,
+                "peer-a".into(),
+                vec![1],
+                102,
+            )
+            .expect("owner should succeed");
+
+        // Requester can stream.
+        relay
+            .relay_stream(
+                slot.relay_slot_id,
+                2,
+                RelayPayloadKind::Control,
+                "peer-b".into(),
+                vec![2],
+                103,
+            )
+            .expect("requester should succeed");
+
+        // Third party must be rejected.
+        let err = relay
+            .relay_stream(
+                slot.relay_slot_id,
+                3,
+                RelayPayloadKind::Control,
+                "peer-evil".into(),
+                vec![3],
+                104,
+            )
+            .expect_err("unauthorized peer must be rejected");
+        assert!(err.to_string().contains("unauthorized"));
     }
 
     #[test]

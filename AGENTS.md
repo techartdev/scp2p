@@ -21,7 +21,7 @@ Implement SCP2P from `SPECIFICATION.md` in milestone-oriented increments, priori
 - Add additional crates only when separation is meaningful (e.g., `scp2p-dht`, `scp2p-transport`).
 
 ## Coding conventions
-- Rust edition 2021.
+- Rust edition 2024.
 - Avoid panics in library code; return `anyhow::Result` or custom errors.
 - Keep public API documented for major modules and types.
 - Use `serde` structs for network payloads and persistable records.

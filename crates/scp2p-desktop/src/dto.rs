@@ -108,12 +108,21 @@ pub struct SearchResultView {
     pub name: String,
     pub snippet: Option<String>,
     pub score: f32,
+    /// Title of the share this result belongs to (resolved from manifest).
+    pub share_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SearchResultsView {
     pub total: usize,
     pub results: Vec<SearchResultView>,
+}
+
+/// Outcome of a `sync_now` operation, including how many subscriptions changed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SyncResultView {
+    pub subscriptions: Vec<SubscriptionView>,
+    pub updated_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,7 +139,6 @@ pub struct PublicShareView {
 pub struct PublishResultView {
     pub share_id_hex: String,
     pub share_pubkey_hex: String,
-    pub share_secret_hex: String,
     pub manifest_id_hex: String,
     pub provider_addr: String,
     pub visibility: PublishVisibility,
@@ -142,8 +150,6 @@ pub struct PublishResultView {
 pub struct OwnedShareView {
     pub share_id_hex: String,
     pub share_pubkey_hex: String,
-    /// The Ed25519 signing key (keep confidential; used to prove authorship).
-    pub share_secret_hex: String,
     pub latest_seq: u64,
     pub manifest_id_hex: String,
     pub title: Option<String>,

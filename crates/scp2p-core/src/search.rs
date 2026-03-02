@@ -37,6 +37,13 @@ impl SearchIndexSnapshot {
     }
 }
 
+/// Maximum number of results returned from a single [`SearchIndex::search`] call.
+///
+/// Prevents returning millions of candidates to callers when a common token
+/// matches a large fraction of the subscribed index. The desktop layer
+/// paginates over results, so callers never need the full unbounded set.
+pub const SEARCH_RESULT_HARD_CAP: usize = 2_000;
+
 #[derive(Debug, Default, Clone)]
 pub struct SearchIndex {
     items: HashMap<ItemKey, IndexedItem>,
@@ -144,10 +151,13 @@ impl SearchIndex {
             .collect::<Vec<_>>();
 
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // Cap results to prevent large allocations when a common token matches
+        // most of the index. Callers can paginate over this bounded set.
+        scored.truncate(SEARCH_RESULT_HARD_CAP);
         scored
     }
 
-    fn remove_share(&mut self, share_id: [u8; 32]) {
+    pub(crate) fn remove_share(&mut self, share_id: [u8; 32]) {
         let Some(keys) = self.by_share.remove(&share_id) else {
             return;
         };
@@ -396,6 +406,9 @@ mod tests {
             query_ms,
             max_query_ms
         );
-        assert_eq!(hits.len(), share_count * items_per_share);
+        // Results are capped at SEARCH_RESULT_HARD_CAP when the query matches
+        // more items than the cap.
+        let expected_hits = (share_count * items_per_share).min(SEARCH_RESULT_HARD_CAP);
+        assert_eq!(hits.len(), expected_hits);
     }
 }

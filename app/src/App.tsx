@@ -6,6 +6,9 @@ import { Communities } from "@/pages/Communities";
 import { SearchPage } from "@/pages/Search";
 import { MyShares } from "@/pages/MyShares";
 import { Settings } from "@/pages/Settings";
+import { DownloadQueue } from "@/components/DownloadQueue";
+import { useDownloadQueue } from "@/hooks/useDownloadQueue";
+import { GripHorizontal } from "lucide-react";
 import * as cmd from "@/lib/commands";
 import type { RuntimeStatus, PageId } from "@/lib/types";
 
@@ -15,6 +18,12 @@ export default function App() {
   const [page, setPage] = useState<PageId>("dashboard");
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const autoStartAttempted = useRef(false);
+  const downloadQueue = useDownloadQueue();
+
+  // Resizable download queue panel
+  const [queueHeight, setQueueHeight] = useState(180);
+  const resizingRef = useRef(false);
+  const containerRef = useRef<HTMLDivElement>(null);
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -69,7 +78,7 @@ export default function App() {
           />
         );
       case "discover":
-        return <Discover status={status} onNavigate={setPage} />;
+        return <Discover status={status} onNavigate={setPage} downloadQueue={downloadQueue} />;
       case "communities":
         return <Communities status={status} onNavigate={setPage} />;
       case "search":
@@ -89,6 +98,35 @@ export default function App() {
     }
   };
 
+  const handleResizeMouseDown = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      resizingRef.current = true;
+      const startY = e.clientY;
+      const startH = queueHeight;
+
+      const onMove = (ev: MouseEvent) => {
+        if (!resizingRef.current) return;
+        const container = containerRef.current;
+        const maxH = container ? container.clientHeight - 200 : 500;
+        const delta = startY - ev.clientY;
+        setQueueHeight(Math.max(80, Math.min(maxH, startH + delta)));
+      };
+
+      const onUp = () => {
+        resizingRef.current = false;
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+      };
+
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    },
+    [queueHeight]
+  );
+
+  const hasQueueJobs = downloadQueue.jobs.length > 0;
+
   return (
     <div className="flex h-screen bg-surface-deep">
       <Sidebar
@@ -96,14 +134,33 @@ export default function App() {
         onNavigate={setPage}
         nodeRunning={status?.running ?? false}
         appVersion={status?.app_version}
+        downloadActiveCount={downloadQueue.activeCount}
       />
-      <div className="flex-1 flex flex-col overflow-hidden">
+      <div ref={containerRef} className="flex-1 flex flex-col overflow-hidden">
         {/* Top chrome bar - subtle gradient line */}
         <div className="h-px bg-gradient-to-r from-transparent via-accent/30 to-transparent" />
         {/* Page content */}
-        <div key={page} className="flex-1 overflow-hidden flex flex-col">
+        <div key={page} className="flex-1 overflow-hidden flex flex-col" style={hasQueueJobs ? { minHeight: 200 } : undefined}>
           {renderPage()}
         </div>
+        {/* Global download queue — visible from any page */}
+        {hasQueueJobs && (
+          <>
+            <div
+              className="h-1.5 shrink-0 cursor-row-resize bg-border/40 hover:bg-accent/30 active:bg-accent/50 transition-colors flex items-center justify-center group"
+              onMouseDown={handleResizeMouseDown}
+            >
+              <GripHorizontal className="h-3 w-6 text-text-muted/40 group-hover:text-accent/60 transition-colors" />
+            </div>
+            <div style={{ height: queueHeight, minHeight: 80 }} className="shrink-0">
+              <DownloadQueue
+                jobs={downloadQueue.jobs}
+                onRemoveJob={downloadQueue.removeJob}
+                onClearCompleted={downloadQueue.clearCompleted}
+              />
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

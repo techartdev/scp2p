@@ -9,9 +9,10 @@ use crate::{
     dto::{
         CommunityBrowseView, CommunityView, DesktopClientConfig, OwnedShareView, PeerView,
         PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus, SearchResultsView,
-        ShareItemView, StartNodeRequest, SubscriptionView,
+        ShareItemView, StartNodeRequest, SubscriptionView, SyncResultView,
     },
 };
+use scp2p_core::SubscriptionTrustLevel;
 
 pub async fn start_node(
     app_state: &DesktopAppState,
@@ -88,7 +89,17 @@ pub async fn unsubscribe_share(
     app_state.unsubscribe_share(&share_id_hex).await
 }
 
-pub async fn sync_now(app_state: &DesktopAppState) -> anyhow::Result<Vec<SubscriptionView>> {
+pub async fn set_subscription_trust_level(
+    app_state: &DesktopAppState,
+    share_id_hex: String,
+    trust_level: SubscriptionTrustLevel,
+) -> anyhow::Result<Vec<SubscriptionView>> {
+    app_state
+        .set_subscription_trust_level(&share_id_hex, trust_level)
+        .await
+}
+
+pub async fn sync_now(app_state: &DesktopAppState) -> anyhow::Result<SyncResultView> {
     app_state.sync_now().await
 }
 
@@ -205,6 +216,14 @@ pub async fn update_my_share_visibility(
     app_state
         .update_my_share_visibility(&share_id_hex, visibility)
         .await
+}
+
+/// Export the raw signing key for a published share (explicit opt-in).
+pub async fn export_share_secret(
+    app_state: &DesktopAppState,
+    share_id_hex: String,
+) -> anyhow::Result<String> {
+    app_state.export_share_secret(&share_id_hex).await
 }
 
 pub async fn leave_community(

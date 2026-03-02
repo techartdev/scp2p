@@ -12,6 +12,8 @@ import {
   Clock,
   Compass,
   Settings,
+  Rocket,
+  ArrowRight,
 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -247,6 +249,90 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
             >
               Open Settings
             </Button>
+          </div>
+        </Card>
+      )}
+
+      {/* Quick Start guide — shown when node is stopped */}
+      {!running && (
+        <Card className="mb-6 border-accent/20">
+          <div className="space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-xl bg-accent/10 text-accent">
+                <Rocket className="h-5 w-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-text-primary">
+                  Quick Start
+                </h3>
+                <p className="text-xs text-text-muted">
+                  Get your SCP2P node up and running in a few steps
+                </p>
+              </div>
+            </div>
+            <div className="grid grid-cols-4 gap-3">
+              {[
+                {
+                  step: 1,
+                  label: "Configure",
+                  description: "Set bootstrap peers and bind addresses",
+                  action: () => onNavigate("settings"),
+                  icon: <Settings className="h-4 w-4" />,
+                },
+                {
+                  step: 2,
+                  label: "Start Node",
+                  description: "Launch the peer-to-peer engine",
+                  action: handleStart,
+                  icon: <Play className="h-4 w-4" />,
+                  primary: true,
+                },
+                {
+                  step: 3,
+                  label: "Discover",
+                  description: "Browse and subscribe to shared catalogs",
+                  action: () => onNavigate("discover"),
+                  icon: <Compass className="h-4 w-4" />,
+                },
+                {
+                  step: 4,
+                  label: "Publish",
+                  description: "Share your own files with the network",
+                  action: () => onNavigate("my-shares"),
+                  icon: <Globe className="h-4 w-4" />,
+                },
+              ].map(({ step, label, description, action, icon, primary }) => (
+                <button
+                  key={step}
+                  onClick={action}
+                  className={`group flex flex-col items-center gap-2 p-3 rounded-xl border transition-all text-center ${
+                    primary
+                      ? "border-accent/30 bg-accent/5 hover:bg-accent/10 hover:border-accent/50"
+                      : "border-border hover:border-accent/30 hover:bg-surface-raised"
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-bold text-text-muted bg-surface-deep rounded-full h-5 w-5 flex items-center justify-center">
+                      {step}
+                    </span>
+                    <span
+                      className={`${primary ? "text-accent" : "text-text-muted group-hover:text-accent"} transition-colors`}
+                    >
+                      {icon}
+                    </span>
+                  </div>
+                  <span
+                    className={`text-xs font-medium ${primary ? "text-accent" : "text-text-primary"}`}
+                  >
+                    {label}
+                  </span>
+                  <span className="text-[10px] text-text-muted leading-snug">
+                    {description}
+                  </span>
+                  <ArrowRight className="h-3 w-3 text-text-muted opacity-0 group-hover:opacity-100 transition-opacity" />
+                </button>
+              ))}
+            </div>
           </div>
         </Card>
       )}

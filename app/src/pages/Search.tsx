@@ -155,6 +155,11 @@ export function SearchPage({ status, onNavigate }: SearchPageProps) {
                         <p className="text-sm font-medium text-text-primary truncate">
                           {result.name}
                         </p>
+                        {result.share_title && (
+                          <p className="text-xs text-accent mt-0.5 truncate">
+                            from {result.share_title}
+                          </p>
+                        )}
                         {result.snippet && (
                           <p className="text-xs text-text-muted mt-0.5 truncate selectable">
                             {result.snippet}

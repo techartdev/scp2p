@@ -27,6 +27,7 @@ use crate::dto::{
     CommunityBrowseView, CommunityParticipantView, CommunityView, DesktopClientConfig,
     OwnedShareView, PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
     SearchResultView, SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
+    SyncResultView,
 };
 
 #[derive(Clone, Default)]
@@ -37,6 +38,8 @@ pub struct DesktopAppState {
 #[derive(Default)]
 struct RuntimeState {
     node: Option<NodeHandle>,
+    /// Stable node identity key, loaded from the store on start.
+    node_signing_key: Option<SigningKey>,
     state_db_path: Option<PathBuf>,
     content_data_dir: Option<PathBuf>,
     tls_service_task: Option<JoinHandle<anyhow::Result<()>>>,
@@ -119,8 +122,8 @@ impl DesktopAppState {
 
         let handle = Node::start_with_store(config, store).await?;
         let mut state = self.inner.write().await;
-        let mut rng = OsRng;
-        let service_key = SigningKey::generate(&mut rng);
+        let service_key = handle.ensure_node_identity().await?;
+        state.node_signing_key = Some(service_key.clone());
         let caps = Capabilities::default();
         if let Some(bind_tcp) = request.bind_tcp {
             let tls_server =
@@ -310,21 +313,48 @@ impl DesktopAppState {
         self.subscription_views().await
     }
 
-    pub async fn sync_now(&self) -> anyhow::Result<Vec<SubscriptionView>> {
+    pub async fn set_subscription_trust_level(
+        &self,
+        share_id_hex: &str,
+        trust_level: scp2p_core::SubscriptionTrustLevel,
+    ) -> anyhow::Result<Vec<SubscriptionView>> {
         let node = self.node_handle().await?;
+        let share_id = parse_hex_32(share_id_hex, "share_id")?;
+        node.set_subscription_trust_level(scp2p_core::ShareId(share_id), trust_level)
+            .await?;
+        self.subscription_views().await
+    }
+
+    pub async fn sync_now(&self) -> anyhow::Result<SyncResultView> {
+        let node = self.node_handle().await?;
+        // Snapshot subscription seqs before sync to detect updates.
+        let before: std::collections::HashMap<String, u64> = {
+            let subs = node.subscriptions().await;
+            subs.into_iter()
+                .map(|s| (hex::encode(s.share_id), s.latest_seq))
+                .collect()
+        };
         let mut peers = node.configured_bootstrap_peers().await?;
         for record in node.peer_records().await {
             if !peers.iter().any(|peer| peer == &record.addr) {
                 peers.push(record.addr);
             }
         }
-        let mut rng = OsRng;
-        let transport = DirectRequestTransport::new(DesktopSessionConnector {
-            signing_key: SigningKey::generate(&mut rng),
-            capabilities: Capabilities::default(),
-        });
+        let transport = DirectRequestTransport::new(self.build_connector().await);
         node.sync_subscriptions_over_dht(&transport, &peers).await?;
-        self.subscription_views().await
+        let subscriptions = self.subscription_views().await?;
+        let updated_count = subscriptions
+            .iter()
+            .filter(|s| {
+                before
+                    .get(&s.share_id_hex)
+                    .is_none_or(|&old_seq| s.latest_seq > old_seq)
+            })
+            .count();
+        Ok(SyncResultView {
+            subscriptions,
+            updated_count,
+        })
     }
 
     pub async fn search_catalogs(&self, text: &str) -> anyhow::Result<SearchResultsView> {
@@ -337,9 +367,35 @@ impl DesktopAppState {
                 include_snippets: true,
             })
             .await?;
+        // Build a title lookup from subscription manifests.
+        let subs = node.subscriptions().await;
+        let mut title_map = std::collections::HashMap::new();
+        for sub in &subs {
+            if let Some(mid) = sub.latest_manifest_id {
+                let (title, _desc) = node.cached_manifest_meta(&mid).await;
+                if let Some(t) = title {
+                    title_map.insert(sub.share_id, t);
+                }
+            }
+        }
+        let results = page
+            .results
+            .into_iter()
+            .map(|r| {
+                let share_title = title_map.get(&r.share_id.0).cloned();
+                SearchResultView {
+                    share_id_hex: hex::encode(r.share_id.0),
+                    content_id_hex: hex::encode(r.content_id),
+                    name: r.name,
+                    snippet: r.snippet,
+                    score: r.score,
+                    share_title,
+                }
+            })
+            .collect();
         Ok(SearchResultsView {
             total: page.total,
-            results: page.results.into_iter().map(search_result_view).collect(),
+            results,
         })
     }
 
@@ -352,11 +408,7 @@ impl DesktopAppState {
             return Ok(Vec::new());
         }
 
-        let mut rng = OsRng;
-        let transport = DirectRequestTransport::new(DesktopSessionConnector {
-            signing_key: SigningKey::generate(&mut rng),
-            capabilities: Capabilities::default(),
-        });
+        let transport = DirectRequestTransport::new(self.build_connector().await);
         let mut first_err = None;
         let mut views = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -416,11 +468,7 @@ impl DesktopAppState {
             });
         }
 
-        let mut rng = OsRng;
-        let transport = DirectRequestTransport::new(DesktopSessionConnector {
-            signing_key: SigningKey::generate(&mut rng),
-            capabilities: Capabilities::default(),
-        });
+        let transport = DirectRequestTransport::new(self.build_connector().await);
         let mut participants = Vec::new();
         let mut public_shares = Vec::new();
         let mut seen_shares = std::collections::HashSet::new();
@@ -524,11 +572,7 @@ impl DesktopAppState {
         let node = self.node_handle().await?;
         let content_id = parse_hex_32(content_id_hex, "content_id")?;
         let peers = self.sync_peer_targets(&node).await?;
-        let mut rng = OsRng;
-        let connector = DesktopSessionConnector {
-            signing_key: SigningKey::generate(&mut rng),
-            capabilities: Capabilities::default(),
-        };
+        let connector = self.build_connector().await;
 
         // Resolve our own advertise address so we can self-seed after download.
         let self_addr = self.resolve_self_addr(&node).await.ok();
@@ -622,7 +666,6 @@ impl DesktopAppState {
         Ok(PublishResultView {
             share_id_hex: hex::encode(share.share_id().0),
             share_pubkey_hex: hex::encode(share.verifying_key().to_bytes()),
-            share_secret_hex: hex::encode(share.signing_key.to_bytes()),
             manifest_id_hex: hex::encode(manifest_id),
             provider_addr: format!("{}:{}", provider.ip, provider.port),
             visibility,
@@ -701,6 +744,19 @@ impl DesktopAppState {
         Ok(node.relayed_self_addr(direct_addr).await)
     }
 
+    /// Build a `DesktopSessionConnector` using the stable node identity.
+    async fn build_connector(&self) -> DesktopSessionConnector {
+        let state = self.inner.read().await;
+        let signing_key = state
+            .node_signing_key
+            .clone()
+            .unwrap_or_else(|| SigningKey::generate(&mut OsRng));
+        DesktopSessionConnector {
+            signing_key,
+            capabilities: Capabilities::default(),
+        }
+    }
+
     pub async fn publish_files(
         &self,
         file_paths: &[String],
@@ -747,7 +803,6 @@ impl DesktopAppState {
         Ok(PublishResultView {
             share_id_hex: hex::encode(share.share_id().0),
             share_pubkey_hex: hex::encode(share.verifying_key().to_bytes()),
-            share_secret_hex: hex::encode(share.signing_key.to_bytes()),
             manifest_id_hex: hex::encode(manifest_id),
             provider_addr: format!("{}:{}", provider.ip, provider.port),
             visibility,
@@ -802,7 +857,6 @@ impl DesktopAppState {
         Ok(PublishResultView {
             share_id_hex: hex::encode(share.share_id().0),
             share_pubkey_hex: hex::encode(share.verifying_key().to_bytes()),
-            share_secret_hex: hex::encode(share.signing_key.to_bytes()),
             manifest_id_hex: hex::encode(manifest_id),
             provider_addr: format!("{}:{}", provider.ip, provider.port),
             visibility,
@@ -842,6 +896,21 @@ impl DesktopAppState {
         node.update_share_visibility(scp2p_core::ShareId(share_id), share_visibility(visibility))
             .await?;
         self.list_my_shares().await
+    }
+
+    /// Export the raw Ed25519 signing key for a published share.
+    ///
+    /// This is an explicit, opt-in action — the secret is **not**
+    /// included in `OwnedShareView` or `PublishResultView` by default.
+    pub async fn export_share_secret(&self, share_id_hex: &str) -> anyhow::Result<String> {
+        let node = self.node_handle().await?;
+        let share_id = parse_hex_32(share_id_hex, "share_id")?;
+        let records = node.list_owned_shares().await;
+        let record = records
+            .into_iter()
+            .find(|r| r.share_id == share_id)
+            .ok_or_else(|| anyhow::anyhow!("share not found among published shares"))?;
+        Ok(hex::encode(record.share_secret))
     }
 
     pub async fn browse_share_items(
@@ -893,11 +962,7 @@ impl DesktopAppState {
 
         // Build connector and peer list — same as download_content.
         let peers = self.sync_peer_targets(&node).await?;
-        let mut rng = OsRng;
-        let connector = DesktopSessionConnector {
-            signing_key: SigningKey::generate(&mut rng),
-            capabilities: Capabilities::default(),
-        };
+        let connector = self.build_connector().await;
         let self_addr = self.resolve_self_addr(&node).await.ok();
         let policy = FetchPolicy::default();
         let target = std::path::Path::new(target_dir);
@@ -951,16 +1016,6 @@ fn community_view(community: scp2p_core::PersistedCommunity) -> CommunityView {
     }
 }
 
-fn search_result_view(result: scp2p_core::SearchResult) -> SearchResultView {
-    SearchResultView {
-        share_id_hex: hex::encode(result.share_id.0),
-        content_id_hex: hex::encode(result.content_id),
-        name: result.name,
-        snippet: result.snippet,
-        score: result.score,
-    }
-}
-
 fn public_share_view(peer: &PeerAddr, share: PublicShareSummary) -> PublicShareView {
     PublicShareView {
         source_peer_addr: format!("{}:{}", peer.ip, peer.port),
@@ -980,7 +1035,6 @@ fn owned_share_view(record: OwnedShareRecord) -> OwnedShareView {
     OwnedShareView {
         share_id_hex: hex::encode(record.share_id),
         share_pubkey_hex: hex::encode(record.share_pubkey),
-        share_secret_hex: hex::encode(record.share_secret),
         latest_seq: record.latest_seq,
         manifest_id_hex: hex::encode(record.manifest_id),
         title: record.title,

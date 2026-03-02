@@ -138,6 +138,7 @@ impl NodeHandle {
             req.value,
             req.ttl_secs.max(DEFAULT_TTL_SECS),
             seed_peers,
+            K,
         )
         .await
     }
@@ -352,6 +353,7 @@ impl NodeHandle {
             if validate_dht_value_for_known_keyspaces(value.key, &value.value).is_err() {
                 continue;
             }
+            let replication_factor = if value.is_popular() { K * 2 } else { K };
             let replicated = replicate_store_to_closest(
                 transport,
                 self,
@@ -359,6 +361,7 @@ impl NodeHandle {
                 value.value,
                 DEFAULT_TTL_SECS,
                 seed_peers,
+                replication_factor,
             )
             .await?;
             if replicated > 0 {
@@ -414,6 +417,7 @@ impl NodeHandle {
     ) -> JoinHandle<anyhow::Result<()>> {
         tokio::spawn(async move {
             let listener = TcpListener::bind(bind_addr).await?;
+            let mut nonce_tracker = crate::transport::NonceTracker::new();
             loop {
                 let accepted = tls_accept_session(
                     &listener,
@@ -421,6 +425,7 @@ impl NodeHandle {
                     &local_signing_key,
                     capabilities.clone(),
                     None,
+                    Some(&mut nonce_tracker),
                 )
                 .await;
                 let Ok((stream, session, remote_addr)) = accepted else {
@@ -453,12 +458,14 @@ impl NodeHandle {
         capabilities: Capabilities,
     ) -> JoinHandle<anyhow::Result<()>> {
         tokio::spawn(async move {
+            let mut nonce_tracker = crate::transport::NonceTracker::new();
             loop {
                 let accepted = quic_accept_bi_session(
                     &quic_server,
                     &local_signing_key,
                     capabilities.clone(),
                     None,
+                    Some(&mut nonce_tracker),
                 )
                 .await;
                 let Ok((stream, session, remote_addr)) = accepted else {

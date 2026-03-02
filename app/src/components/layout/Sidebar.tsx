@@ -6,6 +6,9 @@ import {
   Package,
   Settings,
   Radio,
+  HelpCircle,
+  ExternalLink,
+  Download,
 } from "lucide-react";
 import type { PageId } from "@/lib/types";
 
@@ -14,6 +17,8 @@ interface SidebarProps {
   onNavigate: (page: PageId) => void;
   nodeRunning: boolean;
   appVersion?: string;
+  /** Number of downloads currently active (downloading + queued). */
+  downloadActiveCount?: number;
 }
 
 interface NavItem {
@@ -60,7 +65,7 @@ const navItems: NavItem[] = [
   },
 ];
 
-export function Sidebar({ currentPage, onNavigate, nodeRunning, appVersion }: SidebarProps) {
+export function Sidebar({ currentPage, onNavigate, nodeRunning, appVersion, downloadActiveCount }: SidebarProps) {
   let lastSection = "";
 
   return (
@@ -96,6 +101,18 @@ export function Sidebar({ currentPage, onNavigate, nodeRunning, appVersion }: Si
           </span>
         </div>
       </div>
+
+      {/* Download activity indicator */}
+      {(downloadActiveCount ?? 0) > 0 && (
+        <div className="mx-4 mb-3 px-3 py-2 rounded-xl bg-accent/5 border border-accent/20">
+          <div className="flex items-center gap-2">
+            <Download className="h-3 w-3 text-accent animate-pulse" />
+            <span className="text-xs text-accent font-medium">
+              {downloadActiveCount} download{downloadActiveCount !== 1 ? "s" : ""} active
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Navigation */}
       <nav className="flex-1 px-3 overflow-y-auto">
@@ -134,11 +151,21 @@ export function Sidebar({ currentPage, onNavigate, nodeRunning, appVersion }: Si
       </nav>
 
       {/* Footer */}
-      <div className="px-5 py-4 border-t border-border">
+      <div className="px-5 py-4 border-t border-border space-y-2">
+        <a
+          href="https://github.com/nicholasgasior/scp2p"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center gap-2 text-[11px] text-text-muted hover:text-accent transition-colors group"
+        >
+          <HelpCircle className="h-3.5 w-3.5 group-hover:text-accent" />
+          <span>Help &amp; Docs</span>
+          <ExternalLink className="h-2.5 w-2.5 opacity-0 group-hover:opacity-100 transition-opacity" />
+        </a>
         <p className="text-[10px] text-text-muted">
           Subscribed Catalog P2P
         </p>
-        <p className="text-[10px] text-text-muted/50 mt-0.5">
+        <p className="text-[10px] text-text-muted/50">
           Cross-platform desktop client
         </p>
       </div>

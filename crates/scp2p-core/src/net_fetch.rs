@@ -231,6 +231,16 @@ pub struct FetchPolicy {
     /// Maximum number of chunk requests in flight at once across all peers.
     /// Higher values improve throughput when multiple peers are available.
     pub parallel_chunks: usize,
+    /// Maximum consecutive stall loops (each separated by `failure_backoff_base`)
+    /// before a download is aborted.  A stall loop fires whenever no chunks are
+    /// in-flight because every peer is currently in back-off.  Default: 60
+    /// (≈ 18 s at the 300 ms default back-off base).
+    pub max_stall_rounds: usize,
+    /// Optional seed reputation scores keyed by the peer's canonical string
+    /// (`"<ip>:<port>:<transport>"`).  When present, a peer's
+    /// `PeerRuntimeStats.score` is initialised from this map so that
+    /// historically reliable peers are tried before less-trusted ones.
+    pub initial_reputations: HashMap<String, i32>,
 }
 
 /// Callback invoked after each chunk is verified and stored.
@@ -247,6 +257,8 @@ impl Default for FetchPolicy {
             failure_backoff_base: Duration::from_millis(300),
             max_backoff: Duration::from_secs(8),
             parallel_chunks: 8,
+            max_stall_rounds: 60,
+            initial_reputations: HashMap::new(),
         }
     }
 }
@@ -393,7 +405,14 @@ pub async fn download_swarm_over_network<T: RequestTransport + ?Sized>(
 
     let mut stats: HashMap<String, PeerRuntimeStats> = peers
         .iter()
-        .map(|peer| (peer_key(peer), PeerRuntimeStats::default()))
+        .map(|peer| {
+            let key = peer_key(peer);
+            let initial_score = policy.initial_reputations.get(&key).copied().unwrap_or(0);
+            (
+                key,
+                PeerRuntimeStats { score: initial_score, ..PeerRuntimeStats::default() },
+            )
+        })
         .collect();
 
     // Work queues: fresh chunks + retries
@@ -452,7 +471,7 @@ pub async fn download_swarm_over_network<T: RequestTransport + ?Sized>(
         // ── If nothing is in flight, peers may be in back-off; wait briefly ──
         if in_flight.is_empty() {
             stall_count += 1;
-            if stall_count > 60 {
+            if stall_count > policy.max_stall_rounds {
                 anyhow::bail!(
                     "download stalled: no peers can serve remaining {}/{} chunks",
                     total_chunks - completed_count,
@@ -553,12 +572,19 @@ pub async fn download_swarm_to_file<T: RequestTransport + ?Sized>(
 
     let mut stats: HashMap<String, PeerRuntimeStats> = peers
         .iter()
-        .map(|peer| (peer_key(peer), PeerRuntimeStats::default()))
+        .map(|peer| {
+            let key = peer_key(peer);
+            let initial_score = policy.initial_reputations.get(&key).copied().unwrap_or(0);
+            (
+                key,
+                PeerRuntimeStats { score: initial_score, ..PeerRuntimeStats::default() },
+            )
+        })
         .collect();
 
     let mut next_chunk = 0usize;
     let mut retry_queue: VecDeque<(usize, usize)> = VecDeque::new();
-    let mut in_flight = FuturesUnordered::new();
+    let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
     let mut stall_count = 0usize;
 
     loop {
@@ -614,7 +640,7 @@ pub async fn download_swarm_to_file<T: RequestTransport + ?Sized>(
 
         if in_flight.is_empty() {
             stall_count += 1;
-            if stall_count > 60 {
+            if stall_count > policy.max_stall_rounds {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 anyhow::bail!(
                     "download stalled: no peers can serve remaining {}/{} chunks",
@@ -815,6 +841,9 @@ async fn fetch_manifest_once<T: RequestTransport + ?Sized>(
     }
 
     let manifest: ManifestV1 = crate::cbor::from_slice(&bytes)?;
+    // Enforce protocol size limits on received manifests — prevents adversarial
+    // or buggy peers from triggering OOM by sending oversized item lists.
+    manifest.check_limits()?;
     if manifest.manifest_id()?.0 != manifest_id {
         anyhow::bail!("manifest bytes hash does not match manifest_id");
     }

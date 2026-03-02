@@ -531,6 +531,18 @@ pub struct ListCommunityPublicShares {
     pub community_share_id: [u8; 32],
     pub community_share_pubkey: [u8; 32],
     pub max_entries: u16,
+    /// Ed25519 public key of the requesting node's stable identity.
+    ///
+    /// Required when the serving node has `community_strict_mode` enabled.
+    /// May be omitted for permissive-mode servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_node_pubkey: Option<[u8; 32]>,
+    /// Serialized `CommunityMembershipToken` (CBOR bytes) proving the
+    /// requester is a member of the requested community.
+    ///
+    /// Required when the serving node has `community_strict_mode` enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_membership_proof: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1126,6 +1138,8 @@ mod tests {
             community_share_id: [6u8; 32],
             community_share_pubkey: [7u8; 32],
             max_entries: 12,
+            requester_node_pubkey: None,
+            requester_membership_proof: None,
         };
         let request_rt: ListCommunityPublicShares =
             crate::cbor::from_slice(&crate::cbor::to_vec(&request).expect("encode"))
@@ -1292,6 +1306,8 @@ mod tests {
                 community_share_id: [16u8; 32],
                 community_share_pubkey: [17u8; 32],
                 max_entries: 4,
+                requester_node_pubkey: None,
+                requester_membership_proof: None,
             }),
             WirePayload::CommunityPublicShareList(CommunityPublicShareList {
                 community_share_id: [16u8; 32],

@@ -197,12 +197,11 @@ async fn main() -> anyhow::Result<()> {
             republish_interval_secs,
         } => {
             let node = open_node(&state_db, &bootstrap).await?;
-            let mut rng = OsRng;
-            let node_key = SigningKey::generate(&mut rng);
+            let node_key = node.ensure_node_identity().await?;
             let tls_server = Arc::new(build_tls_server_handle().expect("build TLS server handle"));
             let _service = node.clone().start_tls_dht_service(
                 "0.0.0.0:7001".parse()?,
-                node_key,
+                node_key.clone(),
                 scp2p_core::Capabilities::default(),
                 tls_server,
             );
@@ -213,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
 
             if !peers.is_empty() {
                 let transport = Arc::new(DirectRequestTransport::new(CliSessionConnector {
-                    signing_key: SigningKey::generate(&mut rng),
+                    signing_key: node_key,
                     capabilities: Capabilities::default(),
                 }));
                 let republish_peers = peers.clone();

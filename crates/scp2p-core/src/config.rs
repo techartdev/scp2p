@@ -14,6 +14,24 @@ pub struct NodeConfig {
     pub bind_tcp: Option<SocketAddr>,
     pub capabilities: Capabilities,
     pub bootstrap_peers: Vec<String>,
+    /// Maximum number of share subscriptions this node will hold.
+    ///
+    /// Subscriptions drive sync I/O, search-index RAM, and SQLite FTS5 write
+    /// volume. An unbounded count causes O(N²) persist I/O and multi-GB RAM
+    /// use in active communities. Default: 200.
+    pub max_subscriptions: usize,
+    /// When `true` (default), newly created publisher identities are
+    /// encrypted at rest using a key derived from the node's stable identity
+    /// key via blake3.  On restart, if the node key is available in persisted
+    /// state, encrypted publisher identities are automatically decrypted
+    /// without user interaction.  When the node key itself is passphrase-
+    /// protected, publisher key unlocking follows the same gate.
+    pub auto_protect_publisher_keys: bool,
+    /// When `true`, `ListCommunityPublicShares` requests to this node must
+    /// include a valid, unexpired `CommunityMembershipToken` for the
+    /// requester.  In permissive mode (default `false`), any caller can
+    /// enumerate this node's community public shares.
+    pub community_strict_mode: bool,
 }
 
 impl Default for NodeConfig {
@@ -29,6 +47,9 @@ impl Default for NodeConfig {
                 mobile_light: false,
             },
             bootstrap_peers: vec![],
+            max_subscriptions: 200,
+            auto_protect_publisher_keys: true,
+            community_strict_mode: false,
         }
     }
 }

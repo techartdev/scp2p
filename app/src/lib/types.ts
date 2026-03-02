@@ -32,12 +32,14 @@ export interface PeerView {
   last_seen_unix: number;
 }
 
+export type SubscriptionTrustLevel = "trusted" | "normal" | "untrusted";
+
 export interface SubscriptionView {
   share_id_hex: string;
   share_pubkey_hex: string | null;
   latest_seq: number;
   latest_manifest_id_hex: string | null;
-  trust_level: string;
+  trust_level: SubscriptionTrustLevel;
   title: string | null;
   description: string | null;
 }
@@ -65,11 +67,18 @@ export interface SearchResultView {
   name: string;
   snippet: string | null;
   score: number;
+  share_title: string | null;
 }
 
 export interface SearchResultsView {
   total: number;
   results: SearchResultView[];
+}
+
+/// Outcome of a sync operation.
+export interface SyncResultView {
+  subscriptions: SubscriptionView[];
+  updated_count: number;
 }
 
 export interface PublicShareView {
@@ -84,7 +93,6 @@ export interface PublicShareView {
 export interface PublishResultView {
   share_id_hex: string;
   share_pubkey_hex: string;
-  share_secret_hex: string;
   manifest_id_hex: string;
   provider_addr: string;
   visibility: "private" | "public";
@@ -105,8 +113,6 @@ export interface ShareItemView {
 export interface OwnedShareView {
   share_id_hex: string;
   share_pubkey_hex: string;
-  /// Raw Ed25519 signing key — keep confidential.
-  share_secret_hex: string;
   latest_seq: number;
   manifest_id_hex: string;
   title: string | null;

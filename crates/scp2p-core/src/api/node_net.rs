@@ -8,8 +8,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
+use tokio::task::JoinHandle;
 
 use crate::{
     content::ChunkedContent,
@@ -18,7 +21,8 @@ use crate::{
     manifest::{ManifestV1, ShareVisibility},
     net_fetch::{
         FetchPolicy, PeerConnector, ProgressCallback, RelayAwareTransport, RequestTransport,
-        download_swarm_to_file, fetch_chunk_hashes_with_retry, fetch_manifest_with_retry,
+        download_swarm_over_network, download_swarm_to_file, fetch_chunk_hashes_with_retry,
+        fetch_manifest_with_retry,
     },
     peer::PeerAddr,
     store::{PersistedPartialDownload, decrypt_secret, encrypt_secret},
@@ -40,142 +44,47 @@ use super::{
 
 impl NodeHandle {
     pub async fn sync_subscriptions(&self) -> anyhow::Result<()> {
-        let mut state = self.state.write().await;
-        let now = now_unix_secs()?;
-        let subscription_ids = state.subscriptions.keys().copied().collect::<Vec<_>>();
+        let mut indexed_manifests = Vec::new();
+        let store = {
+            let mut state = self.state.write().await;
+            let now = now_unix_secs()?;
+            let subscription_ids = state.subscriptions.keys().copied().collect::<Vec<_>>();
 
-        for share_id in subscription_ids {
-            let share_pubkey = state
-                .subscriptions
-                .get(&share_id)
-                .and_then(|sub| sub.share_pubkey);
-            let local_seq = state
-                .subscriptions
-                .get(&share_id)
-                .map(|sub| sub.latest_seq)
-                .unwrap_or_default();
+            for share_id in subscription_ids {
+                let share_pubkey = state
+                    .subscriptions
+                    .get(&share_id)
+                    .and_then(|sub| sub.share_pubkey);
+                let local_seq = state
+                    .subscriptions
+                    .get(&share_id)
+                    .map(|sub| sub.latest_seq)
+                    .unwrap_or_default();
 
-            let Some(head_val) = state
-                .dht
-                .find_value(share_head_key(&ShareId(share_id)), now)
-            else {
-                continue;
-            };
-
-            let head: crate::manifest::ShareHead = crate::cbor::from_slice(&head_val.value)?;
-            if let Some(pubkey) = share_pubkey {
-                head.verify_with_pubkey(pubkey)?;
-            }
-
-            if head.latest_seq <= local_seq {
-                continue;
-            }
-
-            let Some(manifest) = state.manifest_cache.get(&head.latest_manifest_id).cloned() else {
-                continue;
-            };
-            manifest.verify()?;
-            if manifest.share_id != share_id {
-                anyhow::bail!("manifest share_id mismatch while syncing subscription");
-            }
-
-            for item in &manifest.items {
-                let content = ChunkedContent {
-                    content_id: ContentId(item.content_id),
-                    chunks: vec![],
-                    chunk_count: item.chunk_count,
-                    chunk_list_hash: item.chunk_list_hash,
+                let Some(head_val) = state
+                    .dht
+                    .find_value(share_head_key(&ShareId(share_id)), now)
+                else {
+                    continue;
                 };
-                state.content_catalog.insert(item.content_id, content);
-            }
-            state.search_index.index_manifest(&manifest);
 
-            if let Some(sub) = state.subscriptions.get_mut(&share_id) {
-                sub.latest_seq = head.latest_seq;
-                sub.latest_manifest_id = Some(head.latest_manifest_id);
-            }
-        }
-        drop(state);
-        {
-            let mut s = self.state.write().await;
-            s.dirty.subscriptions = true;
-            s.dirty.search_index = true;
-            s.dirty.manifests = true;
-        }
-        persist_state(self).await
-    }
+                let head: crate::manifest::ShareHead = crate::cbor::from_slice(&head_val.value)?;
+                if let Some(pubkey) = share_pubkey {
+                    head.verify_with_pubkey(pubkey)?;
+                }
 
-    pub async fn sync_subscriptions_over_dht<T: RequestTransport + ?Sized>(
-        &self,
-        transport: &T,
-        seed_peers: &[PeerAddr],
-    ) -> anyhow::Result<()> {
-        let subscription_meta = {
-            let state = self.state.read().await;
-            state
-                .subscriptions
-                .iter()
-                .map(|(share_id, sub)| (*share_id, sub.share_pubkey, sub.latest_seq))
-                .collect::<Vec<_>>()
-        };
+                if head.latest_seq <= local_seq {
+                    continue;
+                }
 
-        for (share_id, share_pubkey, local_seq) in subscription_meta {
-            let Some(head) = self
-                .dht_find_share_head_iterative(
-                    transport,
-                    ShareId(share_id),
-                    share_pubkey,
-                    seed_peers,
-                )
-                .await?
-            else {
-                continue;
-            };
-            if head.latest_seq <= local_seq {
-                continue;
-            }
-
-            let cached_manifest = {
-                let state = self.state.read().await;
-                state.manifest_cache.get(&head.latest_manifest_id).cloned()
-            };
-            let manifest = if let Some(cached) = cached_manifest {
-                cached
-            } else {
-                let mut target = [0u8; 20];
-                target.copy_from_slice(&head.latest_manifest_id[..20]);
-                let mut peers = seed_peers.to_vec();
-                let discovered = self
-                    .dht_find_node_iterative(transport, target, seed_peers)
-                    .await?;
-                merge_peer_list(&mut peers, discovered);
-                let fetched = match fetch_manifest_with_retry(
-                    transport,
-                    &peers,
-                    head.latest_manifest_id,
-                    &FetchPolicy::default(),
-                )
-                .await
-                {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                let Some(manifest) = state.manifest_cache.get(&head.latest_manifest_id).cloned() else {
+                    continue;
                 };
-                let mut state = self.state.write().await;
-                state
-                    .manifest_cache
-                    .insert(head.latest_manifest_id, fetched.clone());
-                state.dirty.manifests = true;
-                drop(state);
-                persist_state(self).await?;
-                fetched
-            };
-            manifest.verify()?;
-            if manifest.share_id != share_id {
-                anyhow::bail!("manifest share_id mismatch while syncing subscription");
-            }
+                manifest.verify()?;
+                if manifest.share_id != share_id {
+                    anyhow::bail!("manifest share_id mismatch while syncing subscription");
+                }
 
-            {
-                let mut state = self.state.write().await;
                 for item in &manifest.items {
                     let content = ChunkedContent {
                         content_id: ContentId(item.content_id),
@@ -186,18 +95,295 @@ impl NodeHandle {
                     state.content_catalog.insert(item.content_id, content);
                 }
                 state.search_index.index_manifest(&manifest);
+                indexed_manifests.push(manifest);
 
                 if let Some(sub) = state.subscriptions.get_mut(&share_id) {
                     sub.latest_seq = head.latest_seq;
                     sub.latest_manifest_id = Some(head.latest_manifest_id);
                 }
-                state.dirty.subscriptions = true;
-                state.dirty.search_index = true;
-                state.dirty.manifests = true;
             }
-            persist_state(self).await?;
+            state.store.clone()
+        };
+        // FTS5 write-through: persist search index items outside the state lock.
+        for manifest in &indexed_manifests {
+            store.index_manifest_for_search(manifest).await?;
         }
-        Ok(())
+        {
+            let mut s = self.state.write().await;
+            s.dirty.subscriptions = true;
+            s.dirty.manifests = true;
+        }
+        persist_state(self).await
+    }
+
+    pub async fn sync_subscriptions_over_dht<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        seed_peers: &[PeerAddr],
+    ) -> anyhow::Result<()> {
+        /// Number of subscription fetches executed concurrently during the
+        /// network phase.  Bounded to avoid overwhelming the transport or the
+        /// remote peer's rate limits.
+        const SYNC_CONCURRENCY: usize = 20;
+
+        let subscription_meta = {
+            let state = self.state.read().await;
+            state
+                .subscriptions
+                .iter()
+                .map(|(share_id, sub)| (*share_id, sub.share_pubkey, sub.latest_seq))
+                .collect::<Vec<_>>()
+        };
+
+        if subscription_meta.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 1: concurrent network — DHT head lookups + manifest fetches
+        // processed in batches of SYNC_CONCURRENCY.  No state mutations here.
+        type FetchOk = ([u8; 32], [u8; 32], ManifestV1, u64); // (share_id, manifest_id, manifest, new_seq)
+        let mut fetch_results: Vec<Option<FetchOk>> = Vec::new();
+        for chunk in subscription_meta.chunks(SYNC_CONCURRENCY) {
+            let batch = futures_util::future::join_all(chunk.iter().map(
+                |&(share_id, share_pubkey, local_seq)| {
+                    self.fetch_subscription_update_network(
+                        transport,
+                        share_id,
+                        share_pubkey,
+                        local_seq,
+                        seed_peers,
+                    )
+                },
+            ))
+            .await;
+            for result in batch {
+                fetch_results.push(result?);
+            }
+        }
+
+        // Phase 2: apply all fetched manifests to state under a single write lock.
+        let (phase2_store, indexed_manifests) = {
+            let mut indexed_manifests = Vec::new();
+            let mut state = self.state.write().await;
+            for result in fetch_results {
+                let Some((share_id, manifest_id, manifest, new_seq)) = result else {
+                    continue;
+                };
+                state.manifest_cache.insert(manifest_id, manifest.clone());
+                for item in &manifest.items {
+                    let content = ChunkedContent {
+                        content_id: ContentId(item.content_id),
+                        chunks: vec![],
+                        chunk_count: item.chunk_count,
+                        chunk_list_hash: item.chunk_list_hash,
+                    };
+                    state.content_catalog.insert(item.content_id, content);
+                }
+                state.search_index.index_manifest(&manifest);
+                indexed_manifests.push(manifest);
+                if let Some(sub) = state.subscriptions.get_mut(&share_id) {
+                    sub.latest_seq = new_seq;
+                    sub.latest_manifest_id = Some(manifest_id);
+                }
+            }
+            state.dirty.subscriptions = true;
+            state.dirty.manifests = true;
+            (state.store.clone(), indexed_manifests)
+        };
+        // FTS5 write-through: persist search index items outside the state lock.
+        for manifest in &indexed_manifests {
+            phase2_store.index_manifest_for_search(manifest).await?;
+        }
+
+        // Phase 3: single persist (replaces one-per-subscription persist calls).
+        persist_state(self).await
+    }
+
+    /// Network-only phase for a single subscription update.
+    ///
+    /// Performs the DHT head lookup and manifest fetch with no state mutations,
+    /// making it safe to call concurrently for multiple subscriptions.
+    ///
+    /// Returns `None` when the subscription is already up to date or cannot be
+    /// resolved over the network. Returns `Some((share_id, manifest_id,
+    /// manifest, new_seq))` when a newer manifest was fetched.
+    async fn fetch_subscription_update_network<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        share_id: [u8; 32],
+        share_pubkey: Option<[u8; 32]>,
+        local_seq: u64,
+        seed_peers: &[PeerAddr],
+    ) -> anyhow::Result<Option<([u8; 32], [u8; 32], ManifestV1, u64)>> {
+        let Some(head) = self
+            .dht_find_share_head_iterative(
+                transport,
+                ShareId(share_id),
+                share_pubkey,
+                seed_peers,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if head.latest_seq <= local_seq {
+            return Ok(None);
+        }
+
+        let manifest_id = head.latest_manifest_id;
+
+        // Check manifest cache before going to the network.
+        let cached_manifest = {
+            let state = self.state.read().await;
+            state.manifest_cache.get(&manifest_id).cloned()
+        };
+
+        let manifest = if let Some(cached) = cached_manifest {
+            cached
+        } else {
+            let mut target = [0u8; 20];
+            target.copy_from_slice(&manifest_id[..20]);
+            let mut peers = seed_peers.to_vec();
+            let discovered = self
+                .dht_find_node_iterative(transport, target, seed_peers)
+                .await?;
+            merge_peer_list(&mut peers, discovered);
+            match fetch_manifest_with_retry(
+                transport,
+                &peers,
+                manifest_id,
+                &FetchPolicy::default(),
+            )
+            .await
+            {
+                Ok(m) => m,
+                Err(_) => return Ok(None),
+            }
+        };
+
+        manifest.verify()?;
+        if manifest.share_id != share_id {
+            anyhow::bail!("manifest share_id mismatch while syncing subscription");
+        }
+
+        Ok(Some((share_id, manifest_id, manifest, head.latest_seq)))
+    }
+
+    /// Fetch and apply blocklist rules for all enabled blocklist shares that
+    /// publish a manifest item named `"blocklist"` (§4.11).
+    ///
+    /// For each enabled share whose cached manifest contains an item with
+    /// `name == "blocklist"`, this method downloads the content bytes from
+    /// `seed_peers`, decodes them as [`BlocklistRules`], and calls
+    /// [`NodeHandle::set_blocklist_rules`] to apply the update automatically.
+    ///
+    /// Returns the number of shares whose rules were successfully refreshed.
+    pub async fn apply_blocklist_updates_from_subscriptions<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        seed_peers: &[PeerAddr],
+    ) -> anyhow::Result<usize> {
+        /// Conventional item name for blocklist-rule content within a manifest.
+        const BLOCKLIST_ITEM_NAME: &str = "blocklist";
+
+        // Phase 1 (read-lock): collect candidate items from cached manifests.
+        // Only shares that are subscribed, enabled, and have a matching item
+        // will be included.
+        type BlocklistCandidate = ([u8; 32], [u8; 32], u32, [u8; 32]);
+        let candidates: Vec<BlocklistCandidate> = {
+            let state = self.state.read().await;
+            state
+                .enabled_blocklist_shares
+                .iter()
+                .filter_map(|share_id| {
+                    let sub = state.subscriptions.get(share_id)?;
+                    let manifest_id = sub.latest_manifest_id?;
+                    let manifest = state.manifest_cache.get(&manifest_id)?;
+                    let item = manifest
+                        .items
+                        .iter()
+                        .find(|i| i.name == BLOCKLIST_ITEM_NAME)?;
+                    Some((*share_id, item.content_id, item.chunk_count, item.chunk_list_hash))
+                })
+                .collect()
+        };
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // Phase 2 (network): fetch and decode each blocklist item.
+        let policy = FetchPolicy::default();
+        let mut updated = 0usize;
+
+        for (share_id, content_id, chunk_count, chunk_list_hash) in candidates {
+            if chunk_count == 0 {
+                continue;
+            }
+
+            let chunk_hashes = match fetch_chunk_hashes_with_retry(
+                transport,
+                seed_peers,
+                content_id,
+                chunk_count,
+                chunk_list_hash,
+                &policy,
+            )
+            .await
+            {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+
+            let bytes = match download_swarm_over_network(
+                transport,
+                seed_peers,
+                content_id,
+                &chunk_hashes,
+                &policy,
+                None,
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+
+            let Ok(rules) = crate::cbor::from_slice::<super::BlocklistRules>(&bytes) else {
+                continue;
+            };
+
+            if self.set_blocklist_rules(ShareId(share_id), rules).await.is_ok() {
+                updated += 1;
+            }
+        }
+
+        Ok(updated)
+    }
+
+    /// Spawn a background task that periodically syncs subscriptions over the
+    /// DHT and then refreshes blocklist rules from any newly updated blocklist
+    /// share manifests (§4.11).
+    ///
+    /// The loop runs `sync_subscriptions_over_dht` followed by
+    /// `apply_blocklist_updates_from_subscriptions` on each tick.
+    pub fn start_blocklist_auto_sync_loop(
+        self,
+        transport: Arc<dyn RequestTransport>,
+        seed_peers: Vec<PeerAddr>,
+        interval: Duration,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let _ = self
+                    .sync_subscriptions_over_dht(transport.as_ref(), &seed_peers)
+                    .await;
+                let _ = self
+                    .apply_blocklist_updates_from_subscriptions(transport.as_ref(), &seed_peers)
+                    .await;
+                tokio::time::sleep(interval).await;
+            }
+        })
     }
 
     pub async fn search(&self, query: SearchQuery) -> anyhow::Result<Vec<SearchResult>> {
@@ -423,13 +609,15 @@ impl NodeHandle {
     ) -> anyhow::Result<ManifestV1> {
         let manifest = fetch_manifest_with_retry(connector, peers, manifest_id, policy).await?;
         manifest.verify()?;
-        {
+        let store = {
             let mut state = self.state.write().await;
             state.manifest_cache.insert(manifest_id, manifest.clone());
             state.search_index.index_manifest(&manifest);
             state.dirty.manifests = true;
-            state.dirty.search_index = true;
-        }
+            state.store.clone()
+        };
+        // FTS5 write-through outside the state lock.
+        store.index_manifest_for_search(&manifest).await?;
         persist_state(self).await?;
         Ok(manifest)
     }
@@ -517,12 +705,30 @@ impl NodeHandle {
         };
 
         let target_pb = PathBuf::from(target_path);
+
+        // Seed reputation scores from the local peer DB so that historically
+        // reliable peers are scheduled before less-trusted peers.
+        let seeded_policy;
+        let effective_policy: &FetchPolicy = if policy.initial_reputations.is_empty() {
+            let reps = {
+                let state = self.state.read().await;
+                state.peer_db.reputation_for_peers(&all_peers)
+            };
+            seeded_policy = FetchPolicy {
+                initial_reputations: reps,
+                ..policy.clone()
+            };
+            &seeded_policy
+        } else {
+            policy
+        };
+
         download_swarm_to_file(
             &transport,
             &all_peers,
             content_id,
             &chunk_hashes,
-            policy,
+            effective_policy,
             &target_pb,
             on_progress,
         )
@@ -776,6 +982,8 @@ impl NodeHandle {
                     ShareId(msg.community_share_id),
                     msg.community_share_pubkey,
                     msg.max_entries as usize,
+                    msg.requester_node_pubkey,
+                    msg.requester_membership_proof.as_deref(),
                 )
                 .await
                 .and_then(|shares| {

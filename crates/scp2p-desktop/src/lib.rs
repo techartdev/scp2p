@@ -13,4 +13,5 @@ pub use dto::{
     CommunityBrowseView, CommunityParticipantView, CommunityView, DesktopClientConfig,
     OwnedShareView, PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
     SearchResultView, SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
+    SyncResultView,
 };

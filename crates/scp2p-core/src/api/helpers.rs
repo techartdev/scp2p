@@ -14,18 +14,20 @@ use std::{
 };
 
 use crate::{
-    dht::K,
     dht_keys::{content_provider_key, share_head_key},
     ids::{NodeId, ShareId},
-    manifest::{ManifestV1, PublicShareSummary, ShareHead},
+    manifest::{PublicShareSummary, ShareHead},
     net_fetch::RequestTransport,
     peer::PeerAddr,
-    relay::RelayPayloadKind as RelayInternalPayloadKind,
+    relay::{
+        RelayAnnouncement, RelayPayloadKind as RelayInternalPayloadKind,
+        current_rendezvous_bucket, relay_rendezvous_index, relay_rendezvous_key,
+    },
     search::IndexedItem,
     wire::{
         CommunityPublicShareList, CommunityStatus, Envelope, FLAG_RESPONSE, FindNode,
         FindNodeResult, FindValue, FindValueResult, GetCommunityStatus, ListCommunityPublicShares,
-        ListPublicShares, MsgType, Providers, PublicShareList,
+        ListPublicShares, MsgType, Providers, PublicShareList, RelayListRequest, RelayListResponse,
         RelayPayloadKind as WireRelayPayloadKind, Store as WireStore, WirePayload,
     },
 };
@@ -64,6 +66,16 @@ pub(super) fn relay_payload_kind_to_wire(kind: RelayInternalPayloadKind) -> Wire
     }
 }
 
+/// Convert an ASCII hex digit to its value (0–15), or `None`.
+pub(super) fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub(super) fn request_class(payload: &WirePayload) -> RequestClass {
     match payload {
         WirePayload::FindNode(_) | WirePayload::FindValue(_) | WirePayload::Store(_) => {
@@ -74,11 +86,11 @@ pub(super) fn request_class(payload: &WirePayload) -> RequestClass {
         | WirePayload::GetCommunityStatus(_)
         | WirePayload::ListCommunityPublicShares(_)
         | WirePayload::GetChunkHashes(_) => RequestClass::Fetch,
-        // Chunk data is not rate-limited by request count — TCP bandwidth is the
-        // natural throttle.  Applying a fixed-count limit here would cap large
-        // file transfers at max_fetch_requests_per_window * CHUNK_SIZE bytes
-        // (e.g. 240 * 256 KiB ≈ 60 MiB) regardless of available bandwidth.
-        WirePayload::GetChunk(_) => RequestClass::Other,
+        // Chunk data requests are rate-limited by per-peer chunk request
+        // count.  Each chunk is up to CHUNK_SIZE (256 KiB), so the
+        // `max_chunk_requests_per_window` field in `AbuseLimits`
+        // effectively caps bandwidth per peer.
+        WirePayload::GetChunk(_) => RequestClass::Chunk,
         WirePayload::RelayRegister(_)
         | WirePayload::RelayConnect(_)
         | WirePayload::RelayStream(_) => RequestClass::Relay,
@@ -136,9 +148,40 @@ pub(super) fn validate_dht_value_for_known_keyspaces(
         }
         return Ok(());
     }
+    // Relay announcements are stored at DHT rendezvous keys (§4.9).
+    if let Ok(ann) = crate::cbor::from_slice::<RelayAnnouncement>(value) {
+        // Full structural + cryptographic validation.
+        ann.verify_signature()?;
+        // Accept if the key matches any valid rendezvous slot for this relay.
+        if is_valid_relay_rendezvous_key(key, &ann) {
+            return Ok(());
+        }
+        anyhow::bail!("relay announcement key does not match any valid rendezvous slot");
+    }
     // Reject values that do not match any recognized keyspace to prevent
     // arbitrary data storage and potential abuse (§4.5).
     anyhow::bail!("DHT value does not match any recognized keyspace")
+}
+
+/// Check whether `key` is a valid relay rendezvous key for the relay pubkey
+/// embedded in `ann`.  Checks the bucket derived from `ann.issued_at` plus
+/// the adjacent bucket to tolerate boundary timing.
+pub(super) fn is_valid_relay_rendezvous_key(key: [u8; 32], ann: &RelayAnnouncement) -> bool {
+    let issued_bucket = current_rendezvous_bucket(ann.issued_at);
+    let buckets = [
+        issued_bucket,
+        issued_bucket.saturating_sub(1),
+        issued_bucket.saturating_add(1),
+    ];
+    for bucket_id in buckets {
+        for which in 0u8..2 {
+            let slot = relay_rendezvous_index(&ann.relay_pubkey, bucket_id, which);
+            if relay_rendezvous_key(bucket_id, slot) == key {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub(super) async fn query_find_node<T: RequestTransport + ?Sized>(
@@ -255,6 +298,8 @@ pub(super) async fn query_community_public_shares<T: RequestTransport + ?Sized>(
     community_share_id: ShareId,
     community_share_pubkey: [u8; 32],
     max_entries: u16,
+    requester_node_pubkey: Option<[u8; 32]>,
+    requester_membership_proof: Option<Vec<u8>>,
 ) -> anyhow::Result<Vec<PublicShareSummary>> {
     let req_id = next_req_id();
     let request = Envelope::from_typed(
@@ -264,6 +309,8 @@ pub(super) async fn query_community_public_shares<T: RequestTransport + ?Sized>(
             community_share_id: community_share_id.0,
             community_share_pubkey,
             max_entries,
+            requester_node_pubkey,
+            requester_membership_proof,
         }),
     )?;
     let response = transport
@@ -283,6 +330,34 @@ pub(super) async fn query_community_public_shares<T: RequestTransport + ?Sized>(
         anyhow::bail!("community public share list response share_id mismatch");
     }
     Ok(payload.shares)
+}
+
+/// Ask a single peer for its known relay announcements (Relay-PEX, §4.9).
+pub(super) async fn query_relay_list<T: RequestTransport + ?Sized>(
+    transport: &T,
+    peer: &PeerAddr,
+    max_count: u16,
+) -> anyhow::Result<Vec<RelayAnnouncement>> {
+    let req_id = next_req_id();
+    let request = Envelope::from_typed(
+        req_id,
+        0,
+        &WirePayload::RelayListRequest(RelayListRequest { max_count }),
+    )?;
+    let response = transport
+        .request(peer, request, Duration::from_secs(5))
+        .await?;
+    if response.r#type != MsgType::RelayListResponse as u16 {
+        anyhow::bail!("unexpected relay list response type");
+    }
+    if response.req_id != req_id {
+        anyhow::bail!("relay list response req_id mismatch");
+    }
+    if response.flags & FLAG_RESPONSE == 0 {
+        anyhow::bail!("relay list response missing response flag");
+    }
+    let resp: RelayListResponse = crate::cbor::from_slice(&response.payload)?;
+    Ok(resp.announcements)
 }
 
 pub(super) async fn query_store<T: RequestTransport + ?Sized>(
@@ -324,6 +399,7 @@ pub(super) async fn replicate_store_to_closest<T: RequestTransport + ?Sized>(
     value: Vec<u8>,
     ttl_secs: u64,
     seed_peers: &[PeerAddr],
+    replication_factor: usize,
 ) -> anyhow::Result<usize> {
     let mut target = [0u8; 20];
     target.copy_from_slice(&key[..20]);
@@ -332,7 +408,7 @@ pub(super) async fn replicate_store_to_closest<T: RequestTransport + ?Sized>(
         .await?;
 
     let mut stored = 0usize;
-    for peer in peers.into_iter().take(K) {
+    for peer in peers.into_iter().take(replication_factor) {
         if query_store(transport, &peer, key, value.clone(), ttl_secs)
             .await
             .is_ok()
@@ -372,12 +448,6 @@ pub(super) fn error_envelope(message_type: u16, req_id: u32, message: &str) -> E
 // Path-safety helpers
 // ---------------------------------------------------------------------------
 
-/// Maximum number of items allowed in a single manifest.
-pub(super) const MAX_MANIFEST_ITEMS: usize = 10_000;
-
-/// Maximum total number of chunk hashes across all items in a manifest.
-pub(super) const MAX_MANIFEST_CHUNK_HASHES: usize = 100_000;
-
 /// Maximum byte length of a normalised path.
 const MAX_PATH_BYTES: usize = 1024;
 
@@ -414,23 +484,6 @@ pub(super) fn normalize_item_path(raw: &str) -> anyhow::Result<String> {
         );
     }
     Ok(result)
-}
-
-/// Validate manifest item counts against protocol limits.
-pub(super) fn check_manifest_limits(manifest: &ManifestV1) -> anyhow::Result<()> {
-    if manifest.items.len() > MAX_MANIFEST_ITEMS {
-        anyhow::bail!(
-            "manifest has {} items, exceeding limit of {MAX_MANIFEST_ITEMS}",
-            manifest.items.len()
-        );
-    }
-    let total_chunks: u32 = manifest.items.iter().map(|i| i.chunk_count).sum();
-    if total_chunks > MAX_MANIFEST_CHUNK_HASHES as u32 {
-        anyhow::bail!(
-            "manifest has {total_chunks} total chunk hashes, exceeding limit of {MAX_MANIFEST_CHUNK_HASHES}"
-        );
-    }
-    Ok(())
 }
 
 /// Recursively collect all file paths under `dir`, skipping directories.

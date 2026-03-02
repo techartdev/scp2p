@@ -183,6 +183,78 @@ async fn configured_bootstrap_peers_with_transport_prefix() {
 }
 
 #[tokio::test]
+async fn configured_bootstrap_peers_parse_pubkey_suffix() {
+    let pubkey_hex = "aa".repeat(32); // 64 hex chars → [0xaa; 32]
+    let entry = format!("tcp://10.0.0.5:9500@{pubkey_hex}");
+    let handle = Node::start(NodeConfig {
+        bootstrap_peers: vec![entry, "10.0.0.6:9501".to_string()],
+        ..NodeConfig::default()
+    })
+    .await
+    .expect("start");
+    let peers = handle
+        .configured_bootstrap_peers()
+        .await
+        .expect("configured peers");
+    assert_eq!(peers.len(), 2);
+    assert_eq!(peers[0].pubkey_hint, Some([0xaa; 32]));
+    assert_eq!(peers[0].port, 9500);
+    // Entry without pubkey suffix should have None.
+    assert_eq!(peers[1].pubkey_hint, None);
+}
+
+#[tokio::test]
+async fn tofu_pin_bootstrap_key_first_seen() {
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let addr = "tcp://10.0.0.1:7001";
+    let key = [0xbb; 32];
+
+    // No key pinned initially.
+    assert!(handle.pinned_bootstrap_key(addr).await.is_none());
+
+    // Pin first-seen key.
+    handle.pin_bootstrap_key(addr, key).await.expect("pin ok");
+    assert_eq!(handle.pinned_bootstrap_key(addr).await, Some(key));
+
+    // Same key again — should succeed (idempotent).
+    handle
+        .pin_bootstrap_key(addr, key)
+        .await
+        .expect("same key ok");
+
+    // Different key — must fail (identity mismatch).
+    let bad_key = [0xcc; 32];
+    let err = handle
+        .pin_bootstrap_key(addr, bad_key)
+        .await
+        .expect_err("mismatch must fail");
+    assert!(err.to_string().contains("identity mismatch"));
+}
+
+#[tokio::test]
+async fn tofu_pinned_key_appears_in_bootstrap_peers() {
+    let addr_str = "tcp://10.0.0.7:9600";
+    let handle = Node::start(NodeConfig {
+        bootstrap_peers: vec![addr_str.to_string()],
+        ..NodeConfig::default()
+    })
+    .await
+    .expect("start");
+
+    // Before pinning: no pubkey_hint.
+    let peers = handle.configured_bootstrap_peers().await.expect("peers");
+    assert_eq!(peers[0].pubkey_hint, None);
+
+    // Pin a key.
+    let key = [0xdd; 32];
+    handle.pin_bootstrap_key(addr_str, key).await.expect("pin");
+
+    // After pinning: pubkey_hint should be set.
+    let peers = handle.configured_bootstrap_peers().await.expect("peers");
+    assert_eq!(peers[0].pubkey_hint, Some(key));
+}
+
+#[tokio::test]
 async fn peer_and_subscription_snapshots_are_exposed() {
     let handle = Node::start(NodeConfig::default()).await.expect("start");
     let peer = PeerAddr {
@@ -2295,6 +2367,7 @@ async fn incoming_request_rate_limits_are_enforced() {
             max_dht_requests_per_window: 10,
             max_fetch_requests_per_window: 10,
             max_relay_requests_per_window: 10,
+            max_chunk_requests_per_window: 10,
         })
         .await
         .expect("set abuse limits");
@@ -3850,4 +3923,873 @@ async fn handle_relay_list_request_returns_empty() {
     let decoded: crate::wire::RelayListResponse =
         crate::cbor::from_slice(&resp.payload).expect("decode");
     assert!(decoded.announcements.is_empty());
+}
+
+#[tokio::test]
+async fn chunk_request_rate_limits_are_enforced() {
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    handle
+        .set_abuse_limits(AbuseLimits {
+            window_secs: 60,
+            max_total_requests_per_window: 1000,
+            max_dht_requests_per_window: 1000,
+            max_fetch_requests_per_window: 1000,
+            max_relay_requests_per_window: 1000,
+            max_chunk_requests_per_window: 2,
+        })
+        .await
+        .expect("set abuse limits");
+
+    let remote = PeerAddr {
+        ip: "10.0.8.8".parse().expect("ip"),
+        port: 7998,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some([55u8; 32]),
+        relay_via: None,
+    };
+
+    // Each GetChunk request will fail (chunk not found) but the rate
+    // counter is bumped *before* the handler runs, so the limit is
+    // still enforced.
+    let make_req = || {
+        Envelope::from_typed(
+            next_req_id(),
+            0,
+            &WirePayload::GetChunk(crate::wire::GetChunk {
+                content_id: [99u8; 32],
+                chunk_index: 0,
+            }),
+        )
+        .expect("encode request")
+    };
+
+    // First two should pass (may return chunk-not-found, but NOT rate limited).
+    let r1 = handle
+        .handle_incoming_envelope(make_req(), Some(&remote))
+        .await
+        .expect("first response");
+    // Response is an error (chunk not found) but NOT a rate limit error.
+    let msg1 = String::from_utf8_lossy(&r1.payload);
+    assert!(
+        !msg1.contains("rate limit"),
+        "first chunk request should not be rate-limited"
+    );
+
+    let r2 = handle
+        .handle_incoming_envelope(make_req(), Some(&remote))
+        .await
+        .expect("second response");
+    let msg2 = String::from_utf8_lossy(&r2.payload);
+    assert!(
+        !msg2.contains("rate limit"),
+        "second chunk request should not be rate-limited"
+    );
+
+    // Third request should be rate-limited.
+    let r3 = handle
+        .handle_incoming_envelope(make_req(), Some(&remote))
+        .await
+        .expect("third response");
+    assert_ne!(r3.flags & FLAG_ERROR, 0, "third should be an error");
+    let msg3 = String::from_utf8(r3.payload).expect("utf8");
+    assert!(
+        msg3.contains("chunk request rate limit"),
+        "expected chunk rate limit error, got: {msg3}"
+    );
+}
+
+#[tokio::test]
+async fn subscription_cap_is_enforced() {
+    let handle = Node::start(NodeConfig {
+        max_subscriptions: 2,
+        ..NodeConfig::default()
+    })
+    .await
+    .expect("start node");
+
+    let share_a = ShareId([1u8; 32]);
+    let share_b = ShareId([2u8; 32]);
+    let share_c = ShareId([3u8; 32]);
+
+    handle.subscribe(share_a).await.expect("first subscription ok");
+    handle.subscribe(share_b).await.expect("second subscription ok");
+
+    // Third subscription must be rejected.
+    let err = handle.subscribe(share_c).await.unwrap_err();
+    assert!(
+        err.to_string().contains("subscription limit"),
+        "expected subscription limit error, got: {err}"
+    );
+
+    // Re-subscribing an existing share must not be rejected.
+    handle
+        .subscribe(share_a)
+        .await
+        .expect("re-subscribe to existing share must succeed");
+}
+
+// ── AV-07: publisher key encryption at rest ───────────────────────────────
+
+#[tokio::test]
+async fn publisher_key_auto_protected_with_node_key() {
+    // Publisher secrets must be encrypted with the node key when
+    // `auto_protect_publisher_keys` is enabled (the default).
+    let store = MemoryStore::new();
+    let handle = Node::start_with_store(NodeConfig::default(), store.clone())
+        .await
+        .expect("start");
+
+    // Establish node identity first so the node_key is set.
+    handle.ensure_node_identity().await.expect("ensure_node_identity");
+
+    // Create publisher identity; auto-protect should run immediately.
+    let kp = handle
+        .ensure_publisher_identity("test-pub")
+        .await
+        .expect("ensure_publisher_identity");
+
+    // In-memory encrypted form must be present.
+    {
+        let state = handle.state.read().await;
+        assert!(
+            state
+                .node_key_encrypted_publisher_secrets
+                .contains_key("test-pub"),
+            "in-memory encrypted publisher secret must be present"
+        );
+    }
+
+    // Persisted state must omit plaintext and keep only the encrypted form.
+    let persisted = store.load_state().await.expect("load_state");
+    let pi = persisted
+        .publisher_identities
+        .iter()
+        .find(|i| i.label == "test-pub")
+        .expect("publisher identity in persisted state");
+    assert!(
+        pi.node_key_encrypted_share_secret.is_some(),
+        "node_key_encrypted_share_secret must be persisted"
+    );
+    assert!(
+        pi.share_secret.is_none(),
+        "plaintext share_secret must be absent when encrypted form is present"
+    );
+
+    // Round-trip: a second node loaded from the same store recovers the same keypair.
+    let handle2 = Node::start_with_store(NodeConfig::default(), store)
+        .await
+        .expect("start2");
+    handle2
+        .ensure_node_identity()
+        .await
+        .expect("ensure_node_identity2");
+    let kp2 = handle2
+        .ensure_publisher_identity("test-pub")
+        .await
+        .expect("ensure_publisher_identity2");
+    assert_eq!(
+        kp.verifying_key().to_bytes(),
+        kp2.verifying_key().to_bytes(),
+        "recovered publisher keypair must match original"
+    );
+}
+
+#[tokio::test]
+async fn auto_protect_publisher_identities_explicit_encrypts_existing_keys() {
+    // A plaintext identity created before the node key is established must
+    // be encrypted when `auto_protect_publisher_identities()` is called later.
+    let store = MemoryStore::new();
+    let handle = Node::start_with_store(NodeConfig::default(), store.clone())
+        .await
+        .expect("start");
+
+    // Create publisher identity BEFORE ensuring the node key.
+    let kp = handle
+        .ensure_publisher_identity("early-pub")
+        .await
+        .expect("ensure_publisher_identity");
+
+    // No encrypted form should exist yet.
+    {
+        let state = handle.state.read().await;
+        assert!(
+            !state
+                .node_key_encrypted_publisher_secrets
+                .contains_key("early-pub"),
+            "encrypted form must not exist before node key is established"
+        );
+    }
+
+    // Now establish the node key.
+    handle
+        .ensure_node_identity()
+        .await
+        .expect("ensure_node_identity");
+
+    // Explicitly request auto-protection of all existing identities.
+    handle
+        .auto_protect_publisher_identities()
+        .await
+        .expect("auto_protect");
+
+    // Encrypted form must now be present in memory.
+    {
+        let state = handle.state.read().await;
+        assert!(
+            state
+                .node_key_encrypted_publisher_secrets
+                .contains_key("early-pub"),
+            "encrypted form must be present after auto_protect_publisher_identities"
+        );
+    }
+
+    // Persisted form must have the encrypted variant and no plaintext.
+    let persisted = store.load_state().await.expect("load_state");
+    let pi = persisted
+        .publisher_identities
+        .iter()
+        .find(|i| i.label == "early-pub")
+        .expect("publisher identity in persisted state");
+    assert!(
+        pi.node_key_encrypted_share_secret.is_some(),
+        "encrypted form must be persisted"
+    );
+    assert!(
+        pi.share_secret.is_none(),
+        "plaintext must be absent after explicit auto-protect"
+    );
+
+    // Round-trip: second node recovers the same keypair.
+    let handle2 = Node::start_with_store(NodeConfig::default(), store)
+        .await
+        .expect("start2");
+    handle2
+        .ensure_node_identity()
+        .await
+        .expect("ensure_node_identity2");
+    let kp2 = handle2
+        .ensure_publisher_identity("early-pub")
+        .await
+        .expect("ensure_publisher_identity2");
+    assert_eq!(kp.verifying_key().to_bytes(), kp2.verifying_key().to_bytes());
+}
+
+// ── AV-06: community strict mode ─────────────────────────────────────────
+
+#[tokio::test]
+async fn community_strict_mode_rejects_request_without_proof() {
+    // list_local_community_public_shares must reject requests that lack a
+    // membership proof when `community_strict_mode` is enabled.
+    let config = NodeConfig {
+        community_strict_mode: true,
+        ..NodeConfig::default()
+    };
+    let handle = Node::start(config).await.expect("start");
+
+    let mut rng = OsRng;
+    let community_key = SigningKey::generate(&mut rng);
+    let community_pubkey = community_key.verifying_key().to_bytes();
+    let community_id =
+        ShareId::from_pubkey(&VerifyingKey::from_bytes(&community_pubkey).expect("vk"));
+
+    // Server node joins the community so the early-return path is skipped.
+    handle
+        .join_community(community_id, community_pubkey)
+        .await
+        .expect("join_community");
+
+    // Request without any proof must be rejected.
+    let err = handle
+        .list_local_community_public_shares(community_id, community_pubkey, 10, None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("community strict mode"),
+        "expected 'community strict mode' rejection, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn community_strict_mode_allows_request_with_valid_proof() {
+    // list_local_community_public_shares must accept a request that carries a
+    // valid, unexpired membership proof when `community_strict_mode` is enabled.
+    let config = NodeConfig {
+        community_strict_mode: true,
+        ..NodeConfig::default()
+    };
+    let handle = Node::start(config).await.expect("start");
+
+    let mut rng = OsRng;
+    let community_key = SigningKey::generate(&mut rng);
+    let community_pubkey = community_key.verifying_key().to_bytes();
+    let community_id =
+        ShareId::from_pubkey(&VerifyingKey::from_bytes(&community_pubkey).expect("vk"));
+
+    // Server node is a member of the community.
+    handle
+        .join_community(community_id, community_pubkey)
+        .await
+        .expect("join_community");
+
+    // Create a requester identity and issue a valid membership token for it.
+    let requester_key = SigningKey::generate(&mut rng);
+    let requester_pubkey = requester_key.verifying_key().to_bytes();
+    let now = now_unix_secs().expect("now");
+    let token =
+        CommunityMembershipToken::issue(&community_key, requester_pubkey, now, now + 3600)
+            .expect("issue token");
+    let proof = crate::cbor::to_vec(&token).expect("cbor encode token");
+
+    // Request with a valid proof must succeed; the result is empty because
+    // no public shares have been published to this community yet.
+    let shares = handle
+        .list_local_community_public_shares(
+            community_id,
+            community_pubkey,
+            10,
+            Some(requester_pubkey),
+            Some(&proof),
+        )
+        .await
+        .expect("strict mode must accept valid membership proof");
+    assert_eq!(shares, vec![], "no public shares expected");
+}
+
+// ── Relay Discovery Tests (§4.9) ─────────────────────────────────────────────
+
+/// Build a valid signed RelayAnnouncement for testing.
+fn make_relay_announcement(
+    signing_key: &SigningKey,
+    relay_addr: PeerAddr,
+    ttl_secs: u64,
+    issued_at: u64,
+) -> crate::relay::RelayAnnouncement {
+    use crate::relay::{BandwidthClass, RelayAnnouncement, RelayCapacity};
+    RelayAnnouncement::new_signed(
+        signing_key,
+        vec![relay_addr],
+        Capabilities {
+            relay: true,
+            ..Capabilities::default()
+        },
+        RelayCapacity {
+            max_tunnels: 32,
+            bandwidth_class: BandwidthClass::Medium,
+            max_bytes_per_tunnel: None,
+        },
+        issued_at,
+        ttl_secs,
+    )
+    .expect("build relay announcement")
+}
+
+/// `RelayManager::ingest_announcement` stores a valid announcement and
+/// `known_announcements` returns it.
+#[tokio::test]
+async fn relay_manager_ingest_and_known_announcements() {
+    use crate::relay::RelayManager;
+
+    let mut rng = OsRng;
+    let key = SigningKey::generate(&mut rng);
+    let now: u64 = 1_700_000_000;
+    let addr = PeerAddr {
+        ip: "127.0.0.1".parse().unwrap(),
+        port: 9000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+    let ann = make_relay_announcement(&key, addr, 3600, now);
+
+    let mut mgr = RelayManager::default();
+    mgr.ingest_announcement(ann.clone(), now).expect("ingest");
+
+    let known = mgr.known_announcements();
+    assert_eq!(known.len(), 1);
+    assert_eq!(known[0].relay_pubkey, ann.relay_pubkey);
+}
+
+/// Ingesting the same relay twice keeps only the latest announcement.
+#[tokio::test]
+async fn relay_manager_ingest_deduplicates_by_pubkey() {
+    use crate::relay::RelayManager;
+
+    let mut rng = OsRng;
+    let key = SigningKey::generate(&mut rng);
+    let now: u64 = 1_700_000_000;
+    let make_addr = |port: u16| PeerAddr {
+        ip: "127.0.0.1".parse().unwrap(),
+        port,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+    let ann1 = make_relay_announcement(&key, make_addr(9000), 3600, now);
+    let ann2 = make_relay_announcement(&key, make_addr(9001), 3600, now + 60);
+
+    let mut mgr = RelayManager::default();
+    mgr.ingest_announcement(ann1, now).expect("ingest 1");
+    mgr.ingest_announcement(ann2.clone(), now).expect("ingest 2");
+
+    let known = mgr.known_announcements();
+    assert_eq!(known.len(), 1, "duplicate pubkey must be replaced, not appended");
+    assert_eq!(known[0].relay_addrs[0].port, ann2.relay_addrs[0].port);
+}
+
+/// Ingesting an already-expired announcement returns an error and nothing
+/// is added to the cache.
+#[tokio::test]
+async fn relay_manager_ingest_rejects_expired() {
+    use crate::relay::RelayManager;
+
+    let mut rng = OsRng;
+    let key = SigningKey::generate(&mut rng);
+    let issued_at: u64 = 1_700_000_000;
+    let addr = PeerAddr {
+        ip: "127.0.0.1".parse().unwrap(),
+        port: 9000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+    let ann = make_relay_announcement(&key, addr, 3600, issued_at);
+    let now_past = issued_at + 7200; // 2 hours later — expired
+
+    let mut mgr = RelayManager::default();
+    assert!(
+        mgr.ingest_announcement(ann, now_past).is_err(),
+        "expired announcement must be rejected"
+    );
+    assert!(mgr.known_announcements().is_empty());
+}
+
+/// Ingesting an announcement with a tampered signature returns an error.
+#[tokio::test]
+async fn relay_manager_ingest_rejects_invalid_signature() {
+    use crate::relay::RelayManager;
+
+    let mut rng = OsRng;
+    let key = SigningKey::generate(&mut rng);
+    let now: u64 = 1_700_000_000;
+    let addr = PeerAddr {
+        ip: "127.0.0.1".parse().unwrap(),
+        port: 9000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+    let mut ann = make_relay_announcement(&key, addr, 3600, now);
+    // Tamper the signature.
+    ann.signature[0] ^= 0xff;
+
+    let mut mgr = RelayManager::default();
+    assert!(
+        mgr.ingest_announcement(ann, now).is_err(),
+        "invalid signature must be rejected"
+    );
+    assert!(mgr.known_announcements().is_empty());
+}
+
+/// `prune_stale_announcements` removes expired entries.
+#[tokio::test]
+async fn relay_manager_prune_removes_stale() {
+    use crate::relay::RelayManager;
+
+    let mut rng = OsRng;
+    let key = SigningKey::generate(&mut rng);
+    let now: u64 = 1_700_000_000;
+    let addr = PeerAddr {
+        ip: "127.0.0.1".parse().unwrap(),
+        port: 9000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+    let ann = make_relay_announcement(&key, addr, 3600, now);
+
+    let mut mgr = RelayManager::default();
+    mgr.ingest_announcement(ann, now).expect("ingest");
+    assert_eq!(mgr.known_announcements().len(), 1);
+
+    // Advance time past expiry.
+    let future_now = now + 7200;
+    mgr.prune_stale_announcements(future_now);
+    assert!(
+        mgr.known_announcements().is_empty(),
+        "stale announcement should have been pruned"
+    );
+}
+
+/// `RelayListRequest` served via `handle_incoming_envelope` returns ingested
+/// announcements.
+#[tokio::test]
+async fn relay_list_request_served_by_node() {
+    use crate::relay::RelayCapacity;
+    use crate::wire::RelayListResponse;
+
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let mut rng = OsRng;
+    let relay_signing_key = SigningKey::generate(&mut rng);
+
+    // Build a relay address and publish the announcement so it's cached.
+    let relay_addr = PeerAddr {
+        ip: "10.0.0.1".parse().unwrap(),
+        port: 5000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(relay_signing_key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+    handle
+        .publish_relay_announcement(
+            &relay_signing_key,
+            vec![relay_addr],
+            RelayCapacity::default(),
+            3600,
+        )
+        .await
+        .expect("publish announcement");
+
+    // Verify it's cached.
+    {
+        let state = handle.state.read().await;
+        assert_eq!(state.relay.known_announcements().len(), 1);
+    }
+
+    // Send a RelayListRequest via handle_incoming_envelope.
+    let req = Envelope::from_typed(
+        42,
+        0,
+        &WirePayload::RelayListRequest(crate::wire::RelayListRequest { max_count: 10 }),
+    )
+    .expect("encode request");
+    let resp = handle
+        .handle_incoming_envelope(req, None)
+        .await
+        .expect("handle must return Some");
+
+    assert_eq!(resp.r#type, MsgType::RelayListResponse as u16);
+    let parsed: RelayListResponse =
+        crate::cbor::from_slice(&resp.payload).expect("parse response");
+    assert_eq!(parsed.announcements.len(), 1);
+    assert_eq!(
+        parsed.announcements[0].relay_pubkey,
+        relay_signing_key.verifying_key().to_bytes()
+    );
+}
+
+/// `publish_relay_announcement` self-ingests and returns correctly signed
+/// announcement.
+#[tokio::test]
+async fn node_publish_relay_announcement_self_ingest() {
+    use crate::relay::RelayCapacity;
+
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let mut rng = OsRng;
+    let relay_key = SigningKey::generate(&mut rng);
+    let self_addr = PeerAddr {
+        ip: "192.168.1.1".parse().unwrap(),
+        port: 7000,
+        transport: TransportProtocol::Quic,
+        pubkey_hint: Some(relay_key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+
+    let ann = handle
+        .publish_relay_announcement(&relay_key, vec![self_addr], RelayCapacity::default(), 3600)
+        .await
+        .expect("publish");
+
+    assert!(ann.capabilities.relay, "announcement must advertise relay capability");
+    ann.verify_signature().expect("announcement signature must be valid");
+
+    let known = {
+        let state = handle.state.read().await;
+        state.relay.known_announcements()
+    };
+    assert_eq!(known.len(), 1);
+    assert_eq!(known[0].relay_pubkey, ann.relay_pubkey);
+}
+
+/// `discover_relays_via_peers` ingests announcements fetched from mock peers.
+#[tokio::test]
+async fn node_discover_relays_via_peers_ingests_announcements() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let mut rng = OsRng;
+    let relay_key = SigningKey::generate(&mut rng);
+
+    // Pre-build an announcement that the mock peer will return.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let relay_addr = PeerAddr {
+        ip: "10.0.0.2".parse().unwrap(),
+        port: 6000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(relay_key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+    let ann = make_relay_announcement(&relay_key, relay_addr, 3600, now_secs);
+    let ann_clone = ann.clone();
+
+    // Register a mock peer that returns the announcement as a RelayListResponse.
+    let transport = MockDhtTransport::default();
+    let peer_addr = PeerAddr {
+        ip: "127.0.0.1".parse().unwrap(),
+        port: 9999,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+    transport
+        .register(&peer_addr, move |req| {
+            if req.r#type == MsgType::RelayListRequest as u16 {
+                Envelope::from_typed(
+                    req.req_id,
+                    FLAG_RESPONSE,
+                    &WirePayload::RelayListResponse(crate::wire::RelayListResponse {
+                        announcements: vec![ann_clone.clone()],
+                    }),
+                )
+            } else {
+                anyhow::bail!("unexpected msg type")
+            }
+        })
+        .await;
+
+    let ingested = handle
+        .discover_relays_via_peers(&transport, &[peer_addr], 10)
+        .await
+        .expect("discover");
+
+    assert_eq!(ingested, 1, "should ingest exactly one relay announcement");
+
+    let known = {
+        let state = handle.state.read().await;
+        state.relay.known_announcements()
+    };
+    assert_eq!(known.len(), 1);
+    assert_eq!(known[0].relay_pubkey, ann.relay_pubkey);
+}
+
+/// Relay announcement values are accepted by the DHT keyspace validator
+/// when stored at a valid rendezvous key.
+#[tokio::test]
+async fn dht_validator_accepts_relay_announcement_at_rendezvous_key() {
+    use crate::relay::{current_rendezvous_bucket, relay_rendezvous_index, relay_rendezvous_key};
+
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let mut rng = OsRng;
+    let key = SigningKey::generate(&mut rng);
+    let now: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let addr = PeerAddr {
+        ip: "10.0.0.1".parse().unwrap(),
+        port: 5000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+    let ann = make_relay_announcement(&key, addr, 3600, now);
+    let encoded = crate::cbor::to_vec(&ann).expect("encode");
+
+    // Compute the rendezvous key for slot 0.
+    let bucket = current_rendezvous_bucket(ann.issued_at);
+    let slot = relay_rendezvous_index(&ann.relay_pubkey, bucket, 0);
+    let rendezvous_key = relay_rendezvous_key(bucket, slot);
+
+    // dht_store calls validate_dht_value_for_known_keyspaces internally.
+    handle
+        .dht_store(WireStore {
+            key: rendezvous_key,
+            value: encoded,
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("valid relay announcement at correct rendezvous key must be accepted");
+}
+
+/// Relay announcement values are rejected when stored at a wrong (non-rendezvous) key.
+#[tokio::test]
+async fn dht_validator_rejects_relay_announcement_at_wrong_key() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let mut rng = OsRng;
+    let key = SigningKey::generate(&mut rng);
+    let now: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let addr = PeerAddr {
+        ip: "10.0.0.1".parse().unwrap(),
+        port: 5000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+    let ann = make_relay_announcement(&key, addr, 3600, now);
+    let encoded = crate::cbor::to_vec(&ann).expect("encode");
+
+    // Use a completely wrong key (all zeros — not a valid rendezvous key for this relay).
+    let wrong_key = [0u8; 32];
+    handle
+        .dht_store(WireStore {
+            key: wrong_key,
+            value: encoded,
+            ttl_secs: 3600,
+        })
+        .await
+        .expect_err("relay announcement at a non-rendezvous key must be rejected");
+}
+
+// ── §2.8 Stall protection ─────────────────────────────────────────────────
+
+#[test]
+fn fetch_policy_max_stall_rounds_defaults_to_60() {
+    let policy = FetchPolicy::default();
+    assert_eq!(policy.max_stall_rounds, 60);
+    assert!(
+        policy.initial_reputations.is_empty(),
+        "initial_reputations should default to empty"
+    );
+}
+
+#[test]
+fn fetch_policy_custom_max_stall_rounds() {
+    let policy = FetchPolicy {
+        max_stall_rounds: 10,
+        ..FetchPolicy::default()
+    };
+    assert_eq!(policy.max_stall_rounds, 10);
+}
+
+// ── §2.9 QUIC transport tuning ────────────────────────────────────────────
+
+#[test]
+fn quic_transport_constants_are_exported() {
+    use crate::transport_net::{
+        QUIC_INITIAL_RTT_MS, QUIC_KEEP_ALIVE_INTERVAL_MS, QUIC_MAX_IDLE_TIMEOUT_MS,
+    };
+    assert_eq!(QUIC_KEEP_ALIVE_INTERVAL_MS, 10_000);
+    assert_eq!(QUIC_MAX_IDLE_TIMEOUT_MS, 30_000);
+    assert_eq!(QUIC_INITIAL_RTT_MS, 100);
+    // Idle timeout must be greater than keep-alive interval.
+    assert!(
+        (QUIC_MAX_IDLE_TIMEOUT_MS as u64) > (QUIC_KEEP_ALIVE_INTERVAL_MS as u64),
+        "idle timeout must exceed keep-alive interval"
+    );
+}
+
+// ── §2.7 Adaptive DHT replication ─────────────────────────────────────────
+
+#[tokio::test]
+async fn dht_access_count_increments_on_local_lookup() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let key = [55u8; 32];
+    // Store directly into the DHT state to bypass keyspace validation.
+    {
+        let mut state = handle.state.write().await;
+        let now = now_unix_secs().expect("time");
+        state.dht.store(key, vec![1, 2, 3], 3600, now).expect("store");
+    }
+
+    // First lookup via the state directly — access_count should become 1.
+    let found = {
+        let mut state = handle.state.write().await;
+        let now = now_unix_secs().expect("time");
+        state.dht.find_value(key, now)
+    };
+    assert!(found.is_some(), "value should be found");
+    assert_eq!(found.unwrap().access_count, 1, "first lookup → count=1");
+
+    // Second lookup should give count=2.
+    let found2 = {
+        let mut state = handle.state.write().await;
+        let now = now_unix_secs().expect("time");
+        state.dht.find_value(key, now)
+    };
+    assert_eq!(found2.unwrap().access_count, 2);
+}
+
+// ── §4.8 Peer Reputation ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn peer_reputation_note_outcome_persists() {
+    use crate::peer::TransportProtocol;
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let peer = PeerAddr {
+        ip: "10.0.0.1".parse().unwrap(),
+        port: 7000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+
+    // Register the peer first so there's an entry to update.
+    handle
+        .record_peer_seen(peer.clone())
+        .await
+        .expect("record peer");
+
+    // Note two successes and one failure: net = +1 -2 +1 = 0.
+    handle.note_peer_outcome(&peer, true).await.expect("success 1");
+    handle.note_peer_outcome(&peer, true).await.expect("success 2");
+    handle.note_peer_outcome(&peer, false).await.expect("failure");
+
+    let records = handle.peer_records().await;
+    let rec = records
+        .iter()
+        .find(|r| r.addr.port == 7000)
+        .expect("peer should be in db");
+    assert_eq!(rec.reputation_score, 0, "net score after +1 +1 -2 should be 0");
+}
+
+#[tokio::test]
+async fn peer_reputation_initial_reputations_seeded_in_policy() {
+    use crate::peer::TransportProtocol;
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let peer = PeerAddr {
+        ip: "10.0.0.2".parse().unwrap(),
+        port: 7001,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+    handle.record_peer_seen(peer.clone()).await.expect("record");
+    handle.note_peer_outcome(&peer, true).await.expect("success");
+    handle.note_peer_outcome(&peer, true).await.expect("success 2");
+
+    // reputation_for_peers should return a map with score=2 for this peer.
+    let map = {
+        let state = handle.state.read().await;
+        state.peer_db.reputation_for_peers(std::slice::from_ref(&peer))
+    };
+    assert_eq!(map.len(), 1);
+    let key = format!("10.0.0.2:7001:{:?}", TransportProtocol::Tcp);
+    assert_eq!(map[&key], 2, "reputation should be 2 after two successes");
 }

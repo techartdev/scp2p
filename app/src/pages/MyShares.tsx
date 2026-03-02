@@ -18,6 +18,7 @@ import {
   Link,
   Share2,
   Upload,
+  RotateCw,
 } from "lucide-react";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
 import { Card } from "@/components/ui/Card";
@@ -32,7 +33,7 @@ import { PageHeader, PageContent } from "@/components/layout/Layout";
 import { NodeRequiredOverlay } from "@/components/NodeRequiredOverlay";
 import { encodeShareLink } from "@/lib/shareLink";
 import * as cmd from "@/lib/commands";
-import type { OwnedShareView, PublishVisibility, RuntimeStatus, PageId } from "@/lib/types";
+import type { OwnedShareView, PublishVisibility, CommunityView, RuntimeStatus, PageId } from "@/lib/types";
 
 type PublishMode = "files" | "folder";
 
@@ -53,6 +54,8 @@ export function MyShares({ status, onNavigate }: MySharesProps) {
 
   // Detail / keys modal
   const [detailShare, setDetailShare] = useState<OwnedShareView | null>(null);
+  // Exported secret (loaded on demand via export_share_secret)
+  const [exportedSecret, setExportedSecret] = useState<string | null>(null);
 
   // Delete confirmation
   const [deleteTarget, setDeleteTarget] = useState<OwnedShareView | null>(
@@ -65,6 +68,9 @@ export function MyShares({ status, onNavigate }: MySharesProps) {
 
   // Publish modal
   const [showPublish, setShowPublish] = useState(false);
+
+  // Republish modal (update existing share content)
+  const [republishTarget, setRepublishTarget] = useState<OwnedShareView | null>(null);
 
   // Link copied toast
   const [linkCopied, setLinkCopied] = useState<string | null>(null);
@@ -94,6 +100,7 @@ export function MyShares({ status, onNavigate }: MySharesProps) {
       setDeleteTarget(null);
       if (detailShare?.share_id_hex === deleteTarget.share_id_hex) {
         setDetailShare(null);
+        setExportedSecret(null);
       }
     } catch (e) {
       setError(String(e));
@@ -123,11 +130,26 @@ export function MyShares({ status, onNavigate }: MySharesProps) {
     setToggling(null);
   };
 
+  const handleExportSecret = async () => {
+    if (!detailShare) return;
+    try {
+      const secret = await cmd.exportShareSecret(detailShare.share_id_hex);
+      setExportedSecret(secret);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const handleCopyLink = async (share: OwnedShareView) => {
     try {
+      // Include bootstrap hints: the node's own bind address + configured bootstrap peers
+      const hints: string[] = [];
+      if (status?.bind_tcp) hints.push(status.bind_tcp);
+      if (status?.bootstrap_peers) hints.push(...status.bootstrap_peers);
       const link = encodeShareLink(
         share.share_id_hex,
-        share.share_pubkey_hex
+        share.share_pubkey_hex,
+        hints.length > 0 ? hints : undefined
       );
       await navigator.clipboard.writeText(link);
       setLinkCopied(share.share_id_hex);
@@ -139,6 +161,7 @@ export function MyShares({ status, onNavigate }: MySharesProps) {
 
   const handlePublished = () => {
     setShowPublish(false);
+    setRepublishTarget(null);
     loadShares();
   };
 
@@ -256,8 +279,16 @@ export function MyShares({ status, onNavigate }: MySharesProps) {
                   <Button
                     variant="ghost"
                     size="sm"
+                    icon={<RotateCw className="h-3.5 w-3.5" />}
+                    onClick={() => setRepublishTarget(share)}
+                  >
+                    Update
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
                     icon={<Key className="h-3.5 w-3.5" />}
-                    onClick={() => setDetailShare(share)}
+                    onClick={() => { setExportedSecret(null); setDetailShare(share); }}
                   >
                     Keys
                   </Button>
@@ -294,13 +325,13 @@ export function MyShares({ status, onNavigate }: MySharesProps) {
       {/* ── Detail / keys modal ──────────────────────────────────────── */}
       <Modal
         open={detailShare !== null}
-        onClose={() => setDetailShare(null)}
+        onClose={() => { setExportedSecret(null); setDetailShare(null); }}
         title="Share Keys & Details"
         footer={
           <Button
             variant="ghost"
             size="sm"
-            onClick={() => setDetailShare(null)}
+            onClick={() => { setExportedSecret(null); setDetailShare(null); }}
           >
             Close
           </Button>
@@ -332,12 +363,19 @@ export function MyShares({ status, onNavigate }: MySharesProps) {
               </h4>
               <p className="text-xs text-text-muted">
                 Send this link to anyone — they can paste it to subscribe.
+                Bootstrap peer hints are included automatically.
               </p>
               <CopyField
                 label="Link"
                 value={encodeShareLink(
                   detailShare.share_id_hex,
-                  detailShare.share_pubkey_hex
+                  detailShare.share_pubkey_hex,
+                  (() => {
+                    const hints: string[] = [];
+                    if (status?.bind_tcp) hints.push(status.bind_tcp);
+                    if (status?.bootstrap_peers) hints.push(...status.bootstrap_peers);
+                    return hints.length > 0 ? hints : undefined;
+                  })()
                 )}
               />
             </div>
@@ -353,11 +391,22 @@ export function MyShares({ status, onNavigate }: MySharesProps) {
                 label="Public Key"
                 value={detailShare.share_pubkey_hex}
               />
-              <CopyField
-                label="Secret Key"
-                value={detailShare.share_secret_hex}
-                sensitive
-              />
+              {exportedSecret ? (
+                <CopyField
+                  label="Secret Key"
+                  value={exportedSecret}
+                  sensitive
+                />
+              ) : (
+                <button
+                  onClick={handleExportSecret}
+                  className="flex items-center gap-1.5 text-xs text-amber-400 hover:text-amber-300 transition-colors"
+                  title="Reveal the signing key for this share"
+                >
+                  <Key className="h-3.5 w-3.5" />
+                  Export Secret Key…
+                </button>
+              )}
             </div>
 
             {/* Metadata */}
@@ -450,6 +499,15 @@ export function MyShares({ status, onNavigate }: MySharesProps) {
           onPublished={handlePublished}
         />
       )}
+
+      {/* ── Republish / Update modal ─────────────────────────────────── */}
+      {republishTarget && (
+        <RepublishModal
+          share={republishTarget}
+          onClose={() => setRepublishTarget(null)}
+          onPublished={handlePublished}
+        />
+      )}
     </PageContent>
     </NodeRequiredOverlay>
   );
@@ -469,7 +527,8 @@ function PublishModal({
   const [mode, setMode] = useState<PublishMode>("files");
   const [title, setTitle] = useState("");
   const [visibility, setVisibility] = useState<PublishVisibility>("private");
-  const [communityIds, setCommunityIds] = useState("");
+  const [selectedCommunities, setSelectedCommunities] = useState<Set<string>>(new Set());
+  const [communities, setCommunities] = useState<CommunityView[]>([]);
   const [publishing, setPublishing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -479,10 +538,12 @@ function PublishModal({
   // Folder mode
   const [folderPath, setFolderPath] = useState("");
 
-  const communityIdsArray = communityIds
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  // Load joined communities for the picker
+  useEffect(() => {
+    cmd.listCommunities().then(setCommunities).catch(() => {});
+  }, []);
+
+  const communityIdsArray = [...selectedCommunities];
 
   const canPublish = () => {
     if (!title.trim()) return false;
@@ -635,14 +696,40 @@ function PublishModal({
         />
 
         {/* Community binding */}
-        <Input
-          label="Community IDs (optional)"
-          placeholder="Comma-separated community share IDs..."
-          value={communityIds}
-          onChange={(e) => setCommunityIds(e.target.value)}
-          hint="Bind this share to specific communities"
-          className="font-mono text-xs"
-        />
+        {communities.length > 0 ? (
+          <div>
+            <label className="text-xs font-medium text-text-secondary mb-2 block">
+              Communities (optional)
+            </label>
+            <div className="space-y-1.5 max-h-32 overflow-y-auto">
+              {communities.map((c) => (
+                <label
+                  key={c.share_id_hex}
+                  className="flex items-center gap-2 cursor-pointer text-xs text-text-primary hover:bg-surface-hover/40 px-2 py-1 rounded-lg transition-colors"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedCommunities.has(c.share_id_hex)}
+                    onChange={() => {
+                      setSelectedCommunities((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(c.share_id_hex)) next.delete(c.share_id_hex);
+                        else next.add(c.share_id_hex);
+                        return next;
+                      });
+                    }}
+                    className="rounded border-border text-accent focus:ring-accent"
+                  />
+                  <span className="font-mono truncate">{c.share_id_hex.slice(0, 16)}…</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <p className="text-xs text-text-muted">
+            No communities joined — join one in the Communities page to bind shares.
+          </p>
+        )}
 
         {/* File picker */}
         {mode === "files" && (
@@ -805,5 +892,279 @@ function CopyField({
         </button>
       </div>
     </div>
+  );
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   Republish modal — Update content of an existing share
+   ════════════════════════════════════════════════════════════════════════ */
+
+function RepublishModal({
+  share,
+  onClose,
+  onPublished,
+}: {
+  share: OwnedShareView;
+  onClose: () => void;
+  onPublished: () => void;
+}) {
+  const [mode, setMode] = useState<PublishMode>("files");
+  const [title, setTitle] = useState(share.title ?? "");
+  const [publishing, setPublishing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Files mode
+  const [filePaths, setFilePaths] = useState<string[]>([]);
+
+  // Folder mode
+  const [folderPath, setFolderPath] = useState("");
+
+  const canPublish = () => {
+    if (!title.trim()) return false;
+    if (mode === "files") return filePaths.length > 0;
+    return folderPath.trim() !== "";
+  };
+
+  const handleRepublish = async () => {
+    if (!canPublish()) return;
+    setPublishing(true);
+    setError(null);
+    try {
+      if (mode === "files") {
+        await cmd.publishFiles(
+          filePaths,
+          title.trim(),
+          share.visibility,
+          share.community_ids_hex
+        );
+      } else {
+        await cmd.publishFolder(
+          folderPath.trim(),
+          title.trim(),
+          share.visibility,
+          share.community_ids_hex
+        );
+      }
+      onPublished();
+    } catch (e) {
+      setError(String(e));
+    }
+    setPublishing(false);
+  };
+
+  const handlePickFiles = async () => {
+    try {
+      const selected = await dialogOpen({
+        multiple: true,
+        title: "Select new files for this share",
+      });
+      if (selected) {
+        const paths: string[] = Array.isArray(selected)
+          ? selected
+          : [selected];
+        setFilePaths((prev) => [...new Set([...prev, ...paths])]);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const handlePickFolder = async () => {
+    try {
+      const selected = await dialogOpen({
+        directory: true,
+        title: "Select new folder for this share",
+      });
+      if (selected) {
+        setFolderPath(typeof selected === "string" ? selected : String(selected));
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Update Share Content"
+      footer={
+        <>
+          <Button variant="ghost" size="sm" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={handleRepublish}
+            loading={publishing}
+            disabled={!canPublish()}
+            icon={<RotateCw className="h-3.5 w-3.5" />}
+          >
+            Republish
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-5">
+        {error && (
+          <div className="px-3 py-2 rounded-xl bg-danger/10 border border-danger/30">
+            <p className="text-xs text-danger">{error}</p>
+          </div>
+        )}
+
+        {/* Current share info */}
+        <div className="px-3 py-2 rounded-xl bg-surface border border-border-subtle">
+          <div className="flex items-center gap-2 mb-1">
+            <Package className="h-3.5 w-3.5 text-accent shrink-0" />
+            <span className="text-xs font-medium text-text-primary">
+              {share.title ?? "Untitled Share"}
+            </span>
+            <Badge variant="default" size="sm">
+              Seq #{share.latest_seq}
+            </Badge>
+          </div>
+          <p className="text-[10px] text-text-muted">
+            Publishing will create revision #{share.latest_seq + 1} with the
+            new files below. Existing subscribers will receive the update
+            automatically.
+          </p>
+        </div>
+
+        {/* Mode toggle */}
+        <div className="flex items-center gap-1 p-1 bg-surface-deep rounded-xl w-fit border border-border">
+          {(
+            [
+              {
+                id: "files" as PublishMode,
+                label: "Files",
+                icon: <Files className="h-3.5 w-3.5" />,
+              },
+              {
+                id: "folder" as PublishMode,
+                label: "Folder",
+                icon: <FolderOpen className="h-3.5 w-3.5" />,
+              },
+            ] as const
+          ).map((opt) => (
+            <button
+              key={opt.id}
+              onClick={() => setMode(opt.id)}
+              className={`
+                flex items-center gap-2 px-4 py-1.5 rounded-lg text-xs font-medium
+                transition-all duration-150
+                ${
+                  mode === opt.id
+                    ? "bg-accent/15 text-accent shadow-sm"
+                    : "text-text-muted hover:text-text-primary hover:bg-surface-raised"
+                }
+              `}
+            >
+              {opt.icon}
+              {opt.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Title */}
+        <Input
+          label="Title"
+          placeholder="Share title..."
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+        />
+
+        {/* File picker */}
+        {mode === "files" && (
+          <div className="space-y-3">
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<Plus className="h-3.5 w-3.5" />}
+              onClick={handlePickFiles}
+            >
+              Add Files
+            </Button>
+
+            {filePaths.length > 0 ? (
+              <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                {filePaths.map((fp, i) => (
+                  <div
+                    key={fp}
+                    className="flex items-center gap-3 px-3 py-1.5 bg-surface rounded-xl border border-border-subtle group"
+                  >
+                    <File className="h-3.5 w-3.5 text-text-muted shrink-0" />
+                    <span
+                      className="text-xs text-text-secondary truncate flex-1 font-mono"
+                      title={fp}
+                    >
+                      {fileBaseName(fp)}
+                    </span>
+                    <button
+                      onClick={() =>
+                        setFilePaths((prev) =>
+                          prev.filter((_, j) => j !== i)
+                        )
+                      }
+                      className="opacity-0 group-hover:opacity-100 p-0.5 rounded text-text-muted hover:text-danger transition-all"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-text-muted py-2">
+                No files selected yet.
+              </p>
+            )}
+            <p className="text-xs text-text-muted">
+              {filePaths.length} file{filePaths.length !== 1 ? "s" : ""}{" "}
+              selected
+            </p>
+          </div>
+        )}
+
+        {/* Folder picker */}
+        {mode === "folder" && (
+          <div className="space-y-3">
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<FolderOpen className="h-3.5 w-3.5" />}
+              onClick={handlePickFolder}
+            >
+              Browse Folder
+            </Button>
+
+            {folderPath ? (
+              <div className="flex items-center gap-3 px-3 py-2 bg-surface rounded-xl border border-accent/30">
+                <FolderOpen className="h-4 w-4 text-accent shrink-0" />
+                <span
+                  className="text-xs text-text-primary truncate flex-1 font-mono"
+                  title={folderPath}
+                >
+                  {folderPath}
+                </span>
+                <button
+                  onClick={() => setFolderPath("")}
+                  className="p-0.5 rounded text-text-muted hover:text-danger transition-all"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            ) : (
+              <p className="text-xs text-text-muted py-2">
+                No folder selected yet.
+              </p>
+            )}
+            <p className="text-[10px] text-text-muted leading-relaxed">
+              All files and subdirectories will replace the current share
+              content.
+            </p>
+          </div>
+        )}
+      </div>
+    </Modal>
   );
 }

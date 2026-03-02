@@ -47,6 +47,12 @@ pub struct PersistedState {
     pub share_weights: HashMap<[u8; 32], f32>,
     pub search_index: Option<SearchIndexSnapshot>,
     pub partial_downloads: HashMap<[u8; 32], PersistedPartialDownload>,
+    /// Plaintext Ed25519 node identity key.  When no passphrase
+    /// encryption is active, this is the primary storage.  When
+    /// encrypted, `encrypted_node_key` holds the ciphertext and this
+    /// field is `None`.
+    #[serde(default)]
+    pub node_key: Option<[u8; 32]>,
     pub encrypted_node_key: Option<EncryptedSecret>,
     #[serde(default)]
     pub enabled_blocklist_shares: Vec<[u8; 32]>,
@@ -57,6 +63,14 @@ pub struct PersistedState {
     /// file (publisher) or the downloaded file (subscriber).
     #[serde(default)]
     pub content_paths: HashMap<[u8; 32], PathBuf>,
+    /// TOFU-pinned public keys for bootstrap peers.
+    ///
+    /// Key is the peer address string (e.g. "tcp://1.2.3.4:7001"),
+    /// value is the first-observed Ed25519 public key.  Once pinned,
+    /// subsequent connections to the same address that present a
+    /// different key are rejected.
+    #[serde(default)]
+    pub pinned_bootstrap_keys: HashMap<String, [u8; 32]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +105,15 @@ pub struct PersistedPublisherIdentity {
     /// locked with a passphrase via [`encrypt_publisher_identities`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_share_secret: Option<EncryptedSecret>,
+    /// Encrypted secret protected with the node's stable identity key.
+    ///
+    /// Used by the auto-protect-at-rest feature (AV-07): when
+    /// `NodeConfig::auto_protect_publisher_keys` is true and the node key
+    /// is available, publisher secrets are encrypted with a fast blake3-derived
+    /// key instead of storing them in plaintext.  At startup, if the node key
+    /// is present in persisted state, these are automatically decrypted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_key_encrypted_share_secret: Option<EncryptedSecret>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,7 +143,6 @@ pub struct DirtyFlags {
     pub manifests: bool,
     pub share_heads: bool,
     pub share_weights: bool,
-    pub search_index: bool,
     pub partial_downloads: bool,
     pub node_key: bool,
     pub blocklist: bool,
@@ -138,7 +160,6 @@ impl DirtyFlags {
             manifests: true,
             share_heads: true,
             share_weights: true,
-            search_index: true,
             partial_downloads: true,
             node_key: true,
             blocklist: true,
@@ -155,7 +176,6 @@ impl DirtyFlags {
             || self.manifests
             || self.share_heads
             || self.share_weights
-            || self.search_index
             || self.partial_downloads
             || self.node_key
             || self.blocklist
@@ -182,6 +202,26 @@ pub trait Store: Send + Sync {
         } else {
             Ok(())
         }
+    }
+
+    /// Write-through: UPSERT all items from `manifest` into the persistent
+    /// full-text search index immediately, outside any state lock.  This
+    /// eliminates the need for the O(N) snapshot+clear+repopulate on every
+    /// `persist_state` call.
+    ///
+    /// The default implementation is a no-op so `MemoryStore` (used in tests)
+    /// does not need an FTS5 implementation; the in-process `SearchIndex`
+    /// handles in-memory queries for tests.
+    async fn index_manifest_for_search(&self, _manifest: &ManifestV1) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Remove all search-index entries for `share_id` from the persistent
+    /// store.  Called on unsubscribe and share deletion.
+    ///
+    /// Default is a no-op.
+    async fn remove_share_from_search(&self, _share_id: [u8; 32]) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -343,6 +383,65 @@ impl Store for SqliteStore {
         })
         .await?
     }
+
+    async fn index_manifest_for_search(&self, manifest: &ManifestV1) -> anyhow::Result<()> {
+        let path = self.path.clone();
+        let share_id_hex = hex::encode(manifest.share_id);
+        let items: Vec<(String, String, String, String, String)> = manifest
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    hex::encode(item.content_id),
+                    item.name.clone(),
+                    item.tags.join("\t"),
+                    manifest.title.as_deref().unwrap_or("").to_owned(),
+                    manifest.description.as_deref().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = Connection::open(&path)?;
+            let tx = conn.transaction()?;
+            // Delete stale entries for this share, then insert current items.
+            tx.execute(
+                "DELETE FROM search_fts WHERE share_id = ?1",
+                params![share_id_hex],
+            )?;
+            let mut stmt = tx.prepare(
+                "INSERT INTO search_fts(share_id, content_id, name, tags, title, description) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for (content_id_hex, name, tags, title, description) in &items {
+                stmt.execute(params![
+                    share_id_hex,
+                    content_id_hex,
+                    name,
+                    tags,
+                    title,
+                    description
+                ])?;
+            }
+            drop(stmt);
+            tx.commit()?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+    }
+
+    async fn remove_share_from_search(&self, share_id: [u8; 32]) -> anyhow::Result<()> {
+        let path = self.path.clone();
+        let share_id_hex = hex::encode(share_id);
+        tokio::task::spawn_blocking(move || {
+            let conn = Connection::open(&path)?;
+            conn.execute(
+                "DELETE FROM search_fts WHERE share_id = ?1",
+                params![share_id_hex],
+            )?;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await?
+    }
 }
 
 /// All SQLite reads happen here, on a blocking thread.
@@ -492,12 +591,15 @@ fn load_state_sync(conn: &Connection) -> anyhow::Result<PersistedState> {
     }
 
     state.share_heads = load_metadata_cbor(conn, "share_heads")?.unwrap_or_default();
+    state.node_key = load_metadata_cbor(conn, "node_key")?;
     state.encrypted_node_key = load_metadata_cbor(conn, "encrypted_node_key")?;
     state.enabled_blocklist_shares =
         load_metadata_cbor(conn, "enabled_blocklist_shares")?.unwrap_or_default();
     state.blocklist_rules_by_share =
         load_metadata_cbor(conn, "blocklist_rules_by_share")?.unwrap_or_default();
     state.content_paths = load_metadata_cbor(conn, "content_paths")?.unwrap_or_default();
+    state.pinned_bootstrap_keys =
+        load_metadata_cbor(conn, "pinned_bootstrap_keys")?.unwrap_or_default();
 
     Ok(state)
 }
@@ -545,6 +647,7 @@ fn save_state_sync(
             live_peer_keys.insert(addr_key);
         }
         delete_stale_text_keys(&tx, "peers", "addr_key", &live_peer_keys)?;
+        upsert_metadata_cbor(&tx, "pinned_bootstrap_keys", &state.pinned_bootstrap_keys)?;
     }
 
     // --- subscriptions: UPSERT + prune stale ---
@@ -623,29 +726,13 @@ fn save_state_sync(
     }
 
     // --- remaining metadata ---
-    if dirty.search_index {
-        // FTS5-backed search index: clear and repopulate.
-        tx.execute("DELETE FROM search_fts", [])?;
-        if let Some(ref snapshot) = state.search_index {
-            let mut insert_stmt = tx.prepare(
-                "INSERT INTO search_fts(share_id, content_id, name, tags, title, description) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
-            )?;
-            for item in snapshot.items() {
-                insert_stmt.execute(params![
-                    hex::encode(item.share_id),
-                    hex::encode(item.content_id),
-                    &item.name,
-                    item.tags.join("\t"),
-                    item.title.as_deref().unwrap_or(""),
-                    item.description.as_deref().unwrap_or(""),
-                ])?;
-            }
-        }
-    }
+    // Note: search_index is maintained write-through via Store::index_manifest_for_search /
+    // remove_share_from_search; it no longer needs a bulk clear-and-repopulate here.
     if dirty.share_heads {
         upsert_metadata_cbor(&tx, "share_heads", &state.share_heads)?;
     }
     if dirty.node_key {
+        upsert_metadata_cbor_opt(&tx, "node_key", &state.node_key)?;
         upsert_metadata_cbor_opt(&tx, "encrypted_node_key", &state.encrypted_node_key)?;
     }
     if dirty.blocklist {
@@ -806,6 +893,7 @@ pub fn peer_record(addr: PeerAddr, last_seen_unix: u64) -> PeerRecord {
         last_seen_unix,
         capabilities: None,
         capabilities_seen_at: None,
+        reputation_score: 0,
     }
 }
 
@@ -851,6 +939,36 @@ pub fn decrypt_secret(secret: &EncryptedSecret, passphrase: &str) -> anyhow::Res
         )
         .map_err(|_| anyhow::anyhow!("failed to decrypt secret"))?;
     Ok(plaintext)
+}
+
+/// Encrypt `secret` using a key derived from `node_key` via blake3.
+///
+/// Unlike [`encrypt_secret`] this does **not** run PBKDF2 iterations
+/// because `node_key` is already a 32-byte random value.  Domain
+/// separation is provided by blake3's `derive_key` with a fixed context.
+/// Used by the publisher-key auto-protect-at-rest feature.
+pub fn encrypt_secret_with_key(secret: &[u8], node_key: &[u8; 32]) -> anyhow::Result<EncryptedSecret> {
+    let derived = blake3::derive_key("scp2p publisher-identity v1", node_key);
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
+    let mut nonce = [0u8; 24];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let ciphertext = cipher
+        .encrypt(XNonce::from_slice(&nonce), secret)
+        .map_err(|_| anyhow::anyhow!("failed to encrypt secret with key"))?;
+    Ok(EncryptedSecret {
+        salt: [0u8; 16], // unused for blake3 derivation; kept for struct compat
+        nonce,
+        ciphertext,
+    })
+}
+
+/// Decrypt a secret that was encrypted by [`encrypt_secret_with_key`].
+pub fn decrypt_secret_with_key(secret: &EncryptedSecret, node_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+    let derived = blake3::derive_key("scp2p publisher-identity v1", node_key);
+    let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
+    cipher
+        .decrypt(XNonce::from_slice(&secret.nonce), secret.ciphertext.as_ref())
+        .map_err(|_| anyhow::anyhow!("failed to decrypt secret with key"))
 }
 
 #[cfg(test)]
@@ -974,7 +1092,8 @@ mod tests {
 
     #[tokio::test]
     async fn sqlite_fts5_search_index_roundtrip() {
-        use crate::search::{IndexedItem, SearchIndex};
+        use crate::manifest::{ItemV1, ManifestV1, ShareVisibility};
+        use crate::search::SearchIndex;
 
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -986,33 +1105,53 @@ mod tests {
         ));
         let store = SqliteStore::open(&path).expect("open sqlite");
 
-        let mut initial = PersistedState::default();
+        // Index two items via the write-through path rather than the legacy
+        // save-snapshot path (which no longer writes to FTS5).
+        let share_id = [1u8; 32];
+        let manifest = ManifestV1 {
+            version: 1,
+            share_pubkey: [0u8; 32],
+            share_id,
+            seq: 1,
+            created_at: 1,
+            expires_at: None,
+            title: Some("Linux Downloads".into()),
+            description: Some("Open source Linux distributions".into()),
+            visibility: ShareVisibility::Public,
+            communities: vec![],
+            items: vec![
+                ItemV1 {
+                    content_id: [2u8; 32],
+                    size: 1_000,
+                    name: "Ubuntu ISO".into(),
+                    path: None,
+                    mime: None,
+                    tags: vec!["linux".into(), "ubuntu".into()],
+                    chunk_count: 0,
+                    chunk_list_hash: [0u8; 32],
+                },
+                ItemV1 {
+                    content_id: [3u8; 32],
+                    size: 2_000,
+                    name: "Fedora DVD".into(),
+                    path: None,
+                    mime: None,
+                    tags: vec!["linux".into(), "fedora".into()],
+                    chunk_count: 0,
+                    chunk_list_hash: [0u8; 32],
+                },
+            ],
+            recommended_shares: vec![],
+            signature: None,
+        };
 
-        // Build a search index with two items.
-        let items = vec![
-            IndexedItem {
-                share_id: [1u8; 32],
-                content_id: [2u8; 32],
-                name: "Ubuntu ISO".into(),
-                tags: vec!["linux".into(), "ubuntu".into()],
-                title: Some("Linux Downloads".into()),
-                description: Some("Latest Ubuntu release".into()),
-            },
-            IndexedItem {
-                share_id: [1u8; 32],
-                content_id: [3u8; 32],
-                name: "Fedora DVD".into(),
-                tags: vec!["linux".into(), "fedora".into()],
-                title: Some("Linux Downloads".into()),
-                description: None,
-            },
-        ];
-        let index = SearchIndex::from_items(items);
-        initial.search_index = Some(index.snapshot());
+        store
+            .index_manifest_for_search(&manifest)
+            .await
+            .expect("index_manifest_for_search");
 
-        store.save_state(&initial).await.expect("save");
+        // Load state and verify FTS5 items were persisted.
         let loaded = store.load_state().await.expect("load");
-
         let loaded_snapshot = loaded.search_index.expect("search_index should be Some");
         let loaded_items: Vec<_> = loaded_snapshot.items().collect();
         assert_eq!(loaded_items.len(), 2, "should load 2 FTS5 items");
@@ -1024,22 +1163,34 @@ mod tests {
             .expect("ubuntu item");
         assert_eq!(ubuntu.tags, vec!["linux", "ubuntu"]);
         assert_eq!(ubuntu.title.as_deref(), Some("Linux Downloads"));
-        assert_eq!(ubuntu.description.as_deref(), Some("Latest Ubuntu release"));
+        assert_eq!(ubuntu.description.as_deref(), Some("Open source Linux distributions"));
 
         let fedora = loaded_items
             .iter()
             .find(|i| i.name == "Fedora DVD")
             .expect("fedora item");
         assert_eq!(fedora.tags, vec!["linux", "fedora"]);
-        assert!(fedora.description.is_none());
+        // Manifest-level description is inherited by both items (FTS5 column).
+        assert!(fedora.description.is_some());
 
         // Rebuild the search index and verify search works.
         let reloaded_index = SearchIndex::from_snapshot(loaded_snapshot);
         let mut subs = std::collections::HashSet::new();
-        subs.insert([1u8; 32]);
+        subs.insert(share_id);
         let hits = reloaded_index.search("ubuntu", &subs, &std::collections::HashMap::new());
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].0.name, "Ubuntu ISO");
+
+        // Verify remove_share_from_search cleans up FTS5.
+        store
+            .remove_share_from_search(share_id)
+            .await
+            .expect("remove_share_from_search");
+        let after_remove = store.load_state().await.expect("load after remove");
+        assert!(
+            after_remove.search_index.is_none(),
+            "search_index should be None after removing the only share"
+        );
 
         let _ = std::fs::remove_file(path);
     }

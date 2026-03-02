@@ -6,10 +6,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //! Relay operations on `NodeHandle`: register, connect, stream, peer selection.
 
+use ed25519_dalek::SigningKey;
+
 use crate::{
-    net_fetch::{PeerConnector, send_request_on_stream},
+    net_fetch::{PeerConnector, RequestTransport, send_request_on_stream},
     peer::PeerAddr,
-    relay::RelayLimits,
+    relay::{RelayAnnouncement, RelayCapacity, RelayLimits},
     wire::{
         Envelope, FLAG_RESPONSE, MsgType, RelayConnect, RelayPayloadKind as WireRelayPayloadKind,
         RelayRegister, RelayRegistered, RelayStream, WirePayload,
@@ -19,7 +21,8 @@ use crate::{
 use super::{
     AbuseLimits, ActiveRelaySlot, NodeHandle,
     helpers::{
-        now_unix_secs, relay_payload_kind_to_internal, relay_payload_kind_to_wire, relay_peer_key,
+        now_unix_secs, query_relay_list, relay_payload_kind_to_internal,
+        relay_payload_kind_to_wire, relay_peer_key,
     },
 };
 
@@ -138,13 +141,31 @@ impl NodeHandle {
         let now = now_unix_secs()?;
         let mut state = self.state.write().await;
 
-        // Prefer peers with known relay=true capability.
-        let relay_capable: Vec<PeerAddr> = state
+        // Prefer peers with known relay=true capability (PeerDb).
+        let mut relay_capable: Vec<PeerAddr> = state
             .peer_db
             .relay_capable_peers(now)
             .into_iter()
             .map(|record| record.addr.clone())
             .collect();
+
+        // Also add addresses from announcement cache (§4.9).
+        // Only use fresh announcements.
+        let announced_addrs: Vec<PeerAddr> = state
+            .relay
+            .known_announcements()
+            .into_iter()
+            .filter(|ann| ann.is_fresh(now))
+            .flat_map(|ann| ann.relay_addrs)
+            .collect();
+        // Merge announced addresses — de-dupe by relay_peer_key().
+        let existing_keys: std::collections::HashSet<String> =
+            relay_capable.iter().map(relay_peer_key).collect();
+        for addr in announced_addrs {
+            if !existing_keys.contains(&relay_peer_key(&addr)) {
+                relay_capable.push(addr);
+            }
+        }
 
         // Fall back to all fresh peers if no relay-capable ones are known.
         let mut candidates = if relay_capable.is_empty() {
@@ -195,6 +216,166 @@ impl NodeHandle {
             selected.push(source[(start + idx) % source.len()].clone());
         }
         Ok(selected)
+    }
+
+    // ── Relay Discovery: Relay-PEX client (§4.9) ────────────────────────
+
+    /// Ask a single peer for its cached relay announcements (Relay-PEX).
+    ///
+    /// Returns the raw announcement list as sent by the peer; callers
+    /// should pass results through `ingest_relay_announcements` for
+    /// validation and local caching.
+    pub async fn fetch_relay_list_from_peer<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        peer: &PeerAddr,
+        max_count: u16,
+    ) -> anyhow::Result<Vec<RelayAnnouncement>> {
+        query_relay_list(transport, peer, max_count).await
+    }
+
+    /// Validate and ingest a batch of relay announcements into the local cache.
+    ///
+    /// Each announcement is independently validated (structure + signature +
+    /// freshness).  Invalid or expired entries are silently skipped.
+    /// Returns the number of successfully ingested announcements.
+    pub async fn ingest_relay_announcements(
+        &self,
+        announcements: Vec<RelayAnnouncement>,
+    ) -> anyhow::Result<usize> {
+        let mut state = self.state.write().await;
+        let now = now_unix_secs()?;
+        let mut ingested = 0usize;
+        for ann in announcements {
+            if state.relay.ingest_announcement(ann, now).is_ok() {
+                ingested += 1;
+            }
+        }
+        Ok(ingested)
+    }
+
+    /// Discover relay nodes by querying a set of seed peers via Relay-PEX.
+    ///
+    /// Contacts up to `max_peers` seed peers, collects their relay lists,
+    /// and ingests all valid announcements into the local cache.
+    /// Returns the total number of newly ingested relay announcements.
+    pub async fn discover_relays_via_peers<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        seed_peers: &[PeerAddr],
+        max_per_peer: u16,
+    ) -> anyhow::Result<usize> {
+        let mut total = 0usize;
+        for peer in seed_peers {
+            if let Ok(announcements) =
+                self.fetch_relay_list_from_peer(transport, peer, max_per_peer).await
+            {
+                total += self.ingest_relay_announcements(announcements).await?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Build and sign a relay announcement for this node, then ingest it
+    /// into the local cache so it is returned by `RelayListRequest` handlers.
+    ///
+    /// Call this on startup and periodically when `capabilities.relay = true`.
+    pub async fn publish_relay_announcement(
+        &self,
+        signing_key: &SigningKey,
+        self_addrs: Vec<PeerAddr>,
+        capacity: RelayCapacity,
+        ttl_secs: u64,
+    ) -> anyhow::Result<RelayAnnouncement> {
+        use crate::capabilities::Capabilities;
+        let now = now_unix_secs()?;
+        let ann = RelayAnnouncement::new_signed(
+            signing_key,
+            self_addrs,
+            Capabilities {
+                relay: true,
+                ..Capabilities::default()
+            },
+            capacity,
+            now,
+            ttl_secs,
+        )?;
+        let mut state = self.state.write().await;
+        state.relay.ingest_announcement(ann.clone(), now)?;
+        Ok(ann)
+    }
+
+    /// Publish a relay announcement to the DHT rendezvous keys (§4.9).
+    ///
+    /// The relay's assigned two rendezvous slots are derived from its
+    /// pubkey and the current time bucket.  The announcement is encoded
+    /// as a DHT value and replicated to the `K` closest nodes for each
+    /// slot key.
+    ///
+    /// Returns the total number of successful DHT store operations.
+    pub async fn publish_relay_announcement_to_dht<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        ann: &RelayAnnouncement,
+        seed_peers: &[PeerAddr],
+    ) -> anyhow::Result<usize> {
+        use crate::relay::{current_rendezvous_bucket, relay_rendezvous_index, relay_rendezvous_key};
+        use crate::dht::{DEFAULT_TTL_SECS, K};
+        use super::helpers::replicate_store_to_closest;
+
+        let now = now_unix_secs()?;
+        let bucket_id = current_rendezvous_bucket(now);
+        let encoded = crate::cbor::to_vec(ann)?;
+        // TTL = remaining seconds until bucket rolls over.
+        let bucket_end =
+            (bucket_id + 1) * crate::relay::RELAY_RENDEZVOUS_BUCKET_SECS;
+        let ttl = bucket_end.saturating_sub(now).max(DEFAULT_TTL_SECS);
+
+        let mut total = 0usize;
+        for which in 0u8..2 {
+            let slot = relay_rendezvous_index(&ann.relay_pubkey, bucket_id, which);
+            let key = relay_rendezvous_key(bucket_id, slot);
+            total += replicate_store_to_closest(transport, self, key, encoded.clone(), ttl, seed_peers, K)
+                .await
+                .unwrap_or(0);
+        }
+        Ok(total)
+    }
+
+    /// Discover relay nodes by looking up all rendezvous slots in the DHT
+    /// for the current time bucket (§4.9).
+    ///
+    /// Iterates over all `RELAY_RENDEZVOUS_N` slots, performs an iterative
+    /// DHT find-value lookup for each, decodes any found values as
+    /// `RelayAnnouncement`, and ingests valid entries into the local cache.
+    ///
+    /// Returns the number of newly ingested announcements.
+    pub async fn discover_relays_from_dht<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        seed_peers: &[PeerAddr],
+    ) -> anyhow::Result<usize> {
+        use crate::relay::{
+            RelayAnnouncement as RA, current_rendezvous_bucket, relay_rendezvous_key,
+            RELAY_RENDEZVOUS_N,
+        };
+
+        let now = now_unix_secs()?;
+        let bucket_id = current_rendezvous_bucket(now);
+        let mut found_announcements = Vec::new();
+
+        for slot in 0..RELAY_RENDEZVOUS_N {
+            let key = relay_rendezvous_key(bucket_id, slot);
+            if let Ok(Some(dht_value)) = self
+                .dht_find_value_iterative(transport, key, seed_peers)
+                .await
+                && let Ok(ann) = crate::cbor::from_slice::<RA>(&dht_value.value)
+            {
+                found_announcements.push(ann);
+            }
+        }
+
+        self.ingest_relay_announcements(found_announcements).await
     }
 
     // ── Relay client methods (firewalled node side) ─────────────

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Compass,
   RefreshCw,
@@ -24,10 +24,8 @@ import {
   Package,
   Globe,
   Wifi,
-  GripHorizontal,
 } from "lucide-react";
 import { open as dialogOpen } from "@tauri-apps/plugin-dialog";
-import { listen } from "@tauri-apps/api/event";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
@@ -36,11 +34,9 @@ import { HashDisplay } from "@/components/ui/HashDisplay";
 import { EmptyState } from "@/components/ui/EmptyState";
 import { Modal } from "@/components/ui/Modal";
 import { NodeRequiredOverlay } from "@/components/NodeRequiredOverlay";
-import { DownloadQueue } from "@/components/DownloadQueue";
-import type { DownloadJob } from "@/components/DownloadQueue";
 import * as cmd from "@/lib/commands";
 import { decodeShareLink, isShareLink } from "@/lib/shareLink";
-import type { SubscriptionView, PublicShareView, ShareItemView, PeerView, RuntimeStatus, PageId } from "@/lib/types";
+import type { SubscriptionView, SubscriptionTrustLevel, PublicShareView, ShareItemView, PeerView, RuntimeStatus, PageId } from "@/lib/types";
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -149,7 +145,7 @@ interface ShareEntry {
   source: "subscription" | "public";
   source_peer?: string;
   latest_seq: number;
-  trust_level?: string;
+  trust_level?: SubscriptionTrustLevel;
 }
 
 function mergeEntries(
@@ -322,12 +318,15 @@ function TreeRow({
 
 /* ── Main component ──────────────────────────────────────────────────── */
 
+import type { DownloadQueueState } from "@/hooks/useDownloadQueue";
+
 interface DiscoverProps {
   status: RuntimeStatus | null;
   onNavigate: (page: PageId) => void;
+  downloadQueue: DownloadQueueState;
 }
 
-export function Discover({ status, onNavigate }: DiscoverProps) {
+export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
   // Left panel state
   const [subs, setSubs] = useState<SubscriptionView[]>([]);
   const [publicShares, setPublicShares] = useState<PublicShareView[]>([]);
@@ -336,6 +335,7 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [syncMessage, setSyncMessage] = useState<string | null>(null);
 
   // Subscribe by ID modal
   const [showSubscribe, setShowSubscribe] = useState(false);
@@ -348,18 +348,11 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
   const [browseLoading, setBrowseLoading] = useState(false);
   const [browseError, setBrowseError] = useState<string | null>(null);
 
-  // Selection & download queue
+  // Selection
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
     new Set()
   );
-  const [downloadJobs, setDownloadJobs] = useState<DownloadJob[]>([]);
-  const processingRef = useRef(false);
-
-  // Resizable download queue panel
-  const [queueHeight, setQueueHeight] = useState(180);
-  const resizingRef = useRef(false);
-  const containerRef = useRef<HTMLDivElement>(null);
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -409,8 +402,8 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
       } catch (e) {
         // Manifest not cached yet — sync from peers and retry once
         setBrowseError("Syncing manifest from peer…");
-        const updated = await cmd.syncNow();
-        setSubs(updated);
+        const syncResult = await cmd.syncNow();
+        setSubs(syncResult.subscriptions);
         result = await cmd.browseShareItems(entry.share_id_hex);
       }
 
@@ -442,9 +435,16 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
 
   const handleSync = async () => {
     setSyncing(true);
+    setSyncMessage(null);
     try {
       const result = await cmd.syncNow();
-      setSubs(result);
+      setSubs(result.subscriptions);
+      if (result.updated_count > 0) {
+        setSyncMessage(`${result.updated_count} subscription${result.updated_count !== 1 ? "s" : ""} updated`);
+      } else {
+        setSyncMessage("Already up to date");
+      }
+      setTimeout(() => setSyncMessage(null), 4000);
     } catch (e) {
       setError(String(e));
     }
@@ -465,7 +465,7 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
       setShowSubscribe(false);
       setSubscribeId("");
       // Kick off a sync immediately so the manifest is fetched from the peer
-      cmd.syncNow().then((updated) => setSubs(updated)).catch(() => {});
+      cmd.syncNow().then((r) => setSubs(r.subscriptions)).catch(() => {});
     } catch (e) {
       setError(String(e));
     }
@@ -480,6 +480,15 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
         setActiveShareId(null);
         setItems([]);
       }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const handleTrustLevelChange = async (shareIdHex: string, level: SubscriptionTrustLevel) => {
+    try {
+      const result = await cmd.setSubscriptionTrustLevel(shareIdHex, level);
+      setSubs(result);
     } catch (e) {
       setError(String(e));
     }
@@ -517,100 +526,13 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
     setSelected(new Set(items.map((i) => i.content_id_hex)));
   const selectNone = () => setSelected(new Set());
 
-  /* ── Download queue logic ──────────────────────────────────────────── */
+  /* ── Download ───────────────────────────────────────────────────────── */
 
-  // Listen to backend chunk-level progress events
-  useEffect(() => {
-    const unlisten = listen<{
-      completed_chunks: number;
-      total_chunks: number;
-      bytes_downloaded: number;
-    }>("download-progress", (event) => {
-      setDownloadJobs((prev) =>
-        prev.map((j) =>
-          j.status === "downloading"
-            ? {
-                ...j,
-                chunksCompleted: event.payload.completed_chunks,
-                chunksTotal: event.payload.total_chunks,
-                bytesDownloaded: event.payload.bytes_downloaded,
-              }
-            : j
-        )
-      );
-    });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, []);
-
-  const processQueue = useCallback(async (jobs: DownloadJob[]) => {
-    if (processingRef.current) return;
-    const next = jobs.find((j) => j.status === "queued");
-    if (!next) return;
-
-    processingRef.current = true;
-
-    // Mark job as downloading
-    setDownloadJobs((prev) =>
-      prev.map((j) =>
-        j.id === next.id
-          ? { ...j, status: "downloading" as const, startedAt: Date.now() }
-          : j
-      )
-    );
-
-    // Download all items at once — backend emits chunk-level progress events
-    try {
-      const contentIds = next.items.map((i) => i.contentId);
-      const paths = await cmd.downloadShareItems(
-        next.shareId,
-        contentIds,
-        next.targetDir
-      );
-
-      // Mark complete
-      setDownloadJobs((prev) => {
-        const updated = prev.map((j) =>
-          j.id === next.id
-            ? {
-                ...j,
-                status: "complete" as const,
-                completedAt: Date.now(),
-                completedItems: contentIds,
-                completedPaths: paths,
-                bytesDownloaded: j.items.reduce((a, i) => a + i.size, 0),
-              }
-            : j
-        );
-        setTimeout(() => {
-          processingRef.current = false;
-          processQueue(updated);
-        }, 0);
-        return updated;
-      });
-    } catch (e) {
-      setDownloadJobs((prev) => {
-        const updated = prev.map((j) =>
-          j.id === next.id
-            ? { ...j, status: "error" as const, error: String(e), completedAt: Date.now() }
-            : j
-        );
-        setTimeout(() => {
-          processingRef.current = false;
-          processQueue(updated);
-        }, 0);
-        return updated;
-      });
-    }
-  }, []);
-
-  // Process queue whenever jobs change
-  useEffect(() => {
-    if (!processingRef.current && downloadJobs.some((j) => j.status === "queued")) {
-      processQueue(downloadJobs);
-    }
-  }, [downloadJobs, processQueue]);
+  const tree = buildTree(items);
+  const selectedItems = items.filter((i) => selected.has(i.content_id_hex));
+  const selectedSize = selectedItems.reduce((acc, i) => acc + i.size, 0);
+  const totalSize = items.reduce((acc, i) => acc + i.size, 0);
+  const activeEntry = entries.find((e) => e.share_id_hex === activeShareId);
 
   const handleDownload = async () => {
     if (selected.size === 0 || !activeShareId) return;
@@ -623,10 +545,9 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
       const targetDir = typeof dir === "string" ? dir : String(dir);
       const shareTitle = activeEntry?.title ?? `Share ${activeShareId.slice(0, 12)}…`;
 
-      const job: DownloadJob = {
-        id: `${activeShareId}-${Date.now()}`,
-        shareTitle,
+      downloadQueue.enqueue({
         shareId: activeShareId,
+        shareTitle,
         targetDir,
         items: items
           .filter((i) => selected.has(i.content_id_hex))
@@ -635,71 +556,17 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
             name: i.name,
             size: i.size,
           })),
-        completedItems: [],
-        completedPaths: [],
-        status: "queued",
-        bytesDownloaded: 0,
-        chunksCompleted: 0,
-        chunksTotal: 0,
-      };
-
-      setDownloadJobs((prev) => [...prev, job]);
+      });
     } catch {
       // dialog cancelled or error — ignore
     }
   };
 
-  const handleRemoveJob = (id: string) => {
-    setDownloadJobs((prev) => prev.filter((j) => j.id !== id));
-  };
-
-  const handleClearCompleted = () => {
-    setDownloadJobs((prev) => prev.filter((j) => j.status !== "complete"));
-  };
-
-  /* ── Resize handle logic ───────────────────────────────────────────── */
-
-  const handleResizeMouseDown = useCallback(
-    (e: React.MouseEvent) => {
-      e.preventDefault();
-      resizingRef.current = true;
-      const startY = e.clientY;
-      const startH = queueHeight;
-
-      const onMove = (ev: MouseEvent) => {
-        if (!resizingRef.current) return;
-        const container = containerRef.current;
-        const maxH = container ? container.clientHeight - 200 : 500;
-        const delta = startY - ev.clientY;
-        setQueueHeight(Math.max(80, Math.min(maxH, startH + delta)));
-      };
-
-      const onUp = () => {
-        resizingRef.current = false;
-        document.removeEventListener("mousemove", onMove);
-        document.removeEventListener("mouseup", onUp);
-      };
-
-      document.addEventListener("mousemove", onMove);
-      document.addEventListener("mouseup", onUp);
-    },
-    [queueHeight]
-  );
-
-  const tree = buildTree(items);
-  const selectedItems = items.filter((i) => selected.has(i.content_id_hex));
-  const selectedSize = selectedItems.reduce((acc, i) => acc + i.size, 0);
-  const totalSize = items.reduce((acc, i) => acc + i.size, 0);
-
-  const activeEntry = entries.find((e) => e.share_id_hex === activeShareId);
-
-  const hasQueueJobs = downloadJobs.length > 0;
-
   return (
     <NodeRequiredOverlay status={status} onNavigate={onNavigate}>
-    <div ref={containerRef} className="flex flex-col h-full overflow-hidden">
+    <div className="flex flex-col h-full overflow-hidden">
       {/* ── Top area: share list + file browser ────────────────────────── */}
-      <div className="flex overflow-hidden" style={{ flex: hasQueueJobs ? `1 1 0` : '1 1 0', minHeight: 200 }}>
+      <div className="flex overflow-hidden flex-1" style={{ minHeight: 200 }}>
       {/* ── Left panel: share list ────────────────────────────────────── */}
       <div className="w-80 shrink-0 border-r border-border flex flex-col bg-surface-deep/30">
         {/* Header */}
@@ -740,6 +607,12 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
         {error && (
           <div className="px-4 py-2">
             <p className="text-xs text-danger">{error}</p>
+          </div>
+        )}
+
+        {syncMessage && (
+          <div className="px-4 py-1.5 bg-accent/10 border-b border-accent/20">
+            <p className="text-xs text-accent font-medium">{syncMessage}</p>
           </div>
         )}
 
@@ -904,19 +777,22 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
                     {activeEntry?.title ??
                       `Share ${activeShareId.slice(0, 12)}...`}
                   </h3>
-                  {activeEntry?.trust_level && (
-                    <Badge
-                      variant={
-                        activeEntry.trust_level === "Trusted"
-                          ? "success"
-                          : activeEntry.trust_level === "Default"
-                            ? "default"
-                            : "warning"
+                  {activeEntry?.trust_level && activeEntry.source === "subscription" && (
+                    <select
+                      value={activeEntry.trust_level}
+                      onChange={(e) =>
+                        handleTrustLevelChange(
+                          activeEntry.share_id_hex,
+                          e.target.value as SubscriptionTrustLevel
+                        )
                       }
-                      size="sm"
+                      className="text-xs rounded-md border border-border bg-surface-overlay text-text-primary px-1.5 py-0.5 focus:outline-none focus:ring-1 focus:ring-accent"
+                      title="Trust level"
                     >
-                      {activeEntry.trust_level}
-                    </Badge>
+                      <option value="trusted">Trusted</option>
+                      <option value="normal">Normal</option>
+                      <option value="untrusted">Untrusted</option>
+                    </select>
                   )}
                 </div>
                 <div className="flex items-center gap-3 mt-0.5">
@@ -1046,25 +922,6 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
       </div>
       </div>{/* end top area */}
 
-      {/* ── Resize handle + Download queue ─────────────────────────────── */}
-      {hasQueueJobs && (
-        <>
-          <div
-            className="h-1.5 shrink-0 cursor-row-resize bg-border/40 hover:bg-accent/30 active:bg-accent/50 transition-colors flex items-center justify-center group"
-            onMouseDown={handleResizeMouseDown}
-          >
-            <GripHorizontal className="h-3 w-6 text-text-muted/40 group-hover:text-accent/60 transition-colors" />
-          </div>
-          <div style={{ height: queueHeight, minHeight: 80 }} className="shrink-0">
-            <DownloadQueue
-              jobs={downloadJobs}
-              onRemoveJob={handleRemoveJob}
-              onClearCompleted={handleClearCompleted}
-            />
-          </div>
-        </>
-      )}
-
       {/* ── Subscribe by ID modal ─────────────────────────────────────── */}
       <Modal
         open={showSubscribe}
@@ -1107,14 +964,43 @@ export function Discover({ status, onNavigate }: DiscoverProps) {
             if (!v) return null;
             if (isShareLink(v)) {
               try {
-                const { shareIdHex } = decodeShareLink(v);
+                const { shareIdHex, bootstrapPeers } = decodeShareLink(v);
                 return (
-                  <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-success/8 border border-success/20">
-                    <Check className="h-3.5 w-3.5 text-success mt-0.5 shrink-0" />
-                    <div>
-                      <p className="text-xs text-success font-medium">Valid share link detected</p>
-                      <p className="text-[10px] text-text-muted font-mono mt-0.5 break-all">{shareIdHex}</p>
+                  <div className="space-y-2">
+                    <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-success/8 border border-success/20">
+                      <Check className="h-3.5 w-3.5 text-success mt-0.5 shrink-0" />
+                      <div>
+                        <p className="text-xs text-success font-medium">Valid share link detected</p>
+                        <p className="text-[10px] text-text-muted font-mono mt-0.5 break-all">{shareIdHex}</p>
+                      </div>
                     </div>
+                    {bootstrapPeers.length > 0 && (
+                      <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-accent/8 border border-accent/20">
+                        <Wifi className="h-3.5 w-3.5 text-accent mt-0.5 shrink-0" />
+                        <div>
+                          <p className="text-xs text-accent font-medium">
+                            Bootstrap hints included
+                          </p>
+                          <p className="text-[10px] text-text-muted mt-0.5">
+                            The publisher suggested these peers. If you can&#39;t
+                            find the share, add them in{" "}
+                            <span className="text-text-primary font-medium">
+                              Settings → Bootstrap Peers
+                            </span>:
+                          </p>
+                          <div className="mt-1 space-y-0.5">
+                            {bootstrapPeers.map((addr) => (
+                              <p
+                                key={addr}
+                                className="text-[10px] font-mono text-text-secondary break-all"
+                              >
+                                {addr}
+                              </p>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               } catch {

@@ -5,6 +5,7 @@ import type {
   DesktopClientConfig,
   PeerView,
   SubscriptionView,
+  SubscriptionTrustLevel,
   CommunityView,
   CommunityBrowseView,
   SearchResultsView,
@@ -13,6 +14,7 @@ import type {
   PublishVisibility,
   ShareItemView,
   OwnedShareView,
+  SyncResultView,
 } from "./types";
 
 // ── Node lifecycle ──────────────────────────────────────────────────────
@@ -76,7 +78,14 @@ export async function unsubscribeShare(
   return invoke("unsubscribe_share", { shareIdHex });
 }
 
-export async function syncNow(): Promise<SubscriptionView[]> {
+export async function setSubscriptionTrustLevel(
+  shareIdHex: string,
+  trustLevel: SubscriptionTrustLevel
+): Promise<SubscriptionView[]> {
+  return invoke("set_subscription_trust_level", { shareIdHex, trustLevel });
+}
+
+export async function syncNow(): Promise<SyncResultView> {
   return invoke("sync_now");
 }
 
@@ -217,4 +226,11 @@ export async function updateMyShareVisibility(
   visibility: PublishVisibility
 ): Promise<OwnedShareView[]> {
   return invoke("update_my_share_visibility", { shareIdHex, visibility });
+}
+
+/// Explicitly export the Ed25519 signing secret for a published share.
+export async function exportShareSecret(
+  shareIdHex: string
+): Promise<string> {
+  return invoke("export_share_secret", { shareIdHex });
 }

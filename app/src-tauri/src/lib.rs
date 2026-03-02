@@ -4,10 +4,11 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+use scp2p_core::SubscriptionTrustLevel;
 use scp2p_desktop::{
     CommunityBrowseView, CommunityView, DesktopAppState, DesktopClientConfig, OwnedShareView,
     PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
-    SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView, commands,
+    SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView, SyncResultView, commands,
 };
 use serde::Serialize;
 use tauri::Emitter;
@@ -114,7 +115,18 @@ async fn unsubscribe_share(
 }
 
 #[tauri::command]
-async fn sync_now(state: tauri::State<'_, AppState>) -> Result<Vec<SubscriptionView>, String> {
+async fn set_subscription_trust_level(
+    state: tauri::State<'_, AppState>,
+    share_id_hex: String,
+    trust_level: SubscriptionTrustLevel,
+) -> Result<Vec<SubscriptionView>, String> {
+    commands::set_subscription_trust_level(&state.0, share_id_hex, trust_level)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn sync_now(state: tauri::State<'_, AppState>) -> Result<SyncResultView, String> {
     commands::sync_now(&state.0)
         .await
         .map_err(|e| format!("{e:#}"))
@@ -348,6 +360,16 @@ async fn update_my_share_visibility(
         .map_err(|e| format!("{e:#}"))
 }
 
+#[tauri::command]
+async fn export_share_secret(
+    state: tauri::State<'_, AppState>,
+    share_id_hex: String,
+) -> Result<String, String> {
+    commands::export_share_secret(&state.0, share_id_hex)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
 // ── App entry ───────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -367,6 +389,7 @@ pub fn run() {
             list_subscriptions,
             subscribe_share,
             unsubscribe_share,
+            set_subscription_trust_level,
             sync_now,
             list_communities,
             join_community,
@@ -384,6 +407,7 @@ pub fn run() {
             list_my_shares,
             delete_my_share,
             update_my_share_visibility,
+            export_share_secret,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SCP2P application");

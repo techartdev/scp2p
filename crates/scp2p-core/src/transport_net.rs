@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::Context as _;
 use ed25519_dalek::SigningKey;
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -24,7 +24,10 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::{
     capabilities::Capabilities,
-    transport::{AuthenticatedSession, generate_nonce, handshake_initiator, handshake_responder},
+    transport::{
+        AuthenticatedSession, NonceTracker, generate_nonce, handshake_initiator,
+        handshake_responder,
+    },
 };
 
 pub struct TlsServerHandle {
@@ -57,6 +60,7 @@ pub async fn tls_accept_session(
     local_signing_key: &SigningKey,
     capabilities: Capabilities,
     expected_remote_pubkey: Option<[u8; 32]>,
+    nonce_tracker: Option<&mut NonceTracker>,
 ) -> anyhow::Result<(
     tokio_rustls::server::TlsStream<TcpStream>,
     AuthenticatedSession,
@@ -70,7 +74,7 @@ pub async fn tls_accept_session(
         capabilities,
         generate_nonce(),
         expected_remote_pubkey,
-        None,
+        nonce_tracker,
     )
     .await?;
     Ok((tls_stream, session, remote_addr))
@@ -138,6 +142,7 @@ pub async fn quic_accept_bi_session(
     local_signing_key: &SigningKey,
     capabilities: Capabilities,
     expected_remote_pubkey: Option<[u8; 32]>,
+    nonce_tracker: Option<&mut NonceTracker>,
 ) -> anyhow::Result<(QuicBiStream, AuthenticatedSession, SocketAddr)> {
     let incoming = server
         .endpoint
@@ -154,7 +159,7 @@ pub async fn quic_accept_bi_session(
         capabilities,
         generate_nonce(),
         expected_remote_pubkey,
-        None,
+        nonce_tracker,
     )
     .await?;
     Ok((stream, session, remote_addr))
@@ -205,8 +210,9 @@ fn build_quic_server_config() -> anyhow::Result<(ServerConfig, Vec<u8>)> {
 
     let cert_chain = vec![CertificateDer::from(cert_der.clone())];
     let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_der.clone()).clone_key());
-    let server_config = ServerConfig::with_single_cert(cert_chain, private_key)
+    let mut server_config = ServerConfig::with_single_cert(cert_chain, private_key)
         .context("build quic server config with certificate")?;
+    server_config.transport_config(quic_transport_config());
     Ok((server_config, cert_der))
 }
 
@@ -219,9 +225,37 @@ fn build_quic_client_config(trusted_server_certificate_der: &[u8]) -> anyhow::Re
     let rustls_client = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Ok(ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(rustls_client)?,
-    )))
+    ));
+    client_config.transport_config(quic_transport_config());
+    Ok(client_config)
+}
+
+/// Keep-alive PING interval.  Keeps NAT bindings and detects dead peers.
+pub const QUIC_KEEP_ALIVE_INTERVAL_MS: u32 = 10_000;
+
+/// Maximum time a connection may be idle before it is closed.
+pub const QUIC_MAX_IDLE_TIMEOUT_MS: u32 = 30_000;
+
+/// Initial round-trip time estimate used by the congestion controller
+/// before the first RTT sample is available.
+pub const QUIC_INITIAL_RTT_MS: u64 = 100;
+
+/// Construct the shared QUIC `TransportConfig` applied to both server and
+/// client connections.  The settings balance responsiveness (10 s keep-alive)
+/// with connection longevity (30 s idle timeout) and provide a reasonable
+/// initial RTT seed of 100 ms for the congestion controller.
+fn quic_transport_config() -> Arc<TransportConfig> {
+    let mut config = TransportConfig::default();
+    config.keep_alive_interval(Some(std::time::Duration::from_millis(
+        QUIC_KEEP_ALIVE_INTERVAL_MS as u64,
+    )));
+    config.max_idle_timeout(Some(
+        quinn::IdleTimeout::from(VarInt::from_u32(QUIC_MAX_IDLE_TIMEOUT_MS)),
+    ));
+    config.initial_rtt(std::time::Duration::from_millis(QUIC_INITIAL_RTT_MS));
+    Arc::new(config)
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +623,7 @@ mod tests {
                 &server_key,
                 Capabilities::default(),
                 Some(client_pub),
+                None,
             )
             .await
             .expect("accept quic session");
@@ -637,6 +672,7 @@ mod tests {
                 &server_key,
                 Capabilities::default(),
                 Some(client_pub),
+                None,
             )
             .await
             .expect("accept tls session");

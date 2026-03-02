@@ -155,7 +155,38 @@ struct ItemSigningTuple<'a>(
     [u8; 32],
 );
 
+/// Maximum number of items allowed in a single manifest (protocol-level limit).
+///
+/// A typical `ItemV1` in CBOR is 150–250 bytes; the wire envelope payload cap
+/// is 1 MiB (`MAX_ENVELOPE_PAYLOAD_BYTES`). At ~200 bytes/item,
+/// 3,000 items ≈ 600 KB — safely below the 1 MiB limit and consistent
+/// with the round-trip wire constraint.
+pub const MAX_MANIFEST_ITEMS: usize = 3_000;
+
+/// Maximum total number of chunk hashes across all items in a manifest.
+pub const MAX_MANIFEST_CHUNK_HASHES: usize = 100_000;
+
 impl ManifestV1 {
+    /// Validate item and chunk-hash counts against protocol limits.
+    ///
+    /// Call this on both locally-built *and* remotely-received manifests
+    /// before they are accepted into node state.
+    pub fn check_limits(&self) -> anyhow::Result<()> {
+        if self.items.len() > MAX_MANIFEST_ITEMS {
+            anyhow::bail!(
+                "manifest has {} items, exceeding limit of {MAX_MANIFEST_ITEMS}",
+                self.items.len()
+            );
+        }
+        let total_chunks: u32 = self.items.iter().map(|i| i.chunk_count).sum();
+        if total_chunks > MAX_MANIFEST_CHUNK_HASHES as u32 {
+            anyhow::bail!(
+                "manifest has {total_chunks} total chunk hashes, exceeding limit of {MAX_MANIFEST_CHUNK_HASHES}"
+            );
+        }
+        Ok(())
+    }
+
     pub fn unsigned_bytes(&self) -> anyhow::Result<Vec<u8>> {
         // Signature payloads use positional CBOR arrays to avoid map key ordering variance.
         let items = self
@@ -562,5 +593,88 @@ mod tests {
         let manifest: ManifestV1 = crate::cbor::from_slice(&legacy).expect("decode legacy");
         assert_eq!(manifest.visibility, ShareVisibility::Private);
         assert!(manifest.communities.is_empty());
+    }
+
+    #[test]
+    fn check_limits_rejects_too_many_items() {
+        let items = (0..=crate::manifest::MAX_MANIFEST_ITEMS as u64)
+            .map(|i| {
+                let mut id = [0u8; 32];
+                id[..8].copy_from_slice(&i.to_le_bytes());
+                ItemV1 {
+                    content_id: id,
+                    size: 1024,
+                    name: format!("file-{i}.bin"),
+                    path: None,
+                    mime: None,
+                    tags: vec![],
+                    chunk_count: 1,
+                    chunk_list_hash: [0u8; 32],
+                }
+            })
+            .collect::<Vec<_>>();
+        let manifest = ManifestV1 {
+            version: 1,
+            share_pubkey: [0u8; 32],
+            share_id: [0u8; 32],
+            seq: 1,
+            created_at: 1_700_000_000,
+            expires_at: None,
+            title: None,
+            description: None,
+            visibility: ShareVisibility::Private,
+            communities: vec![],
+            items,
+            recommended_shares: vec![],
+            signature: None,
+        };
+        let err = manifest.check_limits().unwrap_err();
+        assert!(
+            err.to_string().contains("exceeding limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn check_limits_max_items_fit_in_envelope() {
+        // 3,000 items with realistic field sizes must serialize below
+        // the 1 MiB wire envelope payload limit.
+        let manifest = ManifestV1 {
+            version: 1,
+            share_pubkey: [0u8; 32],
+            share_id: [0u8; 32],
+            seq: 1,
+            created_at: 1_700_000_000,
+            expires_at: None,
+            title: Some("Catalog".into()),
+            description: None,
+            visibility: ShareVisibility::Private,
+            communities: vec![],
+            items: (0..crate::manifest::MAX_MANIFEST_ITEMS as u64)
+                .map(|i| {
+                    let mut id = [0u8; 32];
+                    id[..8].copy_from_slice(&i.to_le_bytes());
+                    ItemV1 {
+                        content_id: id,
+                        size: 1_048_576,
+                        name: format!("file-{i:06}.bin"),
+                        path: Some(format!("catalog/sub/file-{i:06}.bin")),
+                        mime: Some("application/octet-stream".into()),
+                        tags: vec!["tag1".into(), "tag2".into()],
+                        chunk_count: 4,
+                        chunk_list_hash: [0u8; 32],
+                    }
+                })
+                .collect(),
+            recommended_shares: vec![],
+            signature: None,
+        };
+        manifest.check_limits().expect("3000 items should be within limits");
+        let bytes = crate::cbor::to_vec(&manifest).expect("serialize");
+        assert!(
+            bytes.len() < crate::wire::MAX_ENVELOPE_PAYLOAD_BYTES,
+            "3000-item manifest ({} bytes) must fit in 1 MiB envelope",
+            bytes.len()
+        );
     }
 }

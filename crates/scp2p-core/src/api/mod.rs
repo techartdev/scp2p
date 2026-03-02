@@ -41,6 +41,7 @@ use crate::{
     store::{
         DirtyFlags, EncryptedSecret, MemoryStore, PersistedCommunity, PersistedPartialDownload,
         PersistedPublisherIdentity, PersistedState, PersistedSubscription, Store,
+        decrypt_secret_with_key, encrypt_secret_with_key,
     },
     wire::{PexOffer, PexRequest},
 };
@@ -300,6 +301,10 @@ struct NodeState {
     /// [`encrypt_publisher_identities`].  When present for a label,
     /// [`to_persisted`] writes the encrypted form and omits plaintext.
     encrypted_publisher_secrets: HashMap<String, EncryptedSecret>,
+    /// Publisher secrets encrypted with the node identity key (fast blake3 path).
+    /// Populated by `auto_protect_publisher_identities` and `ensure_publisher_identity`
+    /// when `NodeConfig::auto_protect_publisher_keys` is true.
+    node_key_encrypted_publisher_secrets: HashMap<String, EncryptedSecret>,
     peer_db: PeerDb,
     dht: Dht,
     manifest_cache: HashMap<[u8; 32], ManifestV1>,
@@ -317,8 +322,12 @@ struct NodeState {
     abuse_limits: AbuseLimits,
     partial_downloads: HashMap<[u8; 32], PersistedPartialDownload>,
     encrypted_node_key: Option<EncryptedSecret>,
+    /// Plaintext node identity key (loaded from store).
+    node_key: Option<[u8; 32]>,
     enabled_blocklist_shares: HashSet<[u8; 32]>,
     blocklist_rules_by_share: HashMap<[u8; 32], BlocklistRules>,
+    /// TOFU-pinned Ed25519 public keys for bootstrap peers.
+    pinned_bootstrap_keys: HashMap<String, [u8; 32]>,
     /// Active relay slot when this node is firewalled and using a relay.
     /// Supports multiple relays for redundancy.
     active_relay_slots: Vec<ActiveRelaySlot>,
@@ -353,6 +362,10 @@ pub struct AbuseLimits {
     pub max_dht_requests_per_window: u32,
     pub max_fetch_requests_per_window: u32,
     pub max_relay_requests_per_window: u32,
+    /// Maximum chunk data requests per window.  Each chunk is up to
+    /// `CHUNK_SIZE` (256 KiB), so this effectively caps transfer at
+    /// `max_chunk_requests_per_window × 256 KiB` per window period.
+    pub max_chunk_requests_per_window: u32,
 }
 
 impl Default for AbuseLimits {
@@ -363,6 +376,8 @@ impl Default for AbuseLimits {
             max_dht_requests_per_window: 180,
             max_fetch_requests_per_window: 240,
             max_relay_requests_per_window: 180,
+            // 600 chunks × 256 KiB ≈ 150 MiB per minute per peer.
+            max_chunk_requests_per_window: 600,
         }
     }
 }
@@ -372,6 +387,8 @@ enum RequestClass {
     Dht,
     Fetch,
     Relay,
+    /// Chunk data transfer requests (`GetChunk`).
+    Chunk,
     Other,
 }
 
@@ -382,6 +399,8 @@ struct AbuseCounter {
     dht: u32,
     fetch: u32,
     relay: u32,
+    /// Chunk data requests in this window.
+    chunk: u32,
 }
 
 pub struct Node;
@@ -414,16 +433,18 @@ impl NodeState {
             peers,
             subscriptions,
             communities,
-            publisher_identities,
+            publisher_identities: publisher_identities_raw,
             manifests,
             share_heads,
             share_weights,
             search_index,
             partial_downloads,
+            node_key,
             encrypted_node_key,
             enabled_blocklist_shares,
             blocklist_rules_by_share,
             content_paths: persisted_content_paths,
+            pinned_bootstrap_keys,
         } = persisted;
         let mut peer_db = PeerDb::default();
         peer_db.replace_records(peers);
@@ -456,14 +477,36 @@ impl NodeState {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let publisher_identities = publisher_identities
-            .into_iter()
+        // Build publisher_identities map: prefer plaintext; also auto-unlock those
+        // encrypted with the node key (fast blake3, no PBKDF2) when auto-protect is on.
+        let mut publisher_identities: HashMap<String, [u8; 32]> = publisher_identities_raw
+            .iter()
             .filter_map(|identity| {
-                // Only load identities with a plaintext secret.
-                // Encrypted-only identities require explicit unlock.
-                identity.share_secret.map(|secret| (identity.label, secret))
+                identity.share_secret.map(|secret| (identity.label.clone(), secret))
             })
-            .collect::<HashMap<_, _>>();
+            .collect();
+        let mut node_key_encrypted_publisher_secrets: HashMap<String, EncryptedSecret> =
+            HashMap::new();
+        if runtime_config.auto_protect_publisher_keys
+            && let Some(ref nk) = node_key
+        {
+            for identity in &publisher_identities_raw {
+                if let Some(enc) = &identity.node_key_encrypted_share_secret {
+                    // Re-populate encrypted map always (even when plaintext is available).
+                    node_key_encrypted_publisher_secrets
+                        .insert(identity.label.clone(), enc.clone());
+                    // Auto-unlock if we don't already have the plaintext.
+                    if !publisher_identities.contains_key(&identity.label)
+                        && let Ok(plain) = decrypt_secret_with_key(enc, nk)
+                        && plain.len() == 32
+                    {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&plain);
+                        publisher_identities.insert(identity.label.clone(), arr);
+                    }
+                }
+            }
+        }
 
         // Prune content_paths for files that no longer exist on disk.
         let content_paths: HashMap<[u8; 32], PathBuf> = persisted_content_paths
@@ -517,6 +560,7 @@ impl NodeState {
             communities,
             publisher_identities,
             encrypted_publisher_secrets: HashMap::new(),
+            node_key_encrypted_publisher_secrets,
             peer_db,
             dht,
             manifest_cache: manifests,
@@ -532,8 +576,10 @@ impl NodeState {
             abuse_limits: AbuseLimits::default(),
             partial_downloads,
             encrypted_node_key,
+            node_key,
             enabled_blocklist_shares: enabled_blocklist_shares.into_iter().collect(),
             blocklist_rules_by_share,
+            pinned_bootstrap_keys,
             active_relay_slots: Vec::new(),
             store,
             dirty: DirtyFlags::default(),
@@ -569,17 +615,30 @@ impl NodeState {
             .iter()
             .map(|(label, share_secret)| {
                 if let Some(encrypted) = self.encrypted_publisher_secrets.get(label) {
-                    // Persist only the encrypted form – omit plaintext.
+                    // Persist only the user-passphrase encrypted form – omit plaintext.
                     PersistedPublisherIdentity {
                         label: label.clone(),
                         share_secret: None,
                         encrypted_share_secret: Some(encrypted.clone()),
+                        node_key_encrypted_share_secret: self
+                            .node_key_encrypted_publisher_secrets
+                            .get(label)
+                            .cloned(),
                     }
                 } else {
                     PersistedPublisherIdentity {
                         label: label.clone(),
-                        share_secret: Some(*share_secret),
+                        // Omit plaintext when a node-key-encrypted form is available.
+                        share_secret: if self.node_key_encrypted_publisher_secrets.contains_key(label) {
+                            None
+                        } else {
+                            Some(*share_secret)
+                        },
                         encrypted_share_secret: None,
+                        node_key_encrypted_share_secret: self
+                            .node_key_encrypted_publisher_secrets
+                            .get(label)
+                            .cloned(),
                     }
                 }
             })
@@ -592,12 +651,14 @@ impl NodeState {
             manifests: self.manifest_cache.clone(),
             share_heads: self.published_share_heads.clone(),
             share_weights: self.share_weights.clone(),
-            search_index: Some(self.search_index.snapshot()),
+            search_index: None,
             partial_downloads: self.partial_downloads.clone(),
+            node_key: self.node_key,
             encrypted_node_key: self.encrypted_node_key.clone(),
             enabled_blocklist_shares: self.enabled_blocklist_shares.iter().copied().collect(),
             blocklist_rules_by_share: self.blocklist_rules_by_share.clone(),
             content_paths: self.content_paths.clone(),
+            pinned_bootstrap_keys: self.pinned_bootstrap_keys.clone(),
         }
     }
 
@@ -618,6 +679,7 @@ impl NodeState {
                 dht: 0,
                 fetch: 0,
                 relay: 0,
+                chunk: 0,
             });
 
         if now_unix.saturating_sub(counter.window_start_unix) >= window {
@@ -627,6 +689,7 @@ impl NodeState {
                 dht: 0,
                 fetch: 0,
                 relay: 0,
+                chunk: 0,
             };
         }
 
@@ -635,8 +698,8 @@ impl NodeState {
             RequestClass::Dht => counter.dht = counter.dht.saturating_add(1),
             RequestClass::Fetch => counter.fetch = counter.fetch.saturating_add(1),
             RequestClass::Relay => counter.relay = counter.relay.saturating_add(1),
-            // Chunk data requests are not counted toward any limit — bandwidth
-            // is the only meaningful constraint for bulk data transfer.
+            RequestClass::Chunk => counter.chunk = counter.chunk.saturating_add(1),
+            // Truly uncategorized requests are still exempt.
             RequestClass::Other => return Ok(()),
         }
 
@@ -652,6 +715,9 @@ impl NodeState {
         if counter.relay > self.abuse_limits.max_relay_requests_per_window {
             anyhow::bail!("relay request rate limit exceeded");
         }
+        if counter.chunk > self.abuse_limits.max_chunk_requests_per_window {
+            anyhow::bail!("chunk request rate limit exceeded");
+        }
         Ok(())
     }
 }
@@ -662,7 +728,9 @@ impl NodeHandle {
     }
 
     pub async fn configured_bootstrap_peers(&self) -> anyhow::Result<Vec<PeerAddr>> {
-        let config = self.state.read().await.runtime_config.clone();
+        let state = self.state.read().await;
+        let config = state.runtime_config.clone();
+        let pinned = &state.pinned_bootstrap_keys;
         config
             .bootstrap_peers
             .iter()
@@ -674,20 +742,106 @@ impl NodeHandle {
                 } else {
                     (TransportProtocol::Tcp, entry.as_str())
                 };
-                let socket: SocketAddr = addr_part.parse()?;
+
+                // Parse optional pubkey suffix: "ip:port@<64-hex-chars>"
+                let (socket_str, explicit_pubkey) = if let Some(at_pos) = addr_part.rfind('@') {
+                    let hex_str = &addr_part[at_pos + 1..];
+                    if hex_str.len() == 64 {
+                        let mut key = [0u8; 32];
+                        let ok = hex_str.as_bytes().chunks(2).enumerate().all(|(i, pair)| {
+                            let hi = hex_nibble(pair[0]);
+                            let lo = hex_nibble(pair[1]);
+                            if let (Some(h), Some(l)) = (hi, lo) {
+                                key[i] = (h << 4) | l;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if ok {
+                            (&addr_part[..at_pos], Some(key))
+                        } else {
+                            (addr_part, None)
+                        }
+                    } else {
+                        (addr_part, None)
+                    }
+                } else {
+                    (addr_part, None)
+                };
+
+                let socket: SocketAddr = socket_str.parse()?;
+
+                // Use explicit key if present, else fall back to TOFU pinned key.
+                let pubkey_hint = explicit_pubkey.or_else(|| pinned.get(entry).copied());
+
                 Ok(PeerAddr {
                     ip: socket.ip(),
                     port: socket.port(),
                     transport,
-                    pubkey_hint: None,
+                    pubkey_hint,
                     relay_via: None,
                 })
             })
             .collect()
     }
 
+    /// Record a TOFU-pinned public key for a bootstrap peer.
+    ///
+    /// If the peer address already has a pinned key, verifies that the
+    /// new key matches; returns an error on mismatch (identity change).
+    /// If no key is pinned yet, stores it (first-seen trust).
+    pub async fn pin_bootstrap_key(
+        &self,
+        peer_addr_str: &str,
+        observed_pubkey: [u8; 32],
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        if let Some(existing) = state.pinned_bootstrap_keys.get(peer_addr_str) {
+            if *existing != observed_pubkey {
+                anyhow::bail!(
+                    "bootstrap peer identity mismatch for {peer_addr_str}: \
+                     pinned key differs from observed key"
+                );
+            }
+            // Key matches — nothing to do.
+            return Ok(());
+        }
+        state
+            .pinned_bootstrap_keys
+            .insert(peer_addr_str.to_string(), observed_pubkey);
+        state.dirty.peers = true;
+        Ok(())
+    }
+
+    /// Return the TOFU-pinned public key for a bootstrap peer, if any.
+    pub async fn pinned_bootstrap_key(&self, peer_addr_str: &str) -> Option<[u8; 32]> {
+        self.state
+            .read()
+            .await
+            .pinned_bootstrap_keys
+            .get(peer_addr_str)
+            .copied()
+    }
+
     pub async fn peer_records(&self) -> Vec<crate::peer_db::PeerRecord> {
         self.state.read().await.peer_db.all_records()
+    }
+
+    /// Record the outcome of a transfer interaction with a peer.
+    ///
+    /// Calls [`PeerDb::note_outcome`] to update the persistent reputation
+    /// score: `+1` for a successful interaction, `-2` for a failure.
+    /// The score is clamped to `[-10, 10]` and survives node restarts.
+    ///
+    /// This method is a no-op if the peer is not yet in the database.
+    pub async fn note_peer_outcome(&self, addr: &PeerAddr, success: bool) -> anyhow::Result<()> {
+        {
+            let mut state = self.state.write().await;
+            state.peer_db.note_outcome(addr, success);
+            state.dirty.peers = true;
+        }
+        helpers::persist_state(self).await
     }
 
     pub async fn subscriptions(&self) -> Vec<PersistedSubscription> {
@@ -748,6 +902,15 @@ impl NodeHandle {
                     let mut rng = rand::rngs::OsRng;
                     let secret = SigningKey::generate(&mut rng).to_bytes();
                     state.publisher_identities.insert(label.to_string(), secret);
+                    // Auto-protect with the node key when enabled.
+                    if state.runtime_config.auto_protect_publisher_keys
+                        && let Some(nk) = state.node_key
+                        && let Ok(enc) = encrypt_secret_with_key(secret.as_ref(), &nk)
+                    {
+                        state
+                            .node_key_encrypted_publisher_secrets
+                            .insert(label.to_string(), enc);
+                    }
                     state.dirty.publisher_identities = true;
                     needs_persist = true;
                     secret
@@ -758,6 +921,73 @@ impl NodeHandle {
             persist_state(self).await?;
         }
         Ok(ShareKeypair::new(SigningKey::from_bytes(&secret)))
+    }
+
+    /// Encrypt all existing plaintext publisher identities with the node key.
+    ///
+    /// Safe to call repeatedly; already-encrypted identities are skipped.
+    /// No-ops if `auto_protect_publisher_keys` is disabled or no node key is set.
+    pub async fn auto_protect_publisher_identities(&self) -> anyhow::Result<()> {
+        let changed = {
+            let mut state = self.state.write().await;
+            if !state.runtime_config.auto_protect_publisher_keys {
+                return Ok(());
+            }
+            let Some(nk) = state.node_key else {
+                return Ok(());
+            };
+            let mut changed = false;
+            let labels: Vec<_> = state.publisher_identities.keys().cloned().collect();
+            for label in labels {
+                if state.node_key_encrypted_publisher_secrets.contains_key(&label) {
+                    continue;
+                }
+                let secret = state.publisher_identities[&label];
+                if let Ok(enc) = encrypt_secret_with_key(secret.as_ref(), &nk) {
+                    state
+                        .node_key_encrypted_publisher_secrets
+                        .insert(label, enc);
+                    changed = true;
+                }
+            }
+            if changed {
+                state.dirty.publisher_identities = true;
+            }
+            changed
+        };
+        if changed {
+            persist_state(self).await?;
+        }
+        Ok(())
+    }
+
+    /// Return a stable Ed25519 node identity keypair.
+    ///
+    /// On first call the key is generated, persisted to the store, and
+    /// returned.  Subsequent calls return the same key.  This avoids
+    /// the previous pattern of generating a fresh ephemeral keypair on
+    /// every node start, which made the node un-addressable by pubkey
+    /// across restarts.
+    pub async fn ensure_node_identity(&self) -> anyhow::Result<SigningKey> {
+        let mut needs_persist = false;
+        let secret = {
+            let mut state = self.state.write().await;
+            match state.node_key {
+                Some(key) => key,
+                None => {
+                    let mut rng = rand::rngs::OsRng;
+                    let key = SigningKey::generate(&mut rng).to_bytes();
+                    state.node_key = Some(key);
+                    state.dirty.node_key = true;
+                    needs_persist = true;
+                    key
+                }
+            }
+        };
+        if needs_persist {
+            persist_state(self).await?;
+        }
+        Ok(SigningKey::from_bytes(&secret))
     }
 
     pub async fn list_local_public_shares(
@@ -843,15 +1073,16 @@ impl NodeHandle {
     /// Remove the published share head (and its manifest) for the given `share_id`.
     /// The publisher identity key is retained so the share can be re-published later.
     pub async fn delete_published_share(&self, share_id: ShareId) -> anyhow::Result<()> {
-        {
+        let store = {
             let mut state = self.state.write().await;
             if let Some(head) = state.published_share_heads.remove(&share_id.0) {
                 state.manifest_cache.remove(&head.latest_manifest_id);
             }
             state.dirty.manifests = true;
             state.dirty.share_heads = true;
-            state.dirty.search_index = true;
-        }
+            state.store.clone()
+        };
+        store.remove_share_from_search(share_id.0).await?;
         persist_state(self).await
     }
 
@@ -902,6 +1133,8 @@ impl NodeHandle {
         community_share_id: ShareId,
         community_share_pubkey: [u8; 32],
         max_entries: usize,
+        requester_node_pubkey: Option<[u8; 32]>,
+        requester_membership_proof: Option<&[u8]>,
     ) -> anyhow::Result<Vec<PublicShareSummary>> {
         let pubkey = VerifyingKey::from_bytes(&community_share_pubkey)?;
         if ShareId::from_pubkey(&pubkey) != community_share_id {
@@ -911,6 +1144,26 @@ impl NodeHandle {
         let state = self.state.read().await;
         if !state.communities.contains_key(&community_share_id.0) {
             return Ok(Vec::new());
+        }
+
+        // AV-06: enforce strict membership proof when enabled.
+        if state.runtime_config.community_strict_mode {
+            let rpk = requester_node_pubkey.ok_or_else(|| {
+                anyhow::anyhow!("community strict mode: requester_node_pubkey required")
+            })?;
+            let proof_bytes = requester_membership_proof.ok_or_else(|| {
+                anyhow::anyhow!("community strict mode: membership proof required")
+            })?;
+            let token: CommunityMembershipToken =
+                crate::cbor::from_slice(proof_bytes)
+                    .map_err(|_| anyhow::anyhow!("community strict mode: invalid membership proof encoding"))?;
+            if token.member_node_pubkey != rpk {
+                anyhow::bail!(
+                    "community strict mode: proof member_node_pubkey does not match requester"
+                );
+            }
+            let now = now_unix_secs()?;
+            token.verify(&community_share_pubkey, Some(now))?;
         }
 
         let mut heads = state
@@ -977,12 +1230,27 @@ impl NodeHandle {
         community_share_pubkey: [u8; 32],
         max_entries: u16,
     ) -> anyhow::Result<Vec<PublicShareSummary>> {
+        // Build requester identity fields to support strict-mode servers.
+        let (requester_node_pubkey, requester_membership_proof) = {
+            let state = self.state.read().await;
+            let node_pubkey = state
+                .node_key
+                .map(|k| SigningKey::from_bytes(&k).verifying_key().to_bytes());
+            let proof = state
+                .communities
+                .get(&community_share_id.0)
+                .and_then(|m| m.token.as_ref())
+                .and_then(|t| crate::cbor::to_vec(t).ok());
+            (node_pubkey, proof)
+        };
         query_community_public_shares(
             transport,
             peer,
             community_share_id,
             community_share_pubkey,
             max_entries,
+            requester_node_pubkey,
+            requester_membership_proof,
         )
         .await
     }
@@ -1199,6 +1467,16 @@ impl NodeHandle {
     ) -> anyhow::Result<()> {
         {
             let mut state = self.state.write().await;
+            // Enforce subscription cap to prevent unbounded RAM/sync/persist growth.
+            // Re-subscribing to an already-subscribed share does not count toward the cap.
+            if !state.subscriptions.contains_key(&share_id.0)
+                && state.subscriptions.len() >= state.runtime_config.max_subscriptions
+            {
+                anyhow::bail!(
+                    "subscription limit of {} reached; unsubscribe from another share first",
+                    state.runtime_config.max_subscriptions
+                );
+            }
             state
                 .subscriptions
                 .entry(share_id.0)
@@ -1214,14 +1492,17 @@ impl NodeHandle {
     }
 
     pub async fn unsubscribe(&self, share_id: ShareId) -> anyhow::Result<()> {
-        {
+        let store = {
             let mut state = self.state.write().await;
             state.subscriptions.remove(&share_id.0);
+            state.search_index.remove_share(share_id.0);
             state.enabled_blocklist_shares.remove(&share_id.0);
             state.blocklist_rules_by_share.remove(&share_id.0);
             state.dirty.subscriptions = true;
             state.dirty.blocklist = true;
-        }
+            state.store.clone()
+        };
+        store.remove_share_from_search(share_id.0).await?;
         persist_state(self).await
     }
 }
