@@ -7,12 +7,11 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 ed25519-dalek.workspace = true
 hex.workspace = true
 rand.workspace = true
 scp2p-core = { path = "../scp2p-core" }
 tokio.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows = "0.62.2"
+inquire = "0.7"
+indicatif = "0.17"

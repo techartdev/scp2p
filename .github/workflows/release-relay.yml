@@ -1,0 +1,190 @@
+# .github/workflows/release-relay.yml
+#
+# Builds scp2p-relay for all supported platforms and publishes a GitHub Release
+# with pre-compiled binaries whenever a version tag is pushed.
+#
+# Tag format: relay-v<semver>  (e.g. relay-v0.1.0)
+#
+# The release assets produced are:
+#   scp2p-relay-linux-x86_64
+#   scp2p-relay-linux-aarch64
+#   scp2p-relay-macos-x86_64
+#   scp2p-relay-macos-aarch64
+#   scp2p-relay-windows-x86_64.exe
+#
+# install.sh and install.ps1 in the repo root download these assets.
+
+name: Release scp2p-relay
+
+on:
+  push:
+    tags:
+      - "relay-v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write   # needed to create releases and upload assets
+
+jobs:
+  # ── Build matrix ──────────────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86-64  (glibc, runs on all mainstream Linux distros)
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            asset_name: scp2p-relay-linux-x86_64
+
+          # Linux arm64  (Raspberry Pi 4+, AWS Graviton, Oracle free-tier)
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04
+            asset_name: scp2p-relay-linux-aarch64
+            cross: true              # use `cross` for seamless cross-compilation
+
+          # macOS Intel
+          - target: x86_64-apple-darwin
+            os: macos-14
+            asset_name: scp2p-relay-macos-x86_64
+
+          # macOS Apple Silicon (M1/M2/M3)
+          - target: aarch64-apple-darwin
+            os: macos-14
+            asset_name: scp2p-relay-macos-aarch64
+
+          # Windows x86-64
+          - target: x86_64-pc-windows-msvc
+            os: windows-2022
+            asset_name: scp2p-relay-windows-x86_64.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Rust toolchain — pin to stable, add the target we need.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Cache compiled dependencies between runs.
+      - name: Cache Cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # `cross` is only needed for aarch64-linux cross-compilation.
+      - name: Install cross (aarch64-linux only)
+        if: matrix.cross == true
+        run: cargo install cross --locked
+
+      # Build the relay binary (release profile).
+      - name: Build (native)
+        if: matrix.cross != true
+        run: |
+          cargo build --release --package scp2p-relay --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: |
+          cross build --release --package scp2p-relay --target ${{ matrix.target }}
+
+      # Locate the compiled binary and rename it to the asset name.
+      - name: Rename binary (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          cp target/${{ matrix.target }}/release/scp2p-relay ${{ matrix.asset_name }}
+          chmod +x ${{ matrix.asset_name }}
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item "target\${{ matrix.target }}\release\scp2p-relay.exe" "${{ matrix.asset_name }}"
+
+      # Upload the binary as a workflow artifact so the release job can grab it.
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  # ── Create GitHub Release ─────────────────────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout (for install scripts)
+        uses: actions/checkout@v4
+
+      # Download all five binaries into the current directory.
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true   # flatten into cwd
+
+      # List what we have (sanity check).
+      - name: List assets
+        run: ls -lh scp2p-relay-*
+
+      # Derive a human-readable version from the tag (strip "relay-v" prefix).
+      - name: Derive version
+        id: version
+        run: echo "ver=${GITHUB_REF_NAME#relay-v}" >> "$GITHUB_OUTPUT"
+
+      # Create the release and upload all assets.
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "scp2p-relay v${{ steps.version.outputs.ver }}"
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}  # x.y.z-beta → prerelease
+          body: |
+            ## scp2p-relay v${{ steps.version.outputs.ver }}
+
+            Standalone relay node for the SCP2P network.
+
+            ### One-line install
+
+            **Linux / macOS**
+            ```sh
+            curl -sSfL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh | sh
+            ```
+
+            **Windows (PowerShell)**
+            ```powershell
+            irm https://raw.githubusercontent.com/${{ github.repository }}/main/install.ps1 | iex
+            ```
+
+            **Rust (cargo)**
+            ```sh
+            cargo install scp2p-relay
+            ```
+
+            ### Manual download
+
+            Pick the binary for your platform from the Assets below.
+            See the [README](https://github.com/${{ github.repository }}/blob/main/crates/scp2p-relay/README.md) for configuration options.
+
+            ### Assets
+
+            | File | Platform |
+            |---|---|
+            | `scp2p-relay-linux-x86_64` | Linux x86-64 (glibc 2.35+) |
+            | `scp2p-relay-linux-aarch64` | Linux arm64 (Raspberry Pi, Graviton) |
+            | `scp2p-relay-macos-x86_64` | macOS Intel |
+            | `scp2p-relay-macos-aarch64` | macOS Apple Silicon (M1/M2/M3) |
+            | `scp2p-relay-windows-x86_64.exe` | Windows 10/11 x86-64 |
+          files: |
+            scp2p-relay-linux-x86_64
+            scp2p-relay-linux-aarch64
+            scp2p-relay-macos-x86_64
+            scp2p-relay-macos-aarch64
+            scp2p-relay-windows-x86_64.exe
+            install.sh
+            install.ps1

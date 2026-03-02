@@ -1,0 +1,30 @@
+[package]
+name = "scp2p-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone relay node for the SCP2P network — easy to deploy on any OS"
+readme = "README.md"
+keywords = ["p2p", "relay", "nat-traversal", "scp2p"]
+categories = ["network-programming", "command-line-utilities"]
+
+[[bin]]
+name = "scp2p-relay"
+path = "src/main.rs"
+
+[dependencies]
+scp2p-core     = { path = "../scp2p-core" }
+
+anyhow         = { workspace = true }
+async-trait    = { workspace = true }
+clap           = { workspace = true, features = ["env"] }
+ed25519-dalek  = { workspace = true }
+hex            = { workspace = true }
+rand           = { workspace = true }
+serde          = { workspace = true }
+tokio          = { workspace = true }
+tracing        = { workspace = true }
+
+# Not in workspace — relay-only deps
+toml              = "0.8"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
