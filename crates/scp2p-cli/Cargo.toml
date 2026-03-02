@@ -15,3 +15,4 @@ scp2p-core = { path = "../scp2p-core" }
 tokio.workspace = true
 inquire = "0.7"
 indicatif = "0.17"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

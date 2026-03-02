@@ -29,6 +29,10 @@ jobs:
   build:
     name: Build ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
+    # Expose signing secret at job level so it can be referenced in `if:` conditions.
+    # Empty string when the secret is absent, which GitHub treats as falsy.
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
     strategy:
       fail-fast: false
       matrix:
@@ -92,7 +96,7 @@ jobs:
 
       # ── macOS code-signing (skipped when secrets are absent) ─────────────────
       - name: Import Apple certificate
-        if: matrix.platform == 'macos' && secrets.APPLE_CERTIFICATE != ''
+        if: matrix.platform == 'macos' && env.APPLE_CERTIFICATE != ''
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}

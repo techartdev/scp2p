@@ -8,10 +8,11 @@
 mod shell;
 
 use clap::Parser;
+use tracing_subscriber::{EnvFilter, fmt};
 
 /// SCP2P interactive command-line interface.
 ///
-/// Run without subcommands â€“ the shell guides you through all operations
+/// No subcommands - the shell guides you through all operations
 /// interactively. Use arrow keys to navigate menus and Escape to go back.
 #[derive(Parser)]
 #[command(name = "scp2p", version)]
@@ -20,7 +21,7 @@ struct Args {
     #[arg(long, default_value = "scp2p.db", env = "SCP2P_DB")]
     db: String,
 
-    /// Bootstrap peer addresses (IP:PORT) â€“ comma-separated or repeated.
+    /// Bootstrap peer addresses (IP:PORT) - comma-separated or repeated.
     #[arg(
         long = "bootstrap",
         value_name = "IP:PORT",
@@ -33,11 +34,21 @@ struct Args {
     /// TCP port this node listens on for incoming peer connections.
     #[arg(long, default_value_t = 7001, env = "SCP2P_PORT")]
     port: u16,
+
+    /// Log level: error, warn, info, debug, trace.
+    /// Can also be set via RUST_LOG (e.g. RUST_LOG=scp2p_core=debug).
+    #[arg(long, default_value = "warn", env = "SCP2P_LOG")]
+    log_level: String,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    // Initialise tracing. RUST_LOG overrides --log-level when set.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+    fmt().with_env_filter(filter).with_target(false).init();
+
     shell::run(args.db, args.bootstrap, args.port).await
 }
-
