@@ -111,6 +111,13 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: \
             -s -k "$KEYCHAIN_PASSWORD" build.keychain
 
+      # Only expose the signing identity when a certificate was actually imported.
+      # If this step is skipped, APPLE_SIGNING_IDENTITY is never set, so Tauri
+      # will not attempt to call codesign at all.
+      - name: Set Apple signing identity
+        if: matrix.platform == 'macos' && env.APPLE_CERTIFICATE != ''
+        run: echo "APPLE_SIGNING_IDENTITY=${{ secrets.APPLE_SIGNING_IDENTITY }}" >> $GITHUB_ENV
+
       # ── Tauri build ──────────────────────────────────────────────────────────
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
@@ -120,7 +127,9 @@ jobs:
           APPLE_ID:                    ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD:              ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID:               ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_SIGNING_IDENTITY:      ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # APPLE_SIGNING_IDENTITY is injected into $GITHUB_ENV only when a
+          # certificate was imported (see "Set Apple signing identity" step).
+          # Omitting it here prevents codesign from running with an empty identity.
           # Tauri updater signing (optional — set to enable auto-updates)
           TAURI_SIGNING_PRIVATE_KEY:          ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}

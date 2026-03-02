@@ -3,6 +3,10 @@ name = "scp2p-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Interactive command-line client for the SCP2P peer-to-peer network"
+keywords = ["p2p", "cli", "content-sharing", "scp2p"]
+categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 anyhow.workspace = true

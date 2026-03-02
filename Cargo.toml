@@ -12,6 +12,7 @@ resolver = "2"
 edition = "2024"
 license = "MPL-2.0"
 version = "0.1.0"
+repository = "https://github.com/techartdev/scp2p"
 
 [workspace.dependencies]
 anyhow = "1"

@@ -3,6 +3,7 @@ name = "scp2p-relay"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "Standalone relay node for the SCP2P network — easy to deploy on any OS"
 readme = "README.md"
 keywords = ["p2p", "relay", "nat-traversal", "scp2p"]

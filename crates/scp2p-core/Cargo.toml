@@ -3,6 +3,10 @@ name = "scp2p-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Core protocol library for the SCP2P peer-to-peer content-sharing network"
+keywords = ["p2p", "dht", "content-sharing", "scp2p"]
+categories = ["network-programming", "cryptography"]
 
 [dependencies]
 anyhow.workspace = true
