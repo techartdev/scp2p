@@ -5,19 +5,19 @@
 #
 # Usage:
 #   Install relay (default):
-#     curl -sSfL https://raw.githubusercontent.com/your-org/scp2p/main/install.sh | sh
+#     curl -sSfL https://github.com/techartdev/scp2p/raw/main/install.sh | sh
 #
 #   Install CLI:
-#     curl -sSfL https://raw.githubusercontent.com/your-org/scp2p/main/install.sh | sh -s -- --tool cli
+#     curl -sSfL https://github.com/techartdev/scp2p/raw/main/install.sh | sh -s -- --tool cli
 #
 #   Pin a version:
-#     curl -sSfL https://raw.githubusercontent.com/your-org/scp2p/main/install.sh | sh -s -- --version 0.1.0
+#     curl -sSfL https://github.com/techartdev/scp2p/raw/main/install.sh | sh -s -- --version 0.1.0
 #
 #   Custom install dir:
-#     curl -sSfL https://raw.githubusercontent.com/your-org/scp2p/main/install.sh | sh -s -- --dir ~/bin
+#     curl -sSfL https://github.com/techartdev/scp2p/raw/main/install.sh | sh -s -- --dir ~/bin
 set -e
 
-REPO="your-org/scp2p"
+REPO="techartdev/scp2p"
 INSTALL_DIR="${SCP2P_INSTALL_DIR:-/usr/local/bin}"
 
 # ── Argument parsing ────────────────────────────────────────────────────────
