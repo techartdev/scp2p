@@ -24,6 +24,7 @@ import { decodeShareLink, isShareLink } from "@/lib/shareLink";
 import type {
   CommunityView,
   CommunityBrowseView,
+  CreateCommunityResult,
   RuntimeStatus,
   PageId,
 } from "@/lib/types";
@@ -47,6 +48,11 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
     null
   );
   const [browsing, setBrowsing] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [createName, setCreateName] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [createResult, setCreateResult] =
+    useState<CreateCommunityResult | null>(null);
 
   const loadCommunities = useCallback(async () => {
     setLoading(true);
@@ -119,6 +125,27 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
     setBrowsing(false);
   };
 
+  const handleCreate = async () => {
+    if (!createName.trim()) return;
+    setCreating(true);
+    try {
+      const result = await cmd.createCommunity(createName.trim());
+      setCommunities((prev) => {
+        const exists = prev.some((c) => c.share_id_hex === result.share_id_hex);
+        if (exists) return prev;
+        return [
+          ...prev,
+          { share_id_hex: result.share_id_hex, share_pubkey_hex: result.share_pubkey_hex },
+        ];
+      });
+      setCreateResult(result);
+    } catch (e) {
+      setError(String(e));
+      setShowCreate(false);
+    }
+    setCreating(false);
+  };
+
   return (
     <NodeRequiredOverlay status={status} onNavigate={onNavigate}>
       <PageContent>
@@ -135,6 +162,14 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
               loading={loading}
             >
               Refresh
+            </Button>
+            <Button
+              variant="secondary"
+              size="sm"
+              icon={<Plus className="h-3.5 w-3.5" />}
+              onClick={() => { setCreateName(""); setCreateResult(null); setShowCreate(true); }}
+            >
+              Create
             </Button>
             <Button
               variant="primary"
@@ -310,6 +345,91 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
           </Card>
         </div>
       )}
+
+      {/* Create Community modal */}
+      <Modal
+        open={showCreate}
+        onClose={() => { setShowCreate(false); setCreateResult(null); }}
+        title={createResult ? "Community Created" : "Create New Community"}
+        footer={
+          createResult ? (
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => { setShowCreate(false); setCreateResult(null); }}
+            >
+              Done
+            </Button>
+          ) : (
+            <>
+              <Button variant="ghost" size="sm" onClick={() => setShowCreate(false)}>
+                Cancel
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={handleCreate}
+                loading={creating}
+                disabled={!createName.trim()}
+              >
+                Create
+              </Button>
+            </>
+          )
+        }
+      >
+        {createResult ? (
+          <div className="space-y-4">
+            <div className="rounded-xl bg-warning/10 border border-warning/30 px-4 py-3">
+              <p className="text-sm font-semibold text-warning">
+                Save your private key now!
+              </p>
+              <p className="text-xs text-text-secondary mt-1">
+                This is the only time it will be shown. You need it to publish
+                content inside this community.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <p className="text-xs font-semibold text-text-secondary uppercase tracking-wider">
+                Share ID
+              </p>
+              <p className="text-xs font-mono break-all selectable bg-surface-elevated px-3 py-2 rounded-xl border border-border-subtle">
+                {createResult.share_id_hex}
+              </p>
+            </div>
+            <div className="space-y-2">
+              <p className="text-xs font-semibold text-text-secondary uppercase tracking-wider">
+                Public Key
+              </p>
+              <p className="text-xs font-mono break-all selectable bg-surface-elevated px-3 py-2 rounded-xl border border-border-subtle">
+                {createResult.share_pubkey_hex}
+              </p>
+            </div>
+            <div className="space-y-2">
+              <p className="text-xs font-semibold text-warning uppercase tracking-wider">
+                Private Key (keep secret)
+              </p>
+              <p className="text-xs font-mono break-all selectable bg-surface-elevated px-3 py-2 rounded-xl border border-warning/30">
+                {createResult.private_key_hex}
+              </p>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <p className="text-sm text-text-secondary">
+              A fresh keypair will be generated. Share the resulting Share ID
+              and public key so others can join.
+            </p>
+            <Input
+              label="Community Name"
+              placeholder="e.g. My Research Team"
+              value={createName}
+              onChange={(e) => setCreateName(e.target.value)}
+              hint="Used as a local label to identify this community's key"
+            />
+          </div>
+        )}
+      </Modal>
 
       {/* Join modal */}
       <Modal

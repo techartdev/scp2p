@@ -6,8 +6,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use scp2p_core::SubscriptionTrustLevel;
 use scp2p_desktop::{
-    CommunityBrowseView, CommunityView, DesktopAppState, DesktopClientConfig, OwnedShareView,
-    PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
+    CommunityBrowseView, CommunityView, CreateCommunityResult, DesktopAppState, DesktopClientConfig,
+    OwnedShareView, PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
     SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView, SyncResultView, commands,
 };
 use serde::Serialize;
@@ -158,6 +158,16 @@ async fn leave_community(
     share_id_hex: String,
 ) -> Result<Vec<CommunityView>, String> {
     commands::leave_community(&state.0, share_id_hex)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn create_community(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<CreateCommunityResult, String> {
+    commands::create_community(&state.0, name)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -395,6 +405,7 @@ pub fn run() {
             join_community,
             leave_community,
             browse_community,
+            create_community,
             search_catalogs,
             browse_public_shares,
             subscribe_public_share,

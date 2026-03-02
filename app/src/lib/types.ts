@@ -49,6 +49,15 @@ export interface CommunityView {
   share_pubkey_hex: string;
 }
 
+/** Returned when a new community is created via `create_community`. */
+export interface CreateCommunityResult {
+  share_id_hex: string;
+  share_pubkey_hex: string;
+  /** Raw Ed25519 signing key hex — keep this secret and back it up. */
+  private_key_hex: string;
+  name: string;
+}
+
 export interface CommunityParticipantView {
   community_share_id_hex: string;
   peer_addr: string;

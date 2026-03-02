@@ -1,0 +1,26 @@
+<svg width="400" height="120" viewBox="0 0 400 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <g transform="translate(10, 10) scale(0.2)">
+    <!-- Network connections -->
+    <path d="M256 120 L384 256 L256 392 L128 256 Z" stroke="#60A5FA" stroke-width="32" stroke-linejoin="round"/>
+    <path d="M256 120 L256 392" stroke="#60A5FA" stroke-width="32" stroke-linecap="round"/>
+    <path d="M128 256 L384 256" stroke="#60A5FA" stroke-width="32" stroke-linecap="round"/>
+    
+    <!-- Outer ring representing the bounded discovery/community -->
+    <circle cx="256" cy="256" r="210" stroke="#60A5FA" stroke-width="24" stroke-dasharray="40 20"/>
+
+    <!-- Nodes (Peers) -->
+    <circle cx="256" cy="120" r="48" fill="#3B82F6"/>
+    <circle cx="384" cy="256" r="48" fill="#3B82F6"/>
+    <circle cx="256" cy="392" r="48" fill="#3B82F6"/>
+    <circle cx="128" cy="256" r="48" fill="#3B82F6"/>
+    <circle cx="256" cy="256" r="48" fill="#93C5FD"/>
+
+    <!-- Inner dots for the nodes -->
+    <circle cx="256" cy="120" r="20" fill="#111827"/>
+    <circle cx="384" cy="256" r="20" fill="#111827"/>
+    <circle cx="256" cy="392" r="20" fill="#111827"/>
+    <circle cx="128" cy="256" r="20" fill="#111827"/>
+    <circle cx="256" cy="256" r="20" fill="#111827"/>
+  </g>
+  <text x="130" y="82" font-family="system-ui, -apple-system, sans-serif" font-weight="800" font-size="64" fill="#F9FAFB" letter-spacing="-0.02em">SCP2P</text>
+</svg>

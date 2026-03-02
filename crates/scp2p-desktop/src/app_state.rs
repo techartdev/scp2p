@@ -24,10 +24,10 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 
 use crate::dto::{
-    CommunityBrowseView, CommunityParticipantView, CommunityView, DesktopClientConfig,
-    OwnedShareView, PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
-    SearchResultView, SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
-    SyncResultView,
+    CommunityBrowseView, CommunityParticipantView, CommunityView, CreateCommunityResult,
+    DesktopClientConfig, OwnedShareView, PeerView, PublicShareView, PublishResultView,
+    PublishVisibility, RuntimeStatus, SearchResultView, SearchResultsView, ShareItemView,
+    StartNodeRequest, SubscriptionView, SyncResultView,
 };
 
 #[derive(Clone, Default)]
@@ -270,6 +270,31 @@ impl DesktopAppState {
         let share_id = parse_hex_32(share_id_hex, "share_id")?;
         node.leave_community(scp2p_core::ShareId(share_id)).await?;
         self.community_views().await
+    }
+
+    /// Create a new community.
+    ///
+    /// Generates a fresh Ed25519 keypair, persists it under the label
+    /// `"community:<name>"` so it survives restarts, registers this node
+    /// as a member via `join_community`, and returns the community
+    /// identifiers together with the private key.
+    ///
+    /// > **Warning**: The caller must save `private_key_hex`.  It is the
+    /// > only way to publish content inside this community in the future.
+    pub async fn create_community(&self, name: &str) -> anyhow::Result<CreateCommunityResult> {
+        let node = self.node_handle().await?;
+        let label = format!("community:{}", name.trim());
+        let keypair = node.ensure_publisher_identity(&label).await?;
+        let share_id = keypair.share_id();
+        let share_pubkey = keypair.verifying_key();
+        node.join_community(share_id, share_pubkey.to_bytes())
+            .await?;
+        Ok(CreateCommunityResult {
+            share_id_hex: hex::encode(share_id.0),
+            share_pubkey_hex: hex::encode(share_pubkey.to_bytes()),
+            private_key_hex: hex::encode(keypair.signing_key.to_bytes()),
+            name: name.trim().to_string(),
+        })
     }
 
     /// Auto-start the node from saved config if `auto_start` is enabled.

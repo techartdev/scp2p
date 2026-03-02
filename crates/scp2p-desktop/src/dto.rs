@@ -87,6 +87,20 @@ pub struct CommunityView {
     pub share_pubkey_hex: String,
 }
 
+/// Returned when a new community is created.
+///
+/// The `private_key_hex` is the raw Ed25519 signing key — the creator must save
+/// it to publish content inside this community in the future.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CreateCommunityResult {
+    pub share_id_hex: String,
+    pub share_pubkey_hex: String,
+    /// Raw Ed25519 signing key (hex). Keep this secret and back it up.
+    pub private_key_hex: String,
+    /// Human-readable label chosen at creation time.
+    pub name: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommunityParticipantView {
     pub community_share_id_hex: String,
@@ -222,6 +236,20 @@ mod tests {
         let bytes = scp2p_core::cbor::to_vec(&view).expect("encode");
         let decoded: CommunityView = scp2p_core::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, view);
+    }
+
+    #[test]
+    fn create_community_result_serde_roundtrip() {
+        let result = CreateCommunityResult {
+            share_id_hex: "ab".repeat(32),
+            share_pubkey_hex: "cd".repeat(32),
+            private_key_hex: "ef".repeat(32),
+            name: "test-community".to_string(),
+        };
+        let bytes = scp2p_core::cbor::to_vec(&result).expect("encode");
+        let decoded: CreateCommunityResult =
+            scp2p_core::cbor::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, result);
     }
 
     #[test]

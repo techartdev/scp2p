@@ -7,9 +7,10 @@
 use crate::{
     app_state::DesktopAppState,
     dto::{
-        CommunityBrowseView, CommunityView, DesktopClientConfig, OwnedShareView, PeerView,
-        PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus, SearchResultsView,
-        ShareItemView, StartNodeRequest, SubscriptionView, SyncResultView,
+        CommunityBrowseView, CommunityView, CreateCommunityResult, DesktopClientConfig,
+        OwnedShareView, PeerView, PublicShareView, PublishResultView, PublishVisibility,
+        RuntimeStatus, SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
+        SyncResultView,
     },
 };
 use scp2p_core::SubscriptionTrustLevel;
@@ -231,6 +232,13 @@ pub async fn leave_community(
     share_id_hex: String,
 ) -> anyhow::Result<Vec<CommunityView>> {
     app_state.leave_community(&share_id_hex).await
+}
+
+pub async fn create_community(
+    app_state: &DesktopAppState,
+    name: String,
+) -> anyhow::Result<CreateCommunityResult> {
+    app_state.create_community(&name).await
 }
 
 pub async fn auto_start_node(

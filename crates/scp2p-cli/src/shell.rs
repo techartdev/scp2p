@@ -5,7 +5,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{io::IsTerminal, net::SocketAddr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
@@ -14,9 +14,9 @@ use inquire::{InquireError, Select, Text};
 use rand::rngs::OsRng;
 use scp2p_core::{
     BoxedStream, Capabilities, DirectRequestTransport, FetchPolicy, Node, NodeConfig, NodeId,
-    PeerAddr, PeerConnector, SearchQuery, ShareId, ShareVisibility, SqliteStore, Store,
-    TransportProtocol, build_tls_server_handle, quic_connect_bi_session_insecure,
-    tls_connect_session_insecure,
+    PeerAddr, PeerConnector, PersistedCommunity, SearchQuery, ShareId, ShareVisibility,
+    SqliteStore, Store, TransportProtocol, build_tls_server_handle,
+    quic_connect_bi_session_insecure, tls_connect_session_insecure,
 };
 
 // ── Internal connector ────────────────────────────────────────────────────────
@@ -124,22 +124,7 @@ pub async fn run(db: String, bootstrap_raw: Vec<String>, port: u16) -> anyhow::R
     let ctx = Ctx { node, node_key, node_id, share_id, db, port, bootstrap_peers };
 
     // ── Welcome banner ────────────────────────────────────────────────────────
-    println!();
-    println!("  ╔══════════════════════════════════════════╗");
-    println!("  ║        SCP2P Interactive Shell           ║");
-    println!("  ╚══════════════════════════════════════════╝");
-    println!("  Node ID  : {}", hex::encode(ctx.node_id.0));
-    println!("  Share ID : {}", hex::encode(ctx.share_id.0));
-    println!("  Database : {}", ctx.db);
-    println!("  TCP port : {port}");
-    println!(
-        "  Network  : {}",
-        if ctx.bootstrap_peers.is_empty() {
-            "offline – no bootstrap peers".to_owned()
-        } else {
-            format!("{} bootstrap peer(s)", ctx.bootstrap_peers.len())
-        }
-    );
+    print_banner(&ctx);
     println!();
 
     // ── Main REPL loop ────────────────────────────────────────────────────────
@@ -150,6 +135,7 @@ pub async fn run(db: String, bootstrap_raw: Vec<String>, port: u16) -> anyhow::R
             "📁  Publish folder",
             "📚  Browse / inspect a share",
             "🔔  Subscriptions",
+            "🏘  Communities",
             "🔍  Search",
             "⬇   Download by content ID",
             "⬇   Download share",
@@ -171,6 +157,7 @@ pub async fn run(db: String, bootstrap_raw: Vec<String>, port: u16) -> anyhow::R
             c if c.contains("Publish folder") => cmd_publish_folder(&ctx).await,
             c if c.contains("Browse") => cmd_browse_share(&ctx).await,
             c if c.contains("Subscription") => cmd_subscriptions(&ctx).await,
+            c if c.contains("Communit") => cmd_communities(&ctx).await,
             c if c.contains("Search") => cmd_search(&ctx).await,
             c if c.contains("content ID") => cmd_download_content(&ctx).await,
             c if c.contains("Download share") => cmd_download_share(&ctx).await,
@@ -423,6 +410,186 @@ async fn cmd_subscriptions(ctx: &Ctx) -> anyhow::Result<()> {
             c if c.contains("Sync") => {
                 cmd_sync(ctx).await?;
             }
+            _ => return Ok(()),
+        }
+    }
+}
+
+// ── Communities ───────────────────────────────────────────────────────────────
+
+async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
+    loop {
+        let sub_actions = vec![
+            "📋  List communities",
+            "➕  Create a new community",
+            "🔗  Join a community",
+            "🚪  Leave a community",
+            "🔍  Browse a community",
+            "\u{2190}   Back",
+        ];
+
+        println!();
+        let choice = match opt(Select::new("Communities:", sub_actions).prompt())? {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+
+        match choice {
+            // ── List ─────────────────────────────────────────────────────────
+            c if c.contains("List") => {
+                let communities = ctx.node.communities().await;
+                if communities.is_empty() {
+                    println!("\n  No communities joined yet.");
+                } else {
+                    println!("\n  {} community / communities:", communities.len());
+                    for c in &communities {
+                        println!(
+                            "  share_id={}  pubkey={}",
+                            hex::encode(c.share_id),
+                            hex::encode(c.share_pubkey),
+                        );
+                    }
+                }
+            }
+
+            // ── Create ───────────────────────────────────────────────────────
+            c if c.contains("Create") => {
+                let name = match opt(Text::new("Community name (local label):").prompt())? {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let label = format!("community:{}", name.trim());
+                let pb = spinner("Generating community keypair…");
+                let keypair = ctx.node.ensure_publisher_identity(&label).await?;
+                let share_id = keypair.share_id();
+                let share_pubkey = keypair.verifying_key();
+                ctx.node
+                    .join_community(share_id, share_pubkey.to_bytes())
+                    .await?;
+                pb.finish_and_clear();
+
+                let sid_hex = hex::encode(share_id.0);
+                let pk_hex  = hex::encode(share_pubkey.to_bytes());
+                let sk_hex  = hex::encode(keypair.signing_key.to_bytes());
+
+                println!();
+                println!("  \u{2713}  Community created");
+                println!("  Share ID   : {sid_hex}");
+                println!("  Public Key : {pk_hex}");
+                println!();
+                println!("  \u{26a0}  PRIVATE KEY (save this — it will not be shown again):");
+                println!("  {sk_hex}");
+            }
+
+            // ── Join ─────────────────────────────────────────────────────────
+            c if c.contains("Join") => {
+                let share_id_hex = match opt(
+                    Text::new("Community Share ID (64 hex chars):").prompt(),
+                )? {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let pubkey_hex = match opt(
+                    Text::new("Community Public Key (64 hex chars):").prompt(),
+                )? {
+                    Some(s) => s,
+                    None => continue,
+                };
+
+                let share_id = parse_hex_32(&share_id_hex, "share_id")?;
+                let share_pubkey = parse_hex_32(&pubkey_hex, "share_pubkey")?;
+                ctx.node
+                    .join_community(ShareId(share_id), share_pubkey)
+                    .await?;
+                println!("\n  \u{2713}  Joined community {}", hex::encode(share_id));
+            }
+
+            // ── Leave ─────────────────────────────────────────────────────────
+            c if c.contains("Leave") => {
+                let communities: Vec<PersistedCommunity> = ctx.node.communities().await;
+                if communities.is_empty() {
+                    println!("\n  No communities to leave.");
+                    continue;
+                }
+                let choices: Vec<String> = communities
+                    .iter()
+                    .map(|c| format!("{}...", hex::encode(&c.share_id[..8])))
+                    .collect();
+                let pick = match opt(
+                    Select::new("Pick a community to leave:", choices.clone()).prompt(),
+                )? {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let idx = choices.iter().position(|ch| *ch == pick).unwrap_or(0);
+                let target = &communities[idx];
+                ctx.node.leave_community(ShareId(target.share_id)).await?;
+                println!(
+                    "\n  \u{2713}  Left community {}",
+                    hex::encode(target.share_id)
+                );
+            }
+
+            // ── Browse ────────────────────────────────────────────────────────
+            c if c.contains("Browse") => {
+                let communities: Vec<PersistedCommunity> = ctx.node.communities().await;
+                if communities.is_empty() {
+                    println!("\n  No communities joined yet.");
+                    continue;
+                }
+                if ctx.bootstrap_peers.is_empty() {
+                    println!(
+                        "\n  No bootstrap peers configured — unable to browse without peers."
+                    );
+                    continue;
+                }
+
+                let choices: Vec<String> = communities
+                    .iter()
+                    .map(|c| format!("{}...", hex::encode(&c.share_id[..8])))
+                    .collect();
+                let pick = match opt(
+                    Select::new("Pick a community to browse:", choices.clone()).prompt(),
+                )? {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let idx = choices.iter().position(|ch| *ch == pick).unwrap_or(0);
+                let community = &communities[idx];
+
+                let transport = ctx.transport();
+                let pb = spinner("Querying peers for community status…");
+                let mut participants = Vec::new();
+                for peer in &ctx.bootstrap_peers {
+                    if let Ok(true) = ctx
+                        .node
+                        .fetch_community_status_from_peer(
+                            &transport,
+                            peer,
+                            ShareId(community.share_id),
+                            community.share_pubkey,
+                        )
+                        .await
+                    {
+                        participants.push(format!("{}:{}", peer.ip, peer.port));
+                    }
+                }
+                pb.finish_and_clear();
+
+                println!(
+                    "\n  Community {}",
+                    hex::encode(community.share_id)
+                );
+                if participants.is_empty() {
+                    println!("  No participants discovered via bootstrap peers.");
+                } else {
+                    println!("  {} participant(s):", participants.len());
+                    for p in &participants {
+                        println!("    {p}");
+                    }
+                }
+            }
+
             _ => return Ok(()),
         }
     }
@@ -718,4 +885,54 @@ fn prompt_extra_peers() -> anyhow::Result<Vec<PeerAddr>> {
         .collect())
 }
 
+// ── Logo banner ───────────────────────────────────────────────────────────────
+//
+// Mirrors the SVG icon geometry:
+//   • 4 peer nodes (N/E/S/W) at the diamond corners  ●
+//   • center node ◉ where the cross lines meet
+//   • vertical + horizontal cross through center      │ ─
+//   • diamond outline (NW↗NE↘SE↙SW)                  ╱ ╲
+//   • outer dashed ring                               ·
+//
+// Column positions (0-indexed from line start, after 2-space indent):
+//   ◉ center col 19 │ top ● col 19 │ left ● col 6 │ right ● col 32 │ bot ● col 19
+//
+fn print_banner(ctx: &Ctx) {
+    let col = std::io::stdout().is_terminal();
+    let b = if col { "\x1b[94m" } else { "" }; // bright blue  — nodes + lines
+    let d = if col { "\x1b[2m"  } else { "" }; // dim          — ring dots
+    let r = if col { "\x1b[0m"  } else { "" }; // reset
+    let w = if col { "\x1b[1m"  } else { "" }; // bold         — wordmark
 
+    println!();
+    //                              col: 0         1         2         3
+    //                                   0123456789012345678901234567890123456
+    println!("  {d}             · · · · · ·{r}");               // ring top
+    println!("  {d}     ·                     ·{r}");             // ring arc
+    println!("  {d}   · {r}            {b}●{r}{d}            ·{r}"); // top node (col 19)
+    println!("  {d}  · {r}         {b}╱   │   ╲{r}{d}          ·{r}"); // diag row 1
+    println!("  {d} · {r}     {b}╱        │        ╲{r}{d}      ·{r}"); // diag row 2
+    println!("  {d}·{r}   {b}●────────────◉────────────●{r}   {d}·{r}"); // horizontal
+    println!("  {d} · {r}     {b}╲        │        ╱{r}{d}      ·{r}"); // diag row 2
+    println!("  {d}  · {r}         {b}╲   │   ╱{r}{d}         ·{r}"); // diag row 1
+    println!("  {d}   · {r}            {b}●{r}{d}           ·{r}"); // bottom node
+    println!("  {d}     ·                     ·{r}"); // ring arc
+    println!("  {d}             · · · · · ·{r}");               // ring bottom
+    println!();
+    println!("  {w}           S  C  P  2  P{r}  \u{2014}  Interactive Shell");
+    println!();
+
+    // ── Node info ────────────────────────────────────────────────────────────
+    println!("  Node ID  : {}", hex::encode(ctx.node_id.0));
+    println!("  Share ID : {}", hex::encode(ctx.share_id.0));
+    println!("  Database : {}", ctx.db);
+    println!("  TCP port : {}", ctx.port);
+    println!(
+        "  Network  : {}",
+        if ctx.bootstrap_peers.is_empty() {
+            "offline \u{2013} no bootstrap peers".to_owned()
+        } else {
+            format!("{} bootstrap peer(s)", ctx.bootstrap_peers.len())
+        }
+    );
+}
