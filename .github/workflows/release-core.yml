@@ -185,7 +185,8 @@ jobs:
     needs: build-cli          # wait for a successful build before publishing
     runs-on: ubuntu-22.04
     # Skip entirely if the secret is absent (e.g. forks, first-time setup).
-    if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    # Checked at step level because `secrets` context is not available in
+    # job-level `if` expressions.
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
@@ -205,14 +206,17 @@ jobs:
       # the new version before the next crate tries to resolve it.
 
       - name: Publish scp2p-core
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
         run: |
           cargo publish --package scp2p-core --no-verify
           sleep 20
 
       - name: Publish scp2p-cli
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
         run: |
           cargo publish --package scp2p-cli --no-verify
           sleep 20
 
       - name: Publish scp2p-relay
+        if: ${{ env.CARGO_REGISTRY_TOKEN != '' }}
         run: cargo publish --package scp2p-relay --no-verify
