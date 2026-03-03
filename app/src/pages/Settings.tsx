@@ -5,10 +5,13 @@ import {
   FolderOpen,
   Server,
   Shield,
+  Plus,
+  Trash2,
 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
-import { Input, TextArea } from "@/components/ui/Input";
+import { Input } from "@/components/ui/Input";
+import { Modal } from "@/components/ui/Modal";
 import { PageHeader, PageContent } from "@/components/layout/Layout";
 import * as cmd from "@/lib/commands";
 import type { DesktopClientConfig, RuntimeStatus } from "@/lib/types";
@@ -27,7 +30,7 @@ export function Settings({ status }: SettingsProps) {
     bootstrap_peers: [],
     auto_start: false,
   });
-  const [bootstrapText, setBootstrapText] = useState("");
+  const [bootstrapPeers, setBootstrapPeers] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{
@@ -35,13 +38,20 @@ export function Settings({ status }: SettingsProps) {
     text: string;
   } | null>(null);
 
+  // Add-peer dialog state
+  const [showAddPeer, setShowAddPeer] = useState(false);
+  const [peerIp, setPeerIp] = useState("");
+  const [peerTcpPort, setPeerTcpPort] = useState("7001");
+  const [peerQuicPort, setPeerQuicPort] = useState("7000");
+  const [peerTransport, setPeerTransport] = useState<"tcp" | "quic">("tcp");
+
   const handleLoad = async () => {
     setLoading(true);
     setMessage(null);
     try {
       const loaded = await cmd.loadClientConfig(CONFIG_FILE);
       setConfig(loaded);
-      setBootstrapText(loaded.bootstrap_peers.join("\n"));
+      setBootstrapPeers(loaded.bootstrap_peers);
       setMessage({ type: "success", text: "Configuration loaded" });
     } catch (e) {
       setMessage({ type: "error", text: String(e) });
@@ -55,10 +65,7 @@ export function Settings({ status }: SettingsProps) {
     try {
       const toSave: DesktopClientConfig = {
         ...config,
-        bootstrap_peers: bootstrapText
-          .split("\n")
-          .map((s) => s.trim())
-          .filter(Boolean),
+        bootstrap_peers: bootstrapPeers,
       };
       await cmd.saveClientConfig(CONFIG_FILE, toSave);
       setMessage({ type: "success", text: "Configuration saved" });
@@ -66,6 +73,33 @@ export function Settings({ status }: SettingsProps) {
       setMessage({ type: "error", text: String(e) });
     }
     setSaving(false);
+  };
+
+  const openAddPeerDialog = () => {
+    setPeerIp("");
+    setPeerTcpPort("7001");
+    setPeerQuicPort("7000");
+    setPeerTransport("tcp");
+    setShowAddPeer(true);
+  };
+
+  const handleAddPeer = () => {
+    const ip = peerIp.trim();
+    if (!ip) return;
+    const port =
+      peerTransport === "tcp" ? peerTcpPort.trim() : peerQuicPort.trim();
+    const addr =
+      peerTransport === "quic"
+        ? `quic://${ip}:${port || "7000"}`
+        : `${ip}:${port || "7001"}`;
+    if (!bootstrapPeers.includes(addr)) {
+      setBootstrapPeers([...bootstrapPeers, addr]);
+    }
+    setShowAddPeer(false);
+  };
+
+  const handleRemovePeer = (index: number) => {
+    setBootstrapPeers(bootstrapPeers.filter((_, i) => i !== index));
   };
 
   // Try to load config on mount
@@ -168,17 +202,132 @@ export function Settings({ status }: SettingsProps) {
             title="Bootstrap Peers"
             subtitle="Initial peers to connect to on startup"
             icon={<Shield className="h-4 w-4" />}
+            action={
+              <Button
+                variant="primary"
+                size="sm"
+                icon={<Plus className="h-3.5 w-3.5" />}
+                onClick={openAddPeerDialog}
+              >
+                Add Peer
+              </Button>
+            }
           />
-          <TextArea
-            placeholder={"192.168.1.10:7001\n192.168.1.11:7001"}
-            value={bootstrapText}
-            onChange={(e) => setBootstrapText(e.target.value)}
-            rows={8}
-            hint="One peer address per line (ip:port)"
-            className="font-mono text-xs"
-          />
+          {bootstrapPeers.length === 0 ? (
+            <p className="text-xs text-text-muted py-4 text-center">
+              No bootstrap peers configured
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {bootstrapPeers.map((peer, i) => (
+                <div
+                  key={i}
+                  className="flex items-center justify-between gap-2 bg-surface rounded-lg px-3 py-2 border border-border"
+                >
+                  <span className="text-xs font-mono text-text-primary truncate">
+                    {peer}
+                  </span>
+                  <button
+                    onClick={() => handleRemovePeer(i)}
+                    className="p-1 rounded text-text-muted hover:text-danger transition-colors shrink-0"
+                    title="Remove peer"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </Card>
       </div>
+
+      {/* Add Peer Dialog */}
+      <Modal
+        open={showAddPeer}
+        onClose={() => setShowAddPeer(false)}
+        title="Add Bootstrap Peer"
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setShowAddPeer(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={handleAddPeer}
+              disabled={!peerIp.trim()}
+            >
+              Add
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          <Input
+            label="IP Address or Hostname"
+            placeholder="178.104.13.182"
+            value={peerIp}
+            onChange={(e) => setPeerIp(e.target.value)}
+            className="font-mono text-xs"
+            autoFocus
+          />
+
+          <div>
+            <label className="block text-xs font-medium text-text-secondary mb-1.5">
+              Transport
+            </label>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setPeerTransport("tcp")}
+                className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
+                  peerTransport === "tcp"
+                    ? "bg-accent/10 border-accent text-accent"
+                    : "bg-surface border-border text-text-muted hover:text-text-primary"
+                }`}
+              >
+                TCP
+              </button>
+              <button
+                onClick={() => setPeerTransport("quic")}
+                className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
+                  peerTransport === "quic"
+                    ? "bg-accent/10 border-accent text-accent"
+                    : "bg-surface border-border text-text-muted hover:text-text-primary"
+                }`}
+              >
+                QUIC
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <Input
+              label="TCP Port"
+              placeholder="7001"
+              value={peerTcpPort}
+              onChange={(e) => setPeerTcpPort(e.target.value)}
+              className="font-mono text-xs"
+              disabled={peerTransport !== "tcp"}
+            />
+            <Input
+              label="QUIC Port"
+              placeholder="7000"
+              value={peerQuicPort}
+              onChange={(e) => setPeerQuicPort(e.target.value)}
+              className="font-mono text-xs"
+              disabled={peerTransport !== "quic"}
+            />
+          </div>
+
+          <p className="text-xs text-text-muted">
+            Default ports: TCP 7001, QUIC 7000. Most relays use TCP.
+          </p>
+        </div>
+      </Modal>
 
       {/* Auto-start */}
       <Card className="mt-6">

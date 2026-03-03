@@ -246,7 +246,12 @@ impl NodeHandle {
                 .and_then(|mid| state.manifest_cache.get(&mid))
         };
 
-        let manifest = manifest.ok_or_else(|| anyhow::anyhow!("no manifest found for share"))?;
+        let manifest = manifest.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no manifest found for share {} — try syncing first",
+                hex::encode(share_id)
+            )
+        })?;
 
         Ok(manifest
             .items

@@ -11,11 +11,11 @@ use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use rand::{RngCore, rngs::OsRng};
 use scp2p_core::{
-    BoxedStream, Capabilities, DirectRequestTransport, FetchPolicy, ItemV1, ManifestV1, Node,
+    BoxedStream, Capabilities, FetchPolicy, ItemV1, ManifestV1, Node,
     NodeConfig, NodeHandle, OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord,
-    PublicShareSummary, SearchPageQuery, ShareItemInfo, ShareVisibility, SqliteStore, Store,
-    TransportProtocol, build_tls_server_handle, describe_content, quic_connect_bi_session_insecure,
-    start_quic_server, tls_connect_session_insecure,
+    PublicShareSummary, RelayAwareTransport, SearchPageQuery, ShareItemInfo, ShareVisibility,
+    SqliteStore, Store, TransportProtocol, build_tls_server_handle, describe_content,
+    quic_connect_bi_session_insecure, start_quic_server, tls_connect_session_insecure,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -365,7 +365,8 @@ impl DesktopAppState {
                 peers.push(record.addr);
             }
         }
-        let transport = DirectRequestTransport::new(self.build_connector().await);
+        let connector = self.build_connector().await;
+        let transport = RelayAwareTransport::new(&connector);
         node.sync_subscriptions_over_dht(&transport, &peers).await?;
         let subscriptions = self.subscription_views().await?;
         let updated_count = subscriptions
@@ -433,7 +434,8 @@ impl DesktopAppState {
             return Ok(Vec::new());
         }
 
-        let transport = DirectRequestTransport::new(self.build_connector().await);
+        let connector = self.build_connector().await;
+        let transport = RelayAwareTransport::new(&connector);
         let mut first_err = None;
         let mut views = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -493,7 +495,8 @@ impl DesktopAppState {
             });
         }
 
-        let transport = DirectRequestTransport::new(self.build_connector().await);
+        let connector = self.build_connector().await;
+        let transport = RelayAwareTransport::new(&connector);
         let mut participants = Vec::new();
         let mut public_shares = Vec::new();
         let mut seen_shares = std::collections::HashSet::new();
