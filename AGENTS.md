@@ -33,6 +33,40 @@ Implement SCP2P from `SPECIFICATION.md` in milestone-oriented increments, priori
 
 If any check cannot run due to environment limitations, explain exactly why in the final report.
 
+## Release procedure
+When bumping the version and publishing a release:
+
+1. **Bump versions** using the existing script (never edit version numbers manually):
+   ```powershell
+   .\scripts\bump-version.ps1 -Version X.Y.Z
+   ```
+   This updates: workspace `Cargo.toml`, all `scp2p-core` dep pins, `tauri.conf.json`, `package.json`, and `package-lock.json`.
+
+2. **Build & test** before committing:
+   ```powershell
+   cd app; npm run build; cd ..
+   cargo test --workspace
+   cargo clippy --workspace --all-targets -- -D warnings
+   ```
+
+3. **Commit** the version bump.
+
+4. **Create and push 3 annotated tags** (all three are required — the install scripts and CI depend on the tag prefixes):
+   | Tag pattern         | Purpose                                  |
+   |---------------------|------------------------------------------|
+   | `vX.Y.Z`           | Core / CLI release (install.sh default)  |
+   | `relay-vX.Y.Z`     | Relay binary release                     |
+   | `desktop-vX.Y.Z`   | Desktop app release                      |
+
+   ```powershell
+   git tag -a vX.Y.Z -m "vX.Y.Z: <summary>"
+   git tag -a relay-vX.Y.Z -m "relay-vX.Y.Z"
+   git tag -a desktop-vX.Y.Z -m "desktop-vX.Y.Z"
+   git push origin main vX.Y.Z relay-vX.Y.Z desktop-vX.Y.Z
+   ```
+
+5. **Never** create a custom/placeholder SVG logo — use `assets/icon.svg` directly (copy to `app/public/` if needed for the frontend).
+
 ## Skills
 A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and file path so you can open the source for full instructions when using a specific skill.
 
