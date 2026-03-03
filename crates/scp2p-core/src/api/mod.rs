@@ -374,8 +374,8 @@ impl Default for AbuseLimits {
     fn default() -> Self {
         Self {
             window_secs: 60,
-            max_total_requests_per_window: 360,
-            max_dht_requests_per_window: 180,
+            max_total_requests_per_window: 1200,
+            max_dht_requests_per_window: 600,
             max_fetch_requests_per_window: 240,
             max_relay_requests_per_window: 180,
             // 600 chunks × 256 KiB ≈ 150 MiB per minute per peer.

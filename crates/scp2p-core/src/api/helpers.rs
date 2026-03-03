@@ -448,8 +448,10 @@ pub(super) async fn replicate_store_to_closest<T: RequestTransport + ?Sized>(
         "replicate_store_to_closest: found closest peers"
     );
 
+    let deduped = dedup_peers_by_pubkey(peers);
+
     let mut stored = 0usize;
-    for peer in peers.into_iter().take(replication_factor) {
+    for peer in deduped.into_iter().take(replication_factor) {
         match query_store(transport, &peer, key, value.clone(), ttl_secs).await {
             Ok(()) => {
                 debug!(key = %key_hex, peer = ?peer, "replicate_store: stored on peer");
@@ -462,6 +464,52 @@ pub(super) async fn replicate_store_to_closest<T: RequestTransport + ?Sized>(
     }
     debug!(key = %key_hex, stored, "replicate_store_to_closest: done");
     Ok(stored)
+}
+
+/// Store a DHT value on a pre-resolved peer list (skips iterative lookup).
+///
+/// Returns `(stored_count, rate_limited)` so callers can back off when the
+/// remote peer is throttling.
+pub(super) async fn replicate_store_to_peers<T: RequestTransport + ?Sized>(
+    transport: &T,
+    key: [u8; 32],
+    value: Vec<u8>,
+    ttl_secs: u64,
+    peers: &[PeerAddr],
+    replication_factor: usize,
+) -> (usize, bool) {
+    let key_hex = hex::encode(&key[..8]);
+    let mut stored = 0usize;
+    let mut rate_limited = false;
+    for peer in peers.iter().take(replication_factor) {
+        match query_store(transport, peer, key, value.clone(), ttl_secs).await {
+            Ok(()) => {
+                debug!(key = %key_hex, peer = ?peer, "replicate_store_to_peers: stored");
+                stored += 1;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("rate limit") {
+                    debug!(key = %key_hex, peer = ?peer, "replicate_store_to_peers: rate limited");
+                    rate_limited = true;
+                    break;
+                }
+                debug!(key = %key_hex, peer = ?peer, error = %msg, "replicate_store_to_peers: failed");
+            }
+        }
+    }
+    (stored, rate_limited)
+}
+
+/// Deduplicate peers so that each unique pubkey (or IP:port:transport for
+/// peers without a pubkey hint) appears only once.  Keeps the first
+/// occurrence.
+fn dedup_peers_by_pubkey(peers: Vec<PeerAddr>) -> Vec<PeerAddr> {
+    let mut seen = HashSet::new();
+    peers
+        .into_iter()
+        .filter(|p| seen.insert(relay_peer_key(p)))
+        .collect()
 }
 
 /// Persist current state: snapshot under write-lock (to read and clear

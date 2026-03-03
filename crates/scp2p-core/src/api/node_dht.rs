@@ -31,7 +31,8 @@ use super::{
     NodeHandle,
     helpers::{
         merge_peer_list, now_unix_secs, peer_key, persist_state, query_find_node, query_find_value,
-        replicate_store_to_closest, sort_peers_for_target, validate_dht_value_for_known_keyspaces,
+        replicate_store_to_closest, replicate_store_to_peers, sort_peers_for_target,
+        validate_dht_value_for_known_keyspaces,
     },
 };
 
@@ -400,15 +401,42 @@ impl NodeHandle {
         };
         persist_state(self).await?;
 
+        let total = values.len();
         info!(
-            active_values = values.len(),
+            active_values = total,
             seed_peers = seed_peers.len(),
             "DHT republish: starting"
         );
 
+        // --- Resolve the peer list ONCE for the entire batch -----------
+        // With few peers (common: only the relay on QUIC + TCP) every
+        // iterative lookup returns the same set.  Doing it once avoids
+        // O(N) FindNode round-trips that burn through rate limits.
+        let representative_target = {
+            let mut t = [0u8; 20];
+            if let Some(v) = values.first() {
+                t.copy_from_slice(&v.key[..20]);
+            }
+            t
+        };
+        let cached_peers = self
+            .dht_find_node_iterative(transport, representative_target, seed_peers)
+            .await
+            .unwrap_or_default();
+
+        debug!(
+            cached_peers = cached_peers.len(),
+            "DHT republish: using cached peer list"
+        );
+
+        // Throttle: space out store bursts to stay well under the
+        // remote peer's per-window rate limit.
+        const INTER_VALUE_DELAY: Duration = Duration::from_millis(500);
+        // Back-off after a rate-limit error.
+        const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5);
+
         let mut republished = 0usize;
-        let total = values.len();
-        for value in values {
+        for (idx, value) in values.into_iter().enumerate() {
             if validate_dht_value_for_known_keyspaces(value.key, &value.value).is_err() {
                 debug!(
                     key = %hex::encode(&value.key[..8]),
@@ -418,18 +446,23 @@ impl NodeHandle {
                 continue;
             }
             let replication_factor = if value.is_popular() { K * 2 } else { K };
-            let replicated = replicate_store_to_closest(
+            let (stored, rate_limited) = replicate_store_to_peers(
                 transport,
-                self,
                 value.key,
                 value.value,
                 DEFAULT_TTL_SECS,
-                seed_peers,
+                &cached_peers,
                 replication_factor,
             )
-            .await?;
-            if replicated > 0 {
+            .await;
+            if stored > 0 {
                 republished += 1;
+            }
+            if rate_limited {
+                debug!("DHT republish: rate-limited, backing off");
+                tokio::time::sleep(RATE_LIMIT_BACKOFF).await;
+            } else if idx + 1 < total {
+                tokio::time::sleep(INTER_VALUE_DELAY).await;
             }
         }
         info!(republished, total, "DHT republish: complete");
