@@ -12,7 +12,7 @@ use anyhow::Context as _;
 use tracing::{debug, info};
 
 use crate::{
-    content::describe_content,
+    content::{describe_content, describe_content_file},
     dht::DEFAULT_TTL_SECS,
     dht_keys::{content_provider_key, manifest_loc_key, share_head_key},
     ids::{ManifestId, ShareId},
@@ -124,6 +124,35 @@ impl NodeHandle {
         Ok(content_id)
     }
 
+    /// Register a file as seedable content when the [`ChunkedContent`]
+    /// descriptor has already been computed (e.g. via streaming hashing).
+    ///
+    /// This avoids re-reading and re-hashing the file.
+    pub async fn register_content_precomputed(
+        &self,
+        peer: PeerAddr,
+        desc: crate::content::ChunkedContent,
+        path: PathBuf,
+    ) -> anyhow::Result<[u8; 32]> {
+        crate::blob_store::validate_no_traversal(&path)?;
+        let content_id = desc.content_id.0;
+        debug!(
+            content_id = hex::encode(content_id),
+            path = %path.display(),
+            "registering content (precomputed)"
+        );
+        let now = now_unix_secs()?;
+        let mut state = self.state.write().await;
+
+        state.content_catalog.insert(content_id, desc);
+        state.content_paths.insert(content_id, path);
+        state.dirty.content_paths = true;
+
+        upsert_provider(&mut state, content_id, peer, now)?;
+
+        Ok(content_id)
+    }
+
     /// Register in-memory bytes as seedable content.
     ///
     /// Writes `content_bytes` to `{data_dir}/{hex_content_id}.dat` then
@@ -169,12 +198,15 @@ impl NodeHandle {
             .map(|h| h.latest_seq.saturating_add(1))
             .unwrap_or(1);
 
-        let mut items = Vec::with_capacity(files.len());
-        for file_path in files {
-            let bytes = tokio::fs::read(file_path)
+        let total = files.len();
+        let mut items = Vec::with_capacity(total);
+        for (idx, file_path) in files.iter().enumerate() {
+            // Stream the file in 256 KiB chunks — never holds the full file
+            // in memory.  Returns the precomputed ChunkedContent descriptor.
+            let (desc, file_size) = describe_content_file(file_path)
                 .await
-                .with_context(|| format!("read {}", file_path.display()))?;
-            let desc = describe_content(&bytes);
+                .with_context(|| format!("hash {}", file_path.display()))?;
+
             let file_name = file_path
                 .file_name()
                 .unwrap_or_default()
@@ -199,7 +231,7 @@ impl NodeHandle {
             let mime = mime_from_extension(&file_name);
             items.push(ItemV1 {
                 content_id: desc.content_id.0,
-                size: bytes.len() as u64,
+                size: file_size,
                 name: file_name,
                 path: rel_path,
                 mime,
@@ -207,8 +239,23 @@ impl NodeHandle {
                 chunk_count: desc.chunk_count,
                 chunk_list_hash: desc.chunk_list_hash,
             });
-            self.register_content_by_path(provider.clone(), &bytes, file_path.to_path_buf())
-                .await?;
+            // Register using the already-computed descriptor — no re-read.
+            self.register_content_precomputed(
+                provider.clone(),
+                desc,
+                file_path.to_path_buf(),
+            )
+            .await?;
+
+            if total > 50 && (idx + 1) % 500 == 0 {
+                info!(
+                    progress = idx + 1,
+                    total,
+                    "publishing: hashed {}/{} files",
+                    idx + 1,
+                    total,
+                );
+            }
         }
 
         let manifest = ManifestV1 {
