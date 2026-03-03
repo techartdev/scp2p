@@ -1,15 +1,13 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState } from "react";
 import {
   Play,
   Square,
-  RefreshCw,
   Users,
   Globe,
   Bookmark,
   Wifi,
   HardDrive,
   AlertTriangle,
-  Clock,
   Compass,
   Settings,
   Rocket,
@@ -23,17 +21,16 @@ import { PageHeader, PageContent } from "@/components/layout/Layout";
 import * as cmd from "@/lib/commands";
 import type {
   RuntimeStatus,
-  PeerView,
-  SubscriptionView,
-  CommunityView,
   DesktopClientConfig,
   PageId,
 } from "@/lib/types";
+import type { BackgroundState } from "@/hooks/useBackgroundService";
 
 const CONFIG_FILE = "scp2p-desktop-config.cbor";
 
 interface DashboardProps {
   status: RuntimeStatus | null;
+  bg: BackgroundState;
   onRefresh: () => void;
   onNavigate: (page: PageId) => void;
 }
@@ -47,33 +44,12 @@ function timeAgo(unixSecs: number): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
-  const [peers, setPeers] = useState<PeerView[]>([]);
-  const [subs, setSubs] = useState<SubscriptionView[]>([]);
-  const [communities, setCommunities] = useState<CommunityView[]>([]);
+export function Dashboard({ status, bg, onRefresh, onNavigate }: DashboardProps) {
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
 
-  const loadStats = useCallback(async () => {
-    if (!status?.running) return;
-    try {
-      const [p, s, c] = await Promise.all([
-        cmd.listPeers(),
-        cmd.listSubscriptions(),
-        cmd.listCommunities(),
-      ]);
-      setPeers(p);
-      setSubs(s);
-      setCommunities(c);
-    } catch {
-      /* node might be stopping */
-    }
-  }, [status?.running]);
-
-  useEffect(() => {
-    loadStats();
-  }, [loadStats]);
+  const { peers, subscriptions: subs, communities } = bg;
 
   const handleStart = async () => {
     setStarting(true);
@@ -90,7 +66,7 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
           bind_tcp: "0.0.0.0:7001",
           bootstrap_peers: [],
           auto_start: false,
-          log_level: "info",
+          log_level: "error",
         };
       }
       await cmd.startNode({
@@ -100,7 +76,6 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
         bootstrap_peers: config.bootstrap_peers,
       });
       onRefresh();
-      await loadStats();
     } catch (e) {
       setStartError(String(e));
       console.error("start failed:", e);
@@ -113,9 +88,6 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
     try {
       await cmd.stopNode();
       onRefresh();
-      setPeers([]);
-      setSubs([]);
-      setCommunities([]);
     } catch (e) {
       console.error("stop failed:", e);
     }
@@ -135,17 +107,6 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
         subtitle="Node overview and quick actions"
         actions={
           <div className="flex items-center gap-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              icon={<RefreshCw className="h-3.5 w-3.5" />}
-              onClick={() => {
-                onRefresh();
-                loadStats();
-              }}
-            >
-              Refresh
-            </Button>
             {running ? (
               <Button
                 variant="danger"
@@ -193,12 +154,12 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
               </div>
               <div className="flex items-center gap-4 mt-1">
                 {status?.bind_tcp && (
-                  <span className="text-xs text-text-muted font-mono">
+                  <span className="text-xs text-text-muted font-mono selectable">
                     TCP {status.bind_tcp}
                   </span>
                 )}
                 {status?.bind_quic && (
-                  <span className="text-xs text-text-muted font-mono">
+                  <span className="text-xs text-text-muted font-mono selectable">
                     QUIC {status.bind_quic}
                   </span>
                 )}
@@ -406,45 +367,31 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
         </Card>
       )}
 
-      {/* Peers detail */}
+      {/* Recent peers — live */}
       {running && peers.length > 0 && (
         <Card>
           <CardHeader
-            title="Peers"
+            title="Recent Peers"
             subtitle={`${peers.length} known · ${recentPeers.length} online`}
             icon={<Users className="h-4 w-4" />}
           />
-          <div className="space-y-1.5">
-            {peers.map((peer) => {
+          <div className="space-y-1">
+            {peers.slice(0, 10).map((peer) => {
               const now = Math.floor(Date.now() / 1000);
               const isRecent = now - peer.last_seen_unix < 300;
               return (
                 <div
                   key={peer.addr}
-                  className="flex items-center justify-between px-3 py-2 rounded-xl bg-surface border border-border-subtle"
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg"
                 >
-                  <div className="flex items-center gap-3">
-                    <StatusDot
-                      status={isRecent ? "online" : "offline"}
-                      size="sm"
-                      label=""
-                    />
-                    <span className="text-xs font-mono text-text-primary selectable">
-                      {peer.addr}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <span className="text-[10px] text-text-muted flex items-center gap-1">
-                      <Clock className="h-3 w-3" />
-                      {timeAgo(peer.last_seen_unix)}
-                    </span>
-                    <Badge
-                      variant={peer.transport === "Tcp" ? "cyan" : "accent"}
-                      size="sm"
-                    >
-                      {peer.transport}
-                    </Badge>
-                  </div>
+                  <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${isRecent ? "bg-success" : "bg-text-muted"}`} />
+                  <span className="text-xs text-text-secondary font-mono selectable truncate flex-1">
+                    {peer.addr}
+                  </span>
+                  <Badge variant="default" size="sm">{peer.transport}</Badge>
+                  <span className="text-[10px] text-text-muted">
+                    {timeAgo(peer.last_seen_unix)}
+                  </span>
                 </div>
               );
             })}

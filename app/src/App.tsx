@@ -8,6 +8,7 @@ import { MyShares } from "@/pages/MyShares";
 import { Settings } from "@/pages/Settings";
 import { DownloadQueue } from "@/components/DownloadQueue";
 import { useDownloadQueue } from "@/hooks/useDownloadQueue";
+import { useBackgroundService } from "@/hooks/useBackgroundService";
 import { GripHorizontal } from "lucide-react";
 import * as cmd from "@/lib/commands";
 import type { RuntimeStatus, PageId } from "@/lib/types";
@@ -19,6 +20,7 @@ export default function App() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const autoStartAttempted = useRef(false);
   const downloadQueue = useDownloadQueue();
+  const bg = useBackgroundService(status?.running ?? false);
 
   // Resizable download queue panel
   const [queueHeight, setQueueHeight] = useState(180);
@@ -30,7 +32,6 @@ export default function App() {
       const s = await cmd.runtimeStatus();
       setStatus(s);
     } catch {
-      // node may not be ready yet
       setStatus({
         running: false,
         app_version: "",
@@ -62,7 +63,6 @@ export default function App() {
 
   useEffect(() => {
     refreshStatus();
-    // Poll status every 5 seconds
     const interval = setInterval(refreshStatus, 5000);
     return () => clearInterval(interval);
   }, [refreshStatus]);
@@ -73,14 +73,15 @@ export default function App() {
         return (
           <Dashboard
             status={status}
+            bg={bg}
             onRefresh={refreshStatus}
             onNavigate={setPage}
           />
         );
       case "discover":
-        return <Discover status={status} onNavigate={setPage} downloadQueue={downloadQueue} />;
+        return <Discover status={status} bg={bg} onNavigate={setPage} downloadQueue={downloadQueue} />;
       case "communities":
-        return <Communities status={status} onNavigate={setPage} />;
+        return <Communities status={status} bg={bg} onNavigate={setPage} />;
       case "search":
         return <SearchPage status={status} onNavigate={setPage} />;
       case "my-shares":
@@ -91,6 +92,7 @@ export default function App() {
         return (
           <Dashboard
             status={status}
+            bg={bg}
             onRefresh={refreshStatus}
             onNavigate={setPage}
           />

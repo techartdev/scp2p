@@ -1,12 +1,13 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   Settings as SettingsIcon,
   Save,
-  FolderOpen,
   Server,
   Shield,
   Plus,
   Trash2,
+  Copy,
+  Check,
 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -29,36 +30,41 @@ export function Settings({ status }: SettingsProps) {
     bind_tcp: "0.0.0.0:7001",
     bootstrap_peers: [],
     auto_start: false,
-    log_level: "info",
+    log_level: "error",
   });
   const [bootstrapPeers, setBootstrapPeers] = useState<string[]>([]);
   const [logFilePath, setLogFilePath] = useState<string>("");
-  const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{
     type: "success" | "error";
     text: string;
   } | null>(null);
+  const [copiedLogPath, setCopiedLogPath] = useState(false);
+
+  // Track the "clean" (saved) state for dirty detection
+  const savedConfigRef = useRef<string>("");
 
   // Add-peer dialog state
   const [showAddPeer, setShowAddPeer] = useState(false);
   const [peerIp, setPeerIp] = useState("");
   const [peerTcpPort, setPeerTcpPort] = useState("7001");
   const [peerQuicPort, setPeerQuicPort] = useState("7000");
-  const [peerTransport, setPeerTransport] = useState<"tcp" | "quic">("tcp");
+  const [addBoth, setAddBoth] = useState(true);
+
+  // Compute dirty state
+  const currentSnapshot = JSON.stringify({ ...config, bootstrap_peers: bootstrapPeers });
+  const isDirty = savedConfigRef.current !== "" && currentSnapshot !== savedConfigRef.current;
 
   const handleLoad = async () => {
-    setLoading(true);
     setMessage(null);
     try {
       const loaded = await cmd.loadClientConfig(CONFIG_FILE);
       setConfig(loaded);
       setBootstrapPeers(loaded.bootstrap_peers);
-      setMessage({ type: "success", text: "Configuration loaded" });
+      savedConfigRef.current = JSON.stringify(loaded);
     } catch (e) {
       setMessage({ type: "error", text: String(e) });
     }
-    setLoading(false);
   };
 
   const handleSave = async () => {
@@ -70,7 +76,9 @@ export function Settings({ status }: SettingsProps) {
         bootstrap_peers: bootstrapPeers,
       };
       await cmd.saveClientConfig(CONFIG_FILE, toSave);
+      savedConfigRef.current = JSON.stringify(toSave);
       setMessage({ type: "success", text: "Configuration saved" });
+      setTimeout(() => setMessage((m) => m?.type === "success" ? null : m), 3000);
     } catch (e) {
       setMessage({ type: "error", text: String(e) });
     }
@@ -81,22 +89,26 @@ export function Settings({ status }: SettingsProps) {
     setPeerIp("");
     setPeerTcpPort("7001");
     setPeerQuicPort("7000");
-    setPeerTransport("tcp");
+    setAddBoth(true);
     setShowAddPeer(true);
   };
 
   const handleAddPeer = () => {
     const ip = peerIp.trim();
     if (!ip) return;
-    const port =
-      peerTransport === "tcp" ? peerTcpPort.trim() : peerQuicPort.trim();
-    const addr =
-      peerTransport === "quic"
-        ? `quic://${ip}:${port || "7000"}`
-        : `${ip}:${port || "7001"}`;
-    if (!bootstrapPeers.includes(addr)) {
-      setBootstrapPeers([...bootstrapPeers, addr]);
+    const newPeers = [...bootstrapPeers];
+    if (addBoth) {
+      // Add both TCP and QUIC entries
+      const tcpAddr = `${ip}:${peerTcpPort.trim() || "7001"}`;
+      const quicAddr = `quic://${ip}:${peerQuicPort.trim() || "7000"}`;
+      if (!newPeers.includes(tcpAddr)) newPeers.push(tcpAddr);
+      if (!newPeers.includes(quicAddr)) newPeers.push(quicAddr);
+    } else {
+      // Add TCP only
+      const tcpAddr = `${ip}:${peerTcpPort.trim() || "7001"}`;
+      if (!newPeers.includes(tcpAddr)) newPeers.push(tcpAddr);
     }
+    setBootstrapPeers(newPeers);
     setShowAddPeer(false);
   };
 
@@ -117,26 +129,16 @@ export function Settings({ status }: SettingsProps) {
         title="Settings"
         subtitle="Configure your node and client preferences"
         actions={
-          <div className="flex items-center gap-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              icon={<FolderOpen className="h-3.5 w-3.5" />}
-              onClick={handleLoad}
-              loading={loading}
-            >
-              Load Config
-            </Button>
-            <Button
-              variant="primary"
-              size="sm"
-              icon={<Save className="h-3.5 w-3.5" />}
-              onClick={handleSave}
-              loading={saving}
-            >
-              Save Config
-            </Button>
-          </div>
+          <Button
+            variant="primary"
+            size="sm"
+            icon={<Save className="h-3.5 w-3.5" />}
+            onClick={handleSave}
+            loading={saving}
+            disabled={!isDirty}
+          >
+            Save Config
+          </Button>
         }
       />
 
@@ -193,7 +195,7 @@ export function Settings({ status }: SettingsProps) {
                 })
               }
               placeholder="0.0.0.0:7000"
-              hint="QUIC/UDP listen address (reserved for future use; not yet active)"
+              hint="QUIC/UDP listen address"
               className="font-mono text-xs"
             />
           </div>
@@ -227,7 +229,7 @@ export function Settings({ status }: SettingsProps) {
                   key={i}
                   className="flex items-center justify-between gap-2 bg-surface rounded-lg px-3 py-2 border border-border"
                 >
-                  <span className="text-xs font-mono text-text-primary truncate">
+                  <span className="text-xs font-mono text-text-primary truncate selectable">
                     {peer}
                   </span>
                   <button
@@ -279,34 +281,6 @@ export function Settings({ status }: SettingsProps) {
             autoFocus
           />
 
-          <div>
-            <label className="block text-xs font-medium text-text-secondary mb-1.5">
-              Transport
-            </label>
-            <div className="flex gap-2">
-              <button
-                onClick={() => setPeerTransport("tcp")}
-                className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
-                  peerTransport === "tcp"
-                    ? "bg-accent/10 border-accent text-accent"
-                    : "bg-surface border-border text-text-muted hover:text-text-primary"
-                }`}
-              >
-                TCP
-              </button>
-              <button
-                onClick={() => setPeerTransport("quic")}
-                className={`flex-1 px-3 py-2 rounded-xl text-xs font-medium border transition-colors ${
-                  peerTransport === "quic"
-                    ? "bg-accent/10 border-accent text-accent"
-                    : "bg-surface border-border text-text-muted hover:text-text-primary"
-                }`}
-              >
-                QUIC
-              </button>
-            </div>
-          </div>
-
           <div className="grid grid-cols-2 gap-3">
             <Input
               label="TCP Port"
@@ -314,7 +288,6 @@ export function Settings({ status }: SettingsProps) {
               value={peerTcpPort}
               onChange={(e) => setPeerTcpPort(e.target.value)}
               className="font-mono text-xs"
-              disabled={peerTransport !== "tcp"}
             />
             <Input
               label="QUIC Port"
@@ -322,12 +295,27 @@ export function Settings({ status }: SettingsProps) {
               value={peerQuicPort}
               onChange={(e) => setPeerQuicPort(e.target.value)}
               className="font-mono text-xs"
-              disabled={peerTransport !== "quic"}
+              disabled={!addBoth}
             />
           </div>
 
+          <label className="flex items-center gap-3 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={addBoth}
+              onChange={(e) => setAddBoth(e.target.checked)}
+              className="h-4 w-4 rounded border-border bg-surface text-accent focus:ring-accent/50"
+            />
+            <div>
+              <p className="text-xs text-text-primary">Add both TCP &amp; QUIC</p>
+              <p className="text-[10px] text-text-muted">
+                Creates two entries for the same peer so both transports are tried.
+              </p>
+            </div>
+          </label>
+
           <p className="text-xs text-text-muted">
-            Default ports: TCP 7001, QUIC 7000. Most relays use TCP.
+            Default ports: TCP 7001, QUIC 7000.
           </p>
         </div>
       </Modal>
@@ -391,9 +379,26 @@ export function Settings({ status }: SettingsProps) {
           {logFilePath && (
             <div>
               <p className="text-xs font-medium text-text-secondary mb-1">Log File Directory</p>
-              <p className="text-xs font-mono text-text-muted break-all bg-surface rounded-lg px-3 py-2 border border-border">
-                {logFilePath}
-              </p>
+              <div className="flex items-center gap-2">
+                <p className="text-xs font-mono text-text-muted break-all selectable bg-surface rounded-lg px-3 py-2 border border-border flex-1">
+                  {logFilePath}
+                </p>
+                <button
+                  className="shrink-0 p-2 rounded-lg hover:bg-surface-hover transition-colors text-text-muted hover:text-accent"
+                  title="Copy log path"
+                  onClick={() => {
+                    navigator.clipboard.writeText(logFilePath);
+                    setCopiedLogPath(true);
+                    setTimeout(() => setCopiedLogPath(false), 2000);
+                  }}
+                >
+                  {copiedLogPath ? (
+                    <Check className="h-3.5 w-3.5 text-success" />
+                  ) : (
+                    <Copy className="h-3.5 w-3.5" />
+                  )}
+                </button>
+              </div>
             </div>
           )}
         </div>

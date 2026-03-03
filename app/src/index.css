@@ -55,7 +55,7 @@ body {
 /* ── Focus styles ────────────────────────────────────────────────────── */
 
 *:focus-visible {
-  outline: 2px solid rgba(99, 102, 241, 0.5);
+  outline: 2px solid rgba(59, 130, 246, 0.5);
   outline-offset: 2px;
   border-radius: 4px;
 }
@@ -87,8 +87,8 @@ body {
     padding: 1px;
     background: linear-gradient(
       135deg,
-      rgba(99, 102, 241, 0.3),
-      rgba(34, 211, 238, 0.1)
+      rgba(59, 130, 246, 0.3),
+      rgba(147, 197, 253, 0.1)
     );
     -webkit-mask: linear-gradient(#fff 0 0) content-box,
       linear-gradient(#fff 0 0);
@@ -105,7 +105,7 @@ body {
   }
 
   .text-gradient-accent {
-    background: linear-gradient(135deg, #818cf8 0%, #22d3ee 100%);
+    background: linear-gradient(135deg, #60A5FA 0%, #93C5FD 100%);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;

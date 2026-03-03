@@ -15,14 +15,14 @@ export default {
         border: {
           DEFAULT: "#2a2a3e",
           subtle: "#1e1e30",
-          focus: "#6366f1",
+          focus: "#3B82F6",
         },
         accent: {
-          DEFAULT: "#6366f1",
-          hover: "#818cf8",
-          muted: "#4f46e5",
-          glow: "rgba(99, 102, 241, 0.15)",
-          cyan: "#22d3ee",
+          DEFAULT: "#3B82F6",
+          hover: "#60A5FA",
+          muted: "#2563EB",
+          glow: "rgba(59, 130, 246, 0.15)",
+          cyan: "#93C5FD",
         },
         success: {
           DEFAULT: "#10b981",
@@ -58,8 +58,8 @@ export default {
         "2xl": "16px",
       },
       boxShadow: {
-        glow: "0 0 20px rgba(99, 102, 241, 0.15)",
-        "glow-lg": "0 0 40px rgba(99, 102, 241, 0.2)",
+        glow: "0 0 20px rgba(59, 130, 246, 0.15)",
+        "glow-lg": "0 0 40px rgba(59, 130, 246, 0.2)",
         card: "0 1px 3px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.2)",
         "card-hover":
           "0 4px 12px rgba(0, 0, 0, 0.4), 0 2px 4px rgba(0, 0, 0, 0.3)",

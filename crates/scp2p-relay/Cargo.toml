@@ -14,7 +14,7 @@ name = "scp2p-relay"
 path = "src/main.rs"
 
 [dependencies]
-scp2p-core     = { path = "../scp2p-core", version = "0.2.1" }
+scp2p-core     = { path = "../scp2p-core", version = "0.3.0" }
 
 anyhow         = { workspace = true }
 async-trait    = { workspace = true }

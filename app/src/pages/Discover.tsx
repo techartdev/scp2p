@@ -1,10 +1,8 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 import {
   Compass,
   RefreshCw,
-  Plus,
   Trash2,
-  RotateCw,
   Download,
   Check,
   FolderOpen,
@@ -21,6 +19,7 @@ import {
   Square,
   MinusSquare,
   Bookmark,
+  BookmarkCheck,
   Package,
   Globe,
   Wifi,
@@ -36,7 +35,7 @@ import { Modal } from "@/components/ui/Modal";
 import { NodeRequiredOverlay } from "@/components/NodeRequiredOverlay";
 import * as cmd from "@/lib/commands";
 import { decodeShareLink, isShareLink } from "@/lib/shareLink";
-import type { SubscriptionView, SubscriptionTrustLevel, PublicShareView, ShareItemView, PeerView, RuntimeStatus, PageId } from "@/lib/types";
+import type { SubscriptionView, SubscriptionTrustLevel, PublicShareView, ShareItemView, RuntimeStatus, PageId } from "@/lib/types";
 
 /* ── Helpers ─────────────────────────────────────────────────────────── */
 
@@ -319,23 +318,23 @@ function TreeRow({
 /* ── Main component ──────────────────────────────────────────────────── */
 
 import type { DownloadQueueState } from "@/hooks/useDownloadQueue";
+import type { BackgroundState } from "@/hooks/useBackgroundService";
 
 interface DiscoverProps {
   status: RuntimeStatus | null;
+  bg: BackgroundState;
   onNavigate: (page: PageId) => void;
   downloadQueue: DownloadQueueState;
 }
 
-export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
-  // Left panel state
-  const [subs, setSubs] = useState<SubscriptionView[]>([]);
-  const [publicShares, setPublicShares] = useState<PublicShareView[]>([]);
-  const [peers, setPeers] = useState<PeerView[]>([]);
+export function Discover({ status, bg, onNavigate, downloadQueue }: DiscoverProps) {
+  // Left panel state — data from background service
+  const subs = bg.subscriptions;
+  const publicShares = bg.publicShares;
+  const peers = bg.peers;
   const [peersOpen, setPeersOpen] = useState(true);
   const [loading, setLoading] = useState(false);
-  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [syncMessage, setSyncMessage] = useState<string | null>(null);
 
   // Subscribe by ID modal
   const [showSubscribe, setShowSubscribe] = useState(false);
@@ -354,27 +353,17 @@ export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
     new Set()
   );
 
-  const loadData = useCallback(async () => {
+  const handleRefresh = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [s, p, pr] = await Promise.all([
-        cmd.listSubscriptions(),
-        cmd.browsePublicShares().catch(() => [] as PublicShareView[]),
-        cmd.listPeers().catch(() => [] as PeerView[]),
-      ]);
-      setSubs(s);
-      setPublicShares(p);
-      setPeers(pr);
+      await bg.refresh();
+      await bg.syncNow();
     } catch (e) {
       setError(String(e));
     }
     setLoading(false);
-  }, []);
-
-  useEffect(() => {
-    loadData();
-  }, [loadData]);
+  }, [bg]);
 
   const entries = mergeEntries(subs, publicShares);
 
@@ -393,7 +382,7 @@ export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
         !subs.some((s) => s.share_id_hex === entry.share_id_hex)
       ) {
         const updated = await cmd.subscribeShare(entry.share_id_hex);
-        setSubs(updated);
+        bg.setSubscriptions(updated);
       }
 
       let result: ShareItemView[];
@@ -403,7 +392,7 @@ export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
         // Manifest not cached yet — sync from peers and retry once
         setBrowseError("Syncing manifest from peer…");
         const syncResult = await cmd.syncNow();
-        setSubs(syncResult.subscriptions);
+        bg.setSubscriptions(syncResult.subscriptions);
         result = await cmd.browseShareItems(entry.share_id_hex);
       }
 
@@ -433,23 +422,7 @@ export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
     setBrowseLoading(false);
   };
 
-  const handleSync = async () => {
-    setSyncing(true);
-    setSyncMessage(null);
-    try {
-      const result = await cmd.syncNow();
-      setSubs(result.subscriptions);
-      if (result.updated_count > 0) {
-        setSyncMessage(`${result.updated_count} subscription${result.updated_count !== 1 ? "s" : ""} updated`);
-      } else {
-        setSyncMessage("Already up to date");
-      }
-      setTimeout(() => setSyncMessage(null), 4000);
-    } catch (e) {
-      setError(String(e));
-    }
-    setSyncing(false);
-  };
+
 
   const handleSubscribe = async () => {
     if (!subscribeId.trim()) return;
@@ -461,11 +434,11 @@ export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
         shareIdToSubscribe = decoded.shareIdHex;
       }
       const result = await cmd.subscribeShare(shareIdToSubscribe);
-      setSubs(result);
+      bg.setSubscriptions(result);
       setShowSubscribe(false);
       setSubscribeId("");
       // Kick off a sync immediately so the manifest is fetched from the peer
-      cmd.syncNow().then((r) => setSubs(r.subscriptions)).catch(() => {});
+      bg.syncNow().catch(() => {});
     } catch (e) {
       setError(String(e));
     }
@@ -475,7 +448,7 @@ export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
   const handleUnsubscribe = async (shareIdHex: string) => {
     try {
       const result = await cmd.unsubscribeShare(shareIdHex);
-      setSubs(result);
+      bg.setSubscriptions(result);
       if (activeShareId === shareIdHex) {
         setActiveShareId(null);
         setItems([]);
@@ -488,7 +461,7 @@ export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
   const handleTrustLevelChange = async (shareIdHex: string, level: SubscriptionTrustLevel) => {
     try {
       const result = await cmd.setSubscriptionTrustLevel(shareIdHex, level);
-      setSubs(result);
+      bg.setSubscriptions(result);
     } catch (e) {
       setError(String(e));
     }
@@ -581,23 +554,15 @@ export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
             <Button
               variant="ghost"
               size="sm"
-              icon={<RotateCw className="h-3 w-3" />}
-              onClick={handleSync}
-              loading={syncing}
-              title="Sync subscriptions"
-            />
-            <Button
-              variant="ghost"
-              size="sm"
               icon={<RefreshCw className="h-3 w-3" />}
-              onClick={loadData}
-              loading={loading}
-              title="Refresh"
+              onClick={handleRefresh}
+              loading={loading || bg.syncing}
+              title="Refresh & sync"
             />
             <Button
               variant="ghost"
               size="sm"
-              icon={<Plus className="h-3 w-3" />}
+              icon={<Bookmark className="h-3 w-3" />}
               onClick={() => setShowSubscribe(true)}
               title="Subscribe by ID"
             />
@@ -610,9 +575,9 @@ export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
           </div>
         )}
 
-        {syncMessage && (
+        {bg.lastSyncMessage && (
           <div className="px-4 py-1.5 bg-accent/10 border-b border-accent/20">
-            <p className="text-xs text-accent font-medium">{syncMessage}</p>
+            <p className="text-xs text-accent font-medium">{bg.lastSyncMessage}</p>
           </div>
         )}
 
@@ -680,7 +645,7 @@ export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
                 variant="secondary"
                 size="sm"
                 className="mt-3"
-                icon={<Plus className="h-3 w-3" />}
+                icon={<Bookmark className="h-3 w-3" />}
                 onClick={() => setShowSubscribe(true)}
               >
                 Subscribe by ID
@@ -705,8 +670,8 @@ export function Discover({ status, onNavigate, downloadQueue }: DiscoverProps) {
                   >
                     <div className="flex items-center justify-between mb-1">
                       <div className="flex items-center gap-2 min-w-0 flex-1">
-                        {entry.source === "subscription" ? (
-                          <Bookmark className="h-3.5 w-3.5 text-accent shrink-0" />
+                        {isSub ? (
+                          <BookmarkCheck className="h-3.5 w-3.5 text-accent shrink-0" />
                         ) : (
                           <Globe className="h-3.5 w-3.5 text-success shrink-0" />
                         )}

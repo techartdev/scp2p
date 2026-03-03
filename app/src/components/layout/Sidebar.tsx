@@ -5,7 +5,6 @@ import {
   Search,
   Package,
   Settings,
-  Radio,
   HelpCircle,
   ExternalLink,
   Download,
@@ -72,9 +71,7 @@ export function Sidebar({ currentPage, onNavigate, nodeRunning, appVersion, down
     <aside className="w-56 h-full bg-surface border-r border-border flex flex-col shrink-0">
       {/* Logo / Brand */}
       <div className="px-5 py-5 flex items-center gap-3">
-        <div className="h-8 w-8 rounded-xl bg-gradient-to-br from-accent to-accent-cyan flex items-center justify-center shadow-glow">
-          <Radio className="h-4 w-4 text-white" />
-        </div>
+        <img src="/icon.svg" alt="SCP2P" className="h-8 w-8 rounded-xl shadow-glow" />
         <div>
           <h1 className="text-sm font-bold text-text-primary tracking-tight">
             SCP2P

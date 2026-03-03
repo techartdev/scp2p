@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/main/nicegui/static/tauri/schemas/tauri-conf-v2.json",
   "productName": "SCP2P",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "identifier": "com.scp2p.desktop",
   "build": {
     "frontendDist": "../dist",

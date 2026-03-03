@@ -1,7 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState } from "react";
 import {
   Globe,
-  RefreshCw,
   Plus,
   Users,
   Eye,
@@ -9,6 +8,8 @@ import {
   Bookmark,
   LogOut,
   Link,
+  Copy,
+  Check,
 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -20,23 +21,23 @@ import { Modal } from "@/components/ui/Modal";
 import { NodeRequiredOverlay } from "@/components/NodeRequiredOverlay";
 import { PageHeader, PageContent } from "@/components/layout/Layout";
 import * as cmd from "@/lib/commands";
-import { decodeShareLink, isShareLink } from "@/lib/shareLink";
+import { decodeShareLink, encodeShareLink, isShareLink } from "@/lib/shareLink";
 import type {
-  CommunityView,
   CommunityBrowseView,
   CreateCommunityResult,
   RuntimeStatus,
   PageId,
 } from "@/lib/types";
+import type { BackgroundState } from "@/hooks/useBackgroundService";
 
 interface CommunitiesProps {
   status: RuntimeStatus | null;
+  bg: BackgroundState;
   onNavigate: (page: PageId) => void;
 }
 
-export function Communities({ status, onNavigate }: CommunitiesProps) {
-  const [communities, setCommunities] = useState<CommunityView[]>([]);
-  const [loading, setLoading] = useState(false);
+export function Communities({ status, bg, onNavigate }: CommunitiesProps) {
+  const communities = bg.communities;
   const [error, setError] = useState<string | null>(null);
   const [showJoin, setShowJoin] = useState(false);
   const [joinInput, setJoinInput] = useState("");
@@ -53,29 +54,16 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
   const [creating, setCreating] = useState(false);
   const [createResult, setCreateResult] =
     useState<CreateCommunityResult | null>(null);
+  const [copiedLink, setCopiedLink] = useState(false);
 
-  const loadCommunities = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await cmd.listCommunities();
-      setCommunities(result);
-    } catch (e) {
-      setError(String(e));
-    }
-    setLoading(false);
-  }, []);
 
-  useEffect(() => {
-    loadCommunities();
-  }, [loadCommunities]);
 
   const handleJoin = async () => {
     if (!joinId.trim() || !joinPubkey.trim()) return;
     setJoining(true);
     try {
       const result = await cmd.joinCommunity(joinId.trim(), joinPubkey.trim());
-      setCommunities(result);
+      bg.setCommunities(result);
       setShowJoin(false);
       setJoinInput("");
       setJoinId("");
@@ -104,7 +92,7 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
     setLeaving(shareIdHex);
     try {
       const result = await cmd.leaveCommunity(shareIdHex);
-      setCommunities(result);
+      bg.setCommunities(result);
       if (browseData?.community_share_id_hex === shareIdHex) {
         setBrowseData(null);
       }
@@ -130,14 +118,14 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
     setCreating(true);
     try {
       const result = await cmd.createCommunity(createName.trim());
-      setCommunities((prev) => {
-        const exists = prev.some((c) => c.share_id_hex === result.share_id_hex);
-        if (exists) return prev;
-        return [
-          ...prev,
+      // Update bg state with new community
+      const exists = communities.some((c) => c.share_id_hex === result.share_id_hex);
+      if (!exists) {
+        bg.setCommunities([
+          ...communities,
           { share_id_hex: result.share_id_hex, share_pubkey_hex: result.share_pubkey_hex, name: result.name },
-        ];
-      });
+        ]);
+      }
       setCreateResult(result);
     } catch (e) {
       setError(String(e));
@@ -155,19 +143,10 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
         actions={
           <div className="flex items-center gap-2">
             <Button
-              variant="ghost"
-              size="sm"
-              icon={<RefreshCw className="h-3.5 w-3.5" />}
-              onClick={loadCommunities}
-              loading={loading}
-            >
-              Refresh
-            </Button>
-            <Button
               variant="secondary"
               size="sm"
               icon={<Plus className="h-3.5 w-3.5" />}
-              onClick={() => { setCreateName(""); setCreateResult(null); setShowCreate(true); }}
+              onClick={() => { setCreateName(""); setCreateResult(null); setCopiedLink(false); setShowCreate(true); }}
             >
               Create
             </Button>
@@ -190,7 +169,7 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
       )}
 
       {/* Community list */}
-      {communities.length === 0 && !loading ? (
+      {communities.length === 0 ? (
         <EmptyState
           icon={<Globe className="h-8 w-8" />}
           title="No communities joined"
@@ -416,6 +395,44 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
                 {createResult.private_key_hex}
               </p>
             </div>
+            {/* Deep link for sharing */}
+            {(() => {
+              const link = encodeShareLink(
+                createResult.share_id_hex,
+                createResult.share_pubkey_hex,
+                status?.bootstrap_peers
+              );
+              return (
+                <div className="space-y-2">
+                  <p className="text-xs font-semibold text-accent uppercase tracking-wider">
+                    Share Link
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-xs font-mono break-all selectable bg-surface-elevated px-3 py-2 rounded-xl border border-accent/30 flex-1">
+                      {link}
+                    </p>
+                    <button
+                      className="shrink-0 p-2 rounded-lg hover:bg-surface-hover transition-colors text-text-muted hover:text-accent"
+                      title="Copy link"
+                      onClick={() => {
+                        navigator.clipboard.writeText(link);
+                        setCopiedLink(true);
+                        setTimeout(() => setCopiedLink(false), 2000);
+                      }}
+                    >
+                      {copiedLink ? (
+                        <Check className="h-4 w-4 text-success" />
+                      ) : (
+                        <Copy className="h-4 w-4" />
+                      )}
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-text-muted">
+                    Send this link to others so they can join your community.
+                  </p>
+                </div>
+              );
+            })()}
           </div>
         ) : (
           <div className="space-y-4">
@@ -475,14 +492,14 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
           />
           <div className="border-t border-border pt-3 space-y-3">
             <Input
-              label="Share ID (hex)"
+              label="Share ID"
               placeholder="Enter community share ID..."
               value={joinId}
               onChange={(e) => setJoinId(e.target.value)}
               className="font-mono text-xs"
             />
             <Input
-              label="Share Public Key (hex)"
+              label="Share Public Key"
               placeholder="Enter community public key..."
               value={joinPubkey}
               onChange={(e) => setJoinPubkey(e.target.value)}
