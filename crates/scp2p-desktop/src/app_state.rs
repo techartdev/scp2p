@@ -48,6 +48,7 @@ struct RuntimeState {
     lan_discovery_task: Option<JoinHandle<anyhow::Result<()>>>,
     dht_republish_task: Option<JoinHandle<()>>,
     subscription_sync_task: Option<JoinHandle<()>>,
+    relay_tunnel_task: Option<JoinHandle<()>>,
     last_public_shares: Vec<PublicShareView>,
     /// Transport used for DHT replication (same instance as background loops).
     dht_transport: Option<Arc<dyn scp2p_core::RequestTransport>>,
@@ -196,8 +197,106 @@ impl DesktopAppState {
                 bootstrap.clone(),
                 DHT_LOOP_INTERVAL,
             ));
-            state.dht_transport = Some(transport);
-            state.dht_bootstrap_peers = bootstrap;
+            state.dht_transport = Some(transport.clone());
+            state.dht_bootstrap_peers = bootstrap.clone();
+
+            // ── Relay tunnel registration ────────────────────────────
+            // Maintain a persistent relay tunnel so that peers behind
+            // NAT can be reached for content downloads.  Provider
+            // entries in the DHT include `relay_via` only when an
+            // active tunnel exists, so this must run before (or soon
+            // after) the first publish.
+            {
+                let tunnel_handle = handle.clone();
+                let tunnel_connector = DesktopSessionConnector {
+                    signing_key: state
+                        .node_signing_key
+                        .clone()
+                        .unwrap_or_else(|| SigningKey::generate(&mut OsRng)),
+                    capabilities: Capabilities::default(),
+                };
+                let tunnel_bootstrap = bootstrap;
+                let tunnel_transport = transport;
+                let bind_tcp = request.bind_tcp;
+                state.relay_tunnel_task = Some(tokio::spawn(async move {
+                    loop {
+                        // Already have a tunnel? Just wait and re-check.
+                        if !tunnel_handle.active_relay_slots().await.is_empty() {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            continue;
+                        }
+
+                        // Try each bootstrap peer until one accepts.
+                        let mut registered = false;
+                        for peer in &tunnel_bootstrap {
+                            match tunnel_handle
+                                .register_relay_tunnel(&tunnel_connector, peer)
+                                .await
+                            {
+                                Ok(slot) => {
+                                    info!(
+                                        slot_id = slot.slot_id,
+                                        relay = %format!("{}:{}", peer.ip, peer.port),
+                                        "relay tunnel registered"
+                                    );
+                                    registered = true;
+
+                                    // Re-announce provider entries with
+                                    // the newly relayed self-address so
+                                    // downloaders can reach us via the
+                                    // relay tunnel.
+                                    if let Some(bind) = bind_tcp {
+                                        let peer_records =
+                                            tunnel_handle.peer_records().await;
+                                        if let Ok(adv_ip) =
+                                            resolve_advertise_ip(bind, &peer_records)
+                                        {
+                                            let self_addr = tunnel_handle
+                                                .relayed_self_addr(PeerAddr {
+                                                    ip: adv_ip,
+                                                    port: bind.port(),
+                                                    transport: TransportProtocol::Tcp,
+                                                    pubkey_hint: None,
+                                                    relay_via: None,
+                                                })
+                                                .await;
+                                            let _ = tunnel_handle
+                                                .reannounce_content_providers(self_addr)
+                                                .await;
+                                        }
+                                    }
+
+                                    // Push updated providers to the
+                                    // relay immediately instead of
+                                    // waiting for the next 60-s cycle.
+                                    let _ = tunnel_handle
+                                        .dht_republish_once(
+                                            tunnel_transport.as_ref(),
+                                            &tunnel_bootstrap,
+                                        )
+                                        .await;
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        relay = %format!("{}:{}", peer.ip, peer.port),
+                                        error = %e,
+                                        "relay tunnel registration failed, trying next"
+                                    );
+                                }
+                            }
+                        }
+
+                        if !registered {
+                            warn!(
+                                "relay tunnel: no bootstrap peer accepted registration, retrying in 30s"
+                            );
+                        }
+
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                }));
+            }
         }
 
         state.node = Some(handle);
@@ -224,6 +323,9 @@ impl DesktopAppState {
             task.abort();
         }
         if let Some(task) = state.subscription_sync_task.take() {
+            task.abort();
+        }
+        if let Some(task) = state.relay_tunnel_task.take() {
             task.abort();
         }
         state.node = None;
@@ -744,6 +846,12 @@ impl DesktopAppState {
                 peers.push(record.addr);
             }
         }
+        // Sort TCP peers before QUIC so that operations succeed quickly
+        // when QUIC is blocked (common behind NAT / firewalls).
+        peers.sort_by_key(|p| match p.transport {
+            TransportProtocol::Tcp => 0,
+            TransportProtocol::Quic => 1,
+        });
         Ok(peers)
     }
 

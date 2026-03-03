@@ -18,7 +18,7 @@ use crate::{
     ids::{NodeId, ShareId},
     manifest::{ManifestV1, PublicShareSummary, ShareHead},
     net_fetch::RequestTransport,
-    peer::PeerAddr,
+    peer::{PeerAddr, TransportProtocol},
     relay::{
         RelayAnnouncement, RelayPayloadKind as RelayInternalPayloadKind, current_rendezvous_bucket,
         relay_rendezvous_index, relay_rendezvous_key,
@@ -110,8 +110,18 @@ pub(super) fn sort_peers_for_target(peers: &mut [PeerAddr], target_node_id: [u8;
     peers.sort_by(|a, b| {
         peer_distance_key(a, target_node_id)
             .cmp(&peer_distance_key(b, target_node_id))
+            // Prefer TCP over QUIC as a tiebreaker — if QUIC is blocked
+            // by the network this avoids 5-second timeout penalties.
+            .then(transport_order(a).cmp(&transport_order(b)))
             .then(peer_key(a).cmp(&peer_key(b)))
     });
+}
+
+fn transport_order(p: &PeerAddr) -> u8 {
+    match p.transport {
+        TransportProtocol::Tcp => 0,
+        TransportProtocol::Quic => 1,
+    }
 }
 
 pub(super) fn merge_peer_list(into: &mut Vec<PeerAddr>, incoming: Vec<PeerAddr>) -> bool {

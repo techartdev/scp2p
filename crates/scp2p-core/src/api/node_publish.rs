@@ -297,6 +297,40 @@ impl NodeHandle {
             })
             .collect())
     }
+
+    /// Re-announce DHT provider entries for all content in `content_paths`.
+    ///
+    /// Called after relay tunnel registration so that provider entries
+    /// contain the relayed address, enabling NAT-traversed downloads.
+    pub async fn reannounce_content_providers(
+        &self,
+        self_addr: PeerAddr,
+    ) -> anyhow::Result<usize> {
+        let now = now_unix_secs()?;
+        let mut state = self.state.write().await;
+
+        // Collect content IDs from persisted content_paths.
+        let content_ids: Vec<[u8; 32]> = state.content_paths.keys().copied().collect();
+        let mut count = 0usize;
+
+        for content_id in content_ids {
+            if let Err(e) = upsert_provider(&mut state, content_id, self_addr.clone(), now) {
+                debug!(
+                    content_id = %hex::encode(content_id),
+                    error = %e,
+                    "reannounce_content_providers: failed to update provider"
+                );
+            } else {
+                count += 1;
+            }
+        }
+
+        if count > 0 {
+            debug!(count, "reannounce_content_providers: updated");
+        }
+
+        Ok(count)
+    }
 }
 
 /// Insert or update a DHT provider entry for `content_id`.

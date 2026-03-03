@@ -178,13 +178,28 @@ async fn configured_bootstrap_peers_with_transport_prefix() {
         .expect("configured peers");
     // 3 explicit + 3 alternate-transport fallbacks
     assert_eq!(peers.len(), 6);
-    assert_eq!(peers[0].transport, crate::peer::TransportProtocol::Quic);
-    assert_eq!(peers[0].port, 9000);
-    assert_eq!(peers[1].transport, crate::peer::TransportProtocol::Tcp);
-    assert_eq!(peers[1].port, 9001);
-    // bare address defaults to TCP
-    assert_eq!(peers[2].transport, crate::peer::TransportProtocol::Tcp);
-    assert_eq!(peers[2].port, 9002);
+    // TCP peers sorted first (the two explicit TCP entries + the
+    // auto-generated TCP alternate of the QUIC entry).
+    let tcp_peers: Vec<_> = peers
+        .iter()
+        .filter(|p| p.transport == crate::peer::TransportProtocol::Tcp)
+        .collect();
+    let quic_peers: Vec<_> = peers
+        .iter()
+        .filter(|p| p.transport == crate::peer::TransportProtocol::Quic)
+        .collect();
+    assert_eq!(tcp_peers.len(), 3);
+    assert_eq!(quic_peers.len(), 3);
+    // All TCP peers come before all QUIC peers.
+    let first_quic_idx = peers
+        .iter()
+        .position(|p| p.transport == crate::peer::TransportProtocol::Quic)
+        .unwrap();
+    let last_tcp_idx = peers
+        .iter()
+        .rposition(|p| p.transport == crate::peer::TransportProtocol::Tcp)
+        .unwrap();
+    assert!(last_tcp_idx < first_quic_idx);
 }
 
 #[tokio::test]

@@ -819,6 +819,14 @@ impl NodeHandle {
             }
         }
         peers.extend(extra);
+
+        // Sort TCP peers before QUIC so that operations succeed quickly
+        // when QUIC is blocked (common behind NAT / firewalls).  The QUIC
+        // variants remain in the list for fallback.
+        peers.sort_by_key(|p| match p.transport {
+            TransportProtocol::Tcp => 0,
+            TransportProtocol::Quic => 1,
+        });
         Ok(peers)
     }
 

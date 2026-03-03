@@ -732,11 +732,23 @@ impl NodeHandle {
         persist_state(self).await?;
 
         // ── Gap 2: merge DHT-advertised seeders into the peer list ──
+        //
+        // First, do a *network* DHT lookup for the content provider key so
+        // that provider entries published by the remote peer (via the relay)
+        // are fetched and cached locally.  Without this, a subscriber that
+        // never received the provider entry would only have the bootstrap
+        // peers (relay), which don't hold the actual content data.
+        let transport = RelayAwareTransport::new(connector);
+        let provider_key = content_provider_key(&content_id);
+        let _ = self
+            .dht_find_value_iterative(&transport, provider_key, peers)
+            .await;
+
         let mut all_peers = peers.to_vec();
         {
             let mut state = self.state.write().await;
             let now = now_unix_secs()?;
-            if let Some(val) = state.dht.find_value(content_provider_key(&content_id), now)
+            if let Some(val) = state.dht.find_value(provider_key, now)
                 && let Ok(providers) = crate::cbor::from_slice::<Providers>(&val.value)
             {
                 for p in providers.providers {
@@ -759,7 +771,6 @@ impl NodeHandle {
 
         // Pattern B: chunk hashes are not stored in the manifest.
         // If content_catalog has empty chunks (subscribed content), fetch them on demand.
-        let transport = RelayAwareTransport::new(connector);
         let chunk_hashes = if content.chunks.is_empty() && content.chunk_count > 0 {
             fetch_chunk_hashes_with_retry(
                 &transport,
