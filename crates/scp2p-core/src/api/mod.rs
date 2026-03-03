@@ -1267,8 +1267,9 @@ impl NodeHandle {
         peer: &PeerAddr,
         share_id: ShareId,
         share_pubkey: [u8; 32],
-    ) -> anyhow::Result<bool> {
-        query_community_status(transport, peer, share_id, share_pubkey).await
+    ) -> anyhow::Result<(bool, Option<String>)> {
+        let result = query_community_status(transport, peer, share_id, share_pubkey).await?;
+        Ok((result.joined, result.name))
     }
 
     pub async fn fetch_community_public_shares_from_peer<T: RequestTransport + ?Sized>(
@@ -1448,6 +1449,25 @@ impl NodeHandle {
             state.communities.remove(&share_id.0);
             state.dirty.communities = true;
         }
+        persist_state(self).await
+    }
+
+    /// Update the locally stored name for a community.
+    ///
+    /// Called when a remote peer reports the community name during browse.
+    pub async fn update_community_name(
+        &self,
+        share_id: ShareId,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        if let Some(membership) = state.communities.get_mut(&share_id.0)
+            && membership.name.is_none()
+        {
+            membership.name = Some(name.to_owned());
+            state.dirty.communities = true;
+        }
+        drop(state);
         persist_state(self).await
     }
 

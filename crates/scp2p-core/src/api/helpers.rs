@@ -286,7 +286,7 @@ pub(super) async fn query_community_status<T: RequestTransport + ?Sized>(
     peer: &PeerAddr,
     share_id: ShareId,
     share_pubkey: [u8; 32],
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<CommunityStatusResult> {
     let req_id = next_req_id();
     let request = Envelope::from_typed(
         req_id,
@@ -312,7 +312,17 @@ pub(super) async fn query_community_status<T: RequestTransport + ?Sized>(
     if status.community_share_id != share_id.0 {
         anyhow::bail!("community status response share_id mismatch");
     }
-    Ok(status.joined)
+    Ok(CommunityStatusResult {
+        joined: status.joined,
+        name: status.name,
+    })
+}
+
+/// Result of a community status query.
+pub(super) struct CommunityStatusResult {
+    pub joined: bool,
+    /// Community name reported by the remote peer (if known).
+    pub name: Option<String>,
 }
 
 pub(super) async fn query_community_public_shares<T: RequestTransport + ?Sized>(

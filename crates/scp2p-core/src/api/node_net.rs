@@ -1023,7 +1023,7 @@ impl NodeHandle {
                     payload,
                 }),
             WirePayload::GetCommunityStatus(msg) => {
-                let (joined, proof) = match VerifyingKey::from_bytes(&msg.community_share_pubkey) {
+                let (joined, proof, name) = match VerifyingKey::from_bytes(&msg.community_share_pubkey) {
                     Ok(pubkey) if ShareId::from_pubkey(&pubkey).0 == msg.community_share_id => {
                         let state = self.state.read().await;
                         match state.communities.get(&msg.community_share_id) {
@@ -1032,9 +1032,9 @@ impl NodeHandle {
                                     .token
                                     .as_ref()
                                     .and_then(|t| crate::cbor::to_vec(t).ok());
-                                (true, proof)
+                                (true, proof, membership.name.clone())
                             }
-                            None => (false, None),
+                            None => (false, None, None),
                         }
                     }
                     _ => {
@@ -1049,6 +1049,7 @@ impl NodeHandle {
                     community_share_id: msg.community_share_id,
                     joined,
                     membership_proof: proof,
+                    name,
                 })
                 .map_err(Into::into)
                 .map(|payload| Envelope {

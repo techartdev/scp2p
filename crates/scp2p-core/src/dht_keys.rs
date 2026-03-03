@@ -20,6 +20,10 @@ pub fn content_provider_key(content_id: &[u8; 32]) -> [u8; 32] {
     prefixed_hash(b"content:prov:", content_id)
 }
 
+pub fn community_info_key(share_id: &ShareId) -> [u8; 32] {
+    prefixed_hash(b"community:info:", &share_id.0)
+}
+
 fn prefixed_hash(prefix: &[u8], id: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(prefix);

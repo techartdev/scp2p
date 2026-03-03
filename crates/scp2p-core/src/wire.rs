@@ -524,6 +524,9 @@ pub struct CommunityStatus {
     /// membership is self-asserted (v0.1 default).
     #[serde(default, with = "serde_bytes")]
     pub membership_proof: Option<Vec<u8>>,
+    /// Human-readable community name, if the responding node knows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1125,11 +1128,24 @@ mod tests {
             community_share_id: [4u8; 32],
             joined: true,
             membership_proof: None,
+            name: None,
         };
         let response_rt: CommunityStatus =
             crate::cbor::from_slice(&crate::cbor::to_vec(&response).expect("encode"))
                 .expect("decode");
         assert_eq!(response_rt, response);
+
+        // Verify name field survives roundtrip.
+        let response_with_name = CommunityStatus {
+            community_share_id: [4u8; 32],
+            joined: true,
+            membership_proof: None,
+            name: Some("Pavlikeni".to_string()),
+        };
+        let rt2: CommunityStatus =
+            crate::cbor::from_slice(&crate::cbor::to_vec(&response_with_name).expect("encode"))
+                .expect("decode");
+        assert_eq!(rt2.name, Some("Pavlikeni".to_string()));
     }
 
     #[test]
@@ -1301,6 +1317,7 @@ mod tests {
                 community_share_id: [14u8; 32],
                 joined: true,
                 membership_proof: None,
+                name: None,
             }),
             WirePayload::ListCommunityPublicShares(ListCommunityPublicShares {
                 community_share_id: [16u8; 32],

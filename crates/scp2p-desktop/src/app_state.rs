@@ -667,6 +667,7 @@ impl DesktopAppState {
         let mut public_shares = Vec::new();
         let mut seen_shares = std::collections::HashSet::new();
         let mut first_err = None;
+        let mut discovered_name: Option<String> = None;
         for peer in peers {
             match node
                 .fetch_community_status_from_peer(
@@ -677,7 +678,14 @@ impl DesktopAppState {
                 )
                 .await
             {
-                Ok(true) => {
+                Ok((true, peer_name)) => {
+                    // Capture the first non-empty name from any peer.
+                    if discovered_name.is_none()
+                        && let Some(ref n) = peer_name
+                        && !n.is_empty()
+                    {
+                        discovered_name = Some(n.clone());
+                    }
                     participants.push(CommunityParticipantView {
                         community_share_id_hex: hex::encode(community.share_id),
                         peer_addr: format!("{}:{}", peer.ip, peer.port),
@@ -707,7 +715,7 @@ impl DesktopAppState {
                         }
                     }
                 }
-                Ok(false) => {}
+                Ok((false, _)) => {}
                 Err(err) => {
                     if first_err.is_none() {
                         first_err = Some(err);
@@ -727,6 +735,13 @@ impl DesktopAppState {
             && let Some(err) = first_err
         {
             return Err(err);
+        }
+        // Persist the community name if we discovered it from a peer but
+        // don't have it locally yet.
+        if let Some(name) = discovered_name {
+            let _ = node
+                .update_community_name(scp2p_core::ShareId(community.share_id), &name)
+                .await;
         }
         Ok(CommunityBrowseView {
             community_share_id_hex: hex::encode(community.share_id),

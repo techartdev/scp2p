@@ -723,8 +723,9 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                 let transport = ctx.transport();
                 let pb = spinner("Querying peers for community status…");
                 let mut participants = Vec::new();
+                let mut discovered_name: Option<String> = None;
                 for peer in &ctx.bootstrap_peers {
-                    if let Ok(true) = ctx
+                    if let Ok((true, peer_name)) = ctx
                         .node
                         .fetch_community_status_from_peer(
                             &transport,
@@ -734,12 +735,29 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                         )
                         .await
                     {
+                        if discovered_name.is_none()
+                            && let Some(ref n) = peer_name
+                            && !n.is_empty()
+                        {
+                            discovered_name = Some(n.clone());
+                        }
                         participants.push(format!("{}:{}", peer.ip, peer.port));
                     }
                 }
                 pb.finish_and_clear();
 
-                println!("\n  Community {}", hex::encode(community.share_id));
+                // Persist discovered community name locally.
+                if let Some(ref name) = discovered_name {
+                    let _ = ctx
+                        .node
+                        .update_community_name(ShareId(community.share_id), name)
+                        .await;
+                }
+
+                let display_name = discovered_name
+                    .or_else(|| community.name.clone())
+                    .unwrap_or_else(|| hex::encode(community.share_id));
+                println!("\n  Community {display_name}");
                 if participants.is_empty() {
                     println!("  No participants discovered via bootstrap peers.");
                 } else {

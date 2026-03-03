@@ -1793,13 +1793,14 @@ async fn fetch_community_status_from_peer_roundtrip() {
                         community_share_id: share_id,
                         joined: true,
                         membership_proof: None,
+                        name: None,
                     })?,
                 })
             }
         })
         .await;
 
-    let joined = handle
+    let (joined, _name) = handle
         .fetch_community_status_from_peer(
             &transport,
             &peer,
