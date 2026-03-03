@@ -32,9 +32,11 @@ use std::path::PathBuf;
 use clap::Parser;
 
 mod config;
+mod persist;
 mod runner;
 
 use config::{build_config, load_file_config};
+use persist::install_service;
 use runner::run;
 
 // ── CLI definition ─────────────────────────────────────────────────
@@ -140,13 +142,40 @@ struct Cli {
     /// log aggregators).  Default: `text`.
     #[arg(long, env = "SCP2P_LOG_FORMAT", value_name = "FORMAT")]
     log_format: Option<String>,
+
+    /// Install scp2p-relay as a persistent background service and exit.
+    ///
+    /// On Linux this writes a systemd unit to
+    /// `/etc/systemd/system/scp2p-relay.service`, runs
+    /// `systemctl daemon-reload` and `systemctl enable --now scp2p-relay`.
+    ///
+    /// On macOS this writes a launchd plist to
+    /// `/Library/LaunchDaemons/com.scp2p.relay.plist` and calls
+    /// `launchctl bootstrap`.
+    ///
+    /// On Windows this registers the binary with the Windows Service Manager
+    /// via `sc.exe` and starts it immediately.
+    ///
+    /// All other flags you pass alongside `--persist` are baked into the
+    /// installed service command (e.g. `--bootstrap`, `--announce`).
+    /// Run as root / Administrator.
+    #[arg(long)]
+    persist: bool,
 }
 
 // ── Entry point ────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Capture raw args *before* clap consumes them so --persist can
+    // reconstruct the exact service command line.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+
     let cli = Cli::parse();
+
+    if cli.persist {
+        return install_service(&raw_args);
+    }
 
     // Load TOML config file (if given), then overlay CLI values.
     let file_cfg = load_file_config(cli.config.as_deref())?;
