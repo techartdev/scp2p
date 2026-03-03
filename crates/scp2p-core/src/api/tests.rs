@@ -4011,8 +4011,14 @@ async fn subscription_cap_is_enforced() {
     let share_b = ShareId([2u8; 32]);
     let share_c = ShareId([3u8; 32]);
 
-    handle.subscribe(share_a).await.expect("first subscription ok");
-    handle.subscribe(share_b).await.expect("second subscription ok");
+    handle
+        .subscribe(share_a)
+        .await
+        .expect("first subscription ok");
+    handle
+        .subscribe(share_b)
+        .await
+        .expect("second subscription ok");
 
     // Third subscription must be rejected.
     let err = handle.subscribe(share_c).await.unwrap_err();
@@ -4040,7 +4046,10 @@ async fn publisher_key_auto_protected_with_node_key() {
         .expect("start");
 
     // Establish node identity first so the node_key is set.
-    handle.ensure_node_identity().await.expect("ensure_node_identity");
+    handle
+        .ensure_node_identity()
+        .await
+        .expect("ensure_node_identity");
 
     // Create publisher identity; auto-protect should run immediately.
     let kp = handle
@@ -4171,7 +4180,10 @@ async fn auto_protect_publisher_identities_explicit_encrypts_existing_keys() {
         .ensure_publisher_identity("early-pub")
         .await
         .expect("ensure_publisher_identity2");
-    assert_eq!(kp.verifying_key().to_bytes(), kp2.verifying_key().to_bytes());
+    assert_eq!(
+        kp.verifying_key().to_bytes(),
+        kp2.verifying_key().to_bytes()
+    );
 }
 
 // ── AV-06: community strict mode ─────────────────────────────────────────
@@ -4235,9 +4247,8 @@ async fn community_strict_mode_allows_request_with_valid_proof() {
     let requester_key = SigningKey::generate(&mut rng);
     let requester_pubkey = requester_key.verifying_key().to_bytes();
     let now = now_unix_secs().expect("now");
-    let token =
-        CommunityMembershipToken::issue(&community_key, requester_pubkey, now, now + 3600)
-            .expect("issue token");
+    let token = CommunityMembershipToken::issue(&community_key, requester_pubkey, now, now + 3600)
+        .expect("issue token");
     let proof = crate::cbor::to_vec(&token).expect("cbor encode token");
 
     // Request with a valid proof must succeed; the result is empty because
@@ -4329,10 +4340,15 @@ async fn relay_manager_ingest_deduplicates_by_pubkey() {
 
     let mut mgr = RelayManager::default();
     mgr.ingest_announcement(ann1, now).expect("ingest 1");
-    mgr.ingest_announcement(ann2.clone(), now).expect("ingest 2");
+    mgr.ingest_announcement(ann2.clone(), now)
+        .expect("ingest 2");
 
     let known = mgr.known_announcements();
-    assert_eq!(known.len(), 1, "duplicate pubkey must be replaced, not appended");
+    assert_eq!(
+        known.len(),
+        1,
+        "duplicate pubkey must be replaced, not appended"
+    );
     assert_eq!(known[0].relay_addrs[0].port, ann2.relay_addrs[0].port);
 }
 
@@ -4471,8 +4487,7 @@ async fn relay_list_request_served_by_node() {
         .expect("handle must return Some");
 
     assert_eq!(resp.r#type, MsgType::RelayListResponse as u16);
-    let parsed: RelayListResponse =
-        crate::cbor::from_slice(&resp.payload).expect("parse response");
+    let parsed: RelayListResponse = crate::cbor::from_slice(&resp.payload).expect("parse response");
     assert_eq!(parsed.announcements.len(), 1);
     assert_eq!(
         parsed.announcements[0].relay_pubkey,
@@ -4505,8 +4520,12 @@ async fn node_publish_relay_announcement_self_ingest() {
         .await
         .expect("publish");
 
-    assert!(ann.capabilities.relay, "announcement must advertise relay capability");
-    ann.verify_signature().expect("announcement signature must be valid");
+    assert!(
+        ann.capabilities.relay,
+        "announcement must advertise relay capability"
+    );
+    ann.verify_signature()
+        .expect("announcement signature must be valid");
 
     let known = {
         let state = handle.state.read().await;
@@ -4709,7 +4728,10 @@ async fn dht_access_count_increments_on_local_lookup() {
     {
         let mut state = handle.state.write().await;
         let now = now_unix_secs().expect("time");
-        state.dht.store(key, vec![1, 2, 3], 3600, now).expect("store");
+        state
+            .dht
+            .store(key, vec![1, 2, 3], 3600, now)
+            .expect("store");
     }
 
     // First lookup via the state directly — access_count should become 1.
@@ -4754,16 +4776,28 @@ async fn peer_reputation_note_outcome_persists() {
         .expect("record peer");
 
     // Note two successes and one failure: net = +1 -2 +1 = 0.
-    handle.note_peer_outcome(&peer, true).await.expect("success 1");
-    handle.note_peer_outcome(&peer, true).await.expect("success 2");
-    handle.note_peer_outcome(&peer, false).await.expect("failure");
+    handle
+        .note_peer_outcome(&peer, true)
+        .await
+        .expect("success 1");
+    handle
+        .note_peer_outcome(&peer, true)
+        .await
+        .expect("success 2");
+    handle
+        .note_peer_outcome(&peer, false)
+        .await
+        .expect("failure");
 
     let records = handle.peer_records().await;
     let rec = records
         .iter()
         .find(|r| r.addr.port == 7000)
         .expect("peer should be in db");
-    assert_eq!(rec.reputation_score, 0, "net score after +1 +1 -2 should be 0");
+    assert_eq!(
+        rec.reputation_score, 0,
+        "net score after +1 +1 -2 should be 0"
+    );
 }
 
 #[tokio::test]
@@ -4781,13 +4815,21 @@ async fn peer_reputation_initial_reputations_seeded_in_policy() {
         relay_via: None,
     };
     handle.record_peer_seen(peer.clone()).await.expect("record");
-    handle.note_peer_outcome(&peer, true).await.expect("success");
-    handle.note_peer_outcome(&peer, true).await.expect("success 2");
+    handle
+        .note_peer_outcome(&peer, true)
+        .await
+        .expect("success");
+    handle
+        .note_peer_outcome(&peer, true)
+        .await
+        .expect("success 2");
 
     // reputation_for_peers should return a map with score=2 for this peer.
     let map = {
         let state = handle.state.read().await;
-        state.peer_db.reputation_for_peers(std::slice::from_ref(&peer))
+        state
+            .peer_db
+            .reputation_for_peers(std::slice::from_ref(&peer))
     };
     assert_eq!(map.len(), 1);
     let key = format!("10.0.0.2:7001:{:?}", TransportProtocol::Tcp);

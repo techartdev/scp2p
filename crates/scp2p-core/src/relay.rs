@@ -400,11 +400,7 @@ impl RelayManager {
     /// Performs full structural + signature verification. Fresh announcements
     /// replace older ones for the same relay pubkey. Stale entries are pruned
     /// after each successful ingestion (§4.9).
-    pub fn ingest_announcement(
-        &mut self,
-        ann: RelayAnnouncement,
-        now: u64,
-    ) -> anyhow::Result<()> {
+    pub fn ingest_announcement(&mut self, ann: RelayAnnouncement, now: u64) -> anyhow::Result<()> {
         ann.validate_structure()?;
         if !ann.is_fresh(now) {
             anyhow::bail!("relay announcement is already expired");

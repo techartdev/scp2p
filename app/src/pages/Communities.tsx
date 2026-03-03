@@ -135,7 +135,7 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
         if (exists) return prev;
         return [
           ...prev,
-          { share_id_hex: result.share_id_hex, share_pubkey_hex: result.share_pubkey_hex },
+          { share_id_hex: result.share_id_hex, share_pubkey_hex: result.share_pubkey_hex, name: result.name },
         ];
       });
       setCreateResult(result);
@@ -216,6 +216,9 @@ export function Communities({ status, onNavigate }: CommunitiesProps) {
                     <Globe className="h-5 w-5" />
                   </div>
                   <div className="space-y-1">
+                    {community.name && (
+                      <p className="text-sm font-medium text-text-primary">{community.name}</p>
+                    )}
                     <HashDisplay
                       hash={community.share_id_hex}
                       label="Share"

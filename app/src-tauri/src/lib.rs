@@ -6,12 +6,14 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use scp2p_core::SubscriptionTrustLevel;
 use scp2p_desktop::{
-    CommunityBrowseView, CommunityView, CreateCommunityResult, DesktopAppState, DesktopClientConfig,
-    OwnedShareView, PeerView, PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus,
-    SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView, SyncResultView, commands,
+    CommunityBrowseView, CommunityView, CreateCommunityResult, DesktopAppState,
+    DesktopClientConfig, OwnedShareView, PeerView, PublicShareView, PublishResultView,
+    PublishVisibility, RuntimeStatus, SearchResultsView, ShareItemView, StartNodeRequest,
+    SubscriptionView, SyncResultView, commands,
 };
 use serde::Serialize;
 use tauri::Emitter;
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 struct AppState(DesktopAppState);
 
@@ -231,27 +233,6 @@ async fn download_content(
 // ── Publish ─────────────────────────────────────────────────────────────
 
 #[tauri::command]
-async fn publish_text_share(
-    state: tauri::State<'_, AppState>,
-    title: String,
-    item_name: String,
-    item_text: String,
-    visibility: PublishVisibility,
-    community_ids_hex: Vec<String>,
-) -> Result<PublishResultView, String> {
-    commands::publish_text_share(
-        &state.0,
-        title,
-        item_name,
-        item_text,
-        visibility,
-        community_ids_hex,
-    )
-    .await
-    .map_err(|e| format!("{e:#}"))
-}
-
-#[tauri::command]
 async fn publish_files(
     state: tauri::State<'_, AppState>,
     file_paths: Vec<String>,
@@ -380,10 +361,49 @@ async fn export_share_secret(
         .map_err(|e| format!("{e:#}"))
 }
 
+// ── Logging ─────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn get_log_file_path() -> String {
+    let log_dir = dirs_next::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("scp2p");
+    log_dir.display().to_string()
+}
+
 // ── App entry ───────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ── Logging / tracing ───────────────────────────────────────────────
+    // Write logs to `scp2p.log` in the user's config directory so that
+    // they survive across runs and are easy to find from the Settings page.
+    let log_dir = dirs_next::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("scp2p");
+    std::fs::create_dir_all(&log_dir).ok();
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "scp2p.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,scp2p_core=debug,scp2p_desktop=debug"));
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(
+            fmt::layer()
+                .with_writer(non_blocking)
+                .with_ansi(false)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_file(true)
+                .with_line_number(true),
+        )
+        .init();
+
+    tracing::info!("SCP2P desktop starting, log_dir={}", log_dir.display());
+
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
@@ -410,7 +430,6 @@ pub fn run() {
             browse_public_shares,
             subscribe_public_share,
             download_content,
-            publish_text_share,
             publish_files,
             publish_folder,
             browse_share_items,
@@ -419,6 +438,7 @@ pub fn run() {
             delete_my_share,
             update_my_share_visibility,
             export_share_secret,
+            get_log_file_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running SCP2P application");

@@ -54,7 +54,11 @@ impl PeerDb {
         let key = peer_key(&addr);
         let existing = self.records.get(&key);
         let (caps, caps_at, rep) = match existing {
-            Some(prev) => (prev.capabilities.clone(), prev.capabilities_seen_at, prev.reputation_score),
+            Some(prev) => (
+                prev.capabilities.clone(),
+                prev.capabilities_seen_at,
+                prev.reputation_score,
+            ),
             None => (None, None, 0),
         };
         self.records.insert(
@@ -80,7 +84,11 @@ impl PeerDb {
         capabilities: Capabilities,
     ) {
         let key = peer_key(&addr);
-        let existing_rep = self.records.get(&key).map(|r| r.reputation_score).unwrap_or(0);
+        let existing_rep = self
+            .records
+            .get(&key)
+            .map(|r| r.reputation_score)
+            .unwrap_or(0);
         self.records.insert(
             key,
             PeerRecord {
@@ -179,9 +187,7 @@ impl PeerDb {
         let mut fresh: Vec<&PeerRecord> = self
             .records
             .values()
-            .filter(|r| {
-                now_unix.saturating_sub(r.last_seen_unix) <= PEX_FRESHNESS_WINDOW_SECS
-            })
+            .filter(|r| now_unix.saturating_sub(r.last_seen_unix) <= PEX_FRESHNESS_WINDOW_SECS)
             .collect();
         fresh.sort_by(|a, b| b.reputation_score.cmp(&a.reputation_score));
         fresh.truncate(cap);
@@ -342,7 +348,11 @@ mod tests {
         for _ in 0..20 {
             db.note_outcome(&p("10.0.0.1", 7000), false);
         }
-        assert_eq!(db.reputation_score(&p("10.0.0.1", 7000)), -10, "lower clamp");
+        assert_eq!(
+            db.reputation_score(&p("10.0.0.1", 7000)),
+            -10,
+            "lower clamp"
+        );
     }
 
     #[test]
@@ -359,7 +369,10 @@ mod tests {
     #[test]
     fn upsert_seen_with_capabilities_preserves_reputation_score() {
         let mut db = PeerDb::default();
-        let caps = Capabilities { relay: true, ..Default::default() };
+        let caps = Capabilities {
+            relay: true,
+            ..Default::default()
+        };
         db.upsert_seen(p("10.0.0.1", 7000), 1_000);
         db.note_outcome(&p("10.0.0.1", 7000), true);
         // Updating capabilities should not reset the score.

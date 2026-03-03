@@ -46,9 +46,10 @@ pub use manifest::{
     ItemV1, ManifestV1, PublicShareSummary, ShareHead, ShareKeypair, ShareVisibility,
 };
 pub use net_fetch::{
-    BoxedStream, DirectRequestTransport, FetchPolicy, PeerConnector, ProgressCallback,
-    RelayAwareTransport, RequestTransport, SessionPoolTransport, download_swarm_over_network,
-    download_swarm_to_file, fetch_manifest_with_retry, send_request_on_stream,
+    BoxedStream, DirectRequestTransport, FetchPolicy, OwnedRelayAwareTransport, PeerConnector,
+    ProgressCallback, RelayAwareTransport, RequestTransport, SessionPoolTransport,
+    download_swarm_over_network, download_swarm_to_file, fetch_manifest_with_retry,
+    send_request_on_stream,
 };
 pub use peer::{PeerAddr, RelayRoute, TransportProtocol};
 pub use peer_db::{

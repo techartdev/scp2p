@@ -9,12 +9,13 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
+use tracing::{debug, info};
 
 use crate::{
     content::describe_content,
     dht::DEFAULT_TTL_SECS,
-    dht_keys::{content_provider_key, share_head_key},
-    ids::ShareId,
+    dht_keys::{content_provider_key, manifest_loc_key, share_head_key},
+    ids::{ManifestId, ShareId},
     manifest::{ItemV1, ManifestV1, ShareHead, ShareKeypair, ShareVisibility},
     peer::PeerAddr,
     wire::Providers,
@@ -23,8 +24,8 @@ use crate::{
 use super::{
     NodeHandle, NodeState, ShareItemInfo,
     helpers::{
-        collect_files_recursive, mime_from_extension, normalize_item_path,
-        now_unix_secs, persist_state,
+        collect_files_recursive, mime_from_extension, normalize_item_path, now_unix_secs,
+        persist_state,
     },
 };
 
@@ -39,6 +40,14 @@ impl NodeHandle {
         manifest.verify()?;
         let manifest_id = manifest.manifest_id()?.0;
         let share_id = ShareId(manifest.share_id);
+        info!(
+            share_id = hex::encode(share_id.0),
+            manifest_id = hex::encode(manifest_id),
+            seq = manifest.seq,
+            items = manifest.items.len(),
+            title = manifest.title.as_deref().unwrap_or(""),
+            "publishing share"
+        );
 
         let head = ShareHead::new_signed(
             share_id.0,
@@ -50,19 +59,36 @@ impl NodeHandle {
 
         let manifest_id = {
             let mut state = self.state.write().await;
-            state.manifest_cache.insert(manifest_id, manifest);
-            state.published_share_heads.insert(share_id.0, head.clone());
+            let now = now_unix_secs()?;
+            // Store share head in DHT so peers can discover latest seq.
             state.dht.store(
                 share_head_key(&share_id),
                 crate::cbor::to_vec(&head)?,
                 DEFAULT_TTL_SECS,
-                now_unix_secs()?,
+                now,
             )?;
+            // Store serialised manifest in DHT so peers behind NAT can
+            // fetch it without a direct connection to the publisher.
+            let manifest_bytes = crate::cbor::to_vec(&manifest)?;
+            state.dht.store(
+                manifest_loc_key(&ManifestId(manifest_id)),
+                manifest_bytes,
+                DEFAULT_TTL_SECS,
+                now,
+            )?;
+            state.manifest_cache.insert(manifest_id, manifest);
+            state.published_share_heads.insert(share_id.0, head.clone());
             state.dirty.manifests = true;
             state.dirty.share_heads = true;
             manifest_id
         };
         persist_state(self).await?;
+
+        info!(
+            share_id = hex::encode(share_id.0),
+            manifest_id = hex::encode(manifest_id),
+            "share published and persisted"
+        );
 
         Ok(manifest_id)
     }
@@ -80,6 +106,12 @@ impl NodeHandle {
         crate::blob_store::validate_no_traversal(&path)?;
         let desc = describe_content(content_bytes);
         let content_id = desc.content_id.0;
+        debug!(
+            content_id = hex::encode(content_id),
+            size = content_bytes.len(),
+            path = %path.display(),
+            "registering content by path"
+        );
         let now = now_unix_secs()?;
         let mut state = self.state.write().await;
 

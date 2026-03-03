@@ -11,17 +11,18 @@ use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use rand::{RngCore, rngs::OsRng};
 use scp2p_core::{
-    BoxedStream, Capabilities, FetchPolicy, ItemV1, ManifestV1, Node,
-    NodeConfig, NodeHandle, OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord,
-    PublicShareSummary, RelayAwareTransport, SearchPageQuery, ShareItemInfo, ShareVisibility,
-    SqliteStore, Store, TransportProtocol, build_tls_server_handle, describe_content,
-    quic_connect_bi_session_insecure, start_quic_server, tls_connect_session_insecure,
+    BoxedStream, Capabilities, FetchPolicy, Node, NodeConfig, NodeHandle, OwnedRelayAwareTransport,
+    OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord, PublicShareSummary, RelayAwareTransport,
+    SearchPageQuery, ShareItemInfo, ShareVisibility, SqliteStore, Store, TransportProtocol,
+    build_tls_server_handle, quic_connect_bi_session_insecure, start_quic_server,
+    tls_connect_session_insecure,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
+use tracing::info;
 
 use crate::dto::{
     CommunityBrowseView, CommunityParticipantView, CommunityView, CreateCommunityResult,
@@ -45,6 +46,8 @@ struct RuntimeState {
     tls_service_task: Option<JoinHandle<anyhow::Result<()>>>,
     quic_service_task: Option<JoinHandle<anyhow::Result<()>>>,
     lan_discovery_task: Option<JoinHandle<anyhow::Result<()>>>,
+    dht_republish_task: Option<JoinHandle<()>>,
+    subscription_sync_task: Option<JoinHandle<()>>,
     last_public_shares: Vec<PublicShareView>,
 }
 
@@ -101,6 +104,12 @@ impl DesktopAppState {
     }
 
     pub async fn start_node(&self, request: StartNodeRequest) -> anyhow::Result<RuntimeStatus> {
+        info!(
+            bind_quic = ?request.bind_quic,
+            bind_tcp = ?request.bind_tcp,
+            bootstrap_peers = request.bootstrap_peers.len(),
+            "start_node: initializing"
+        );
         {
             let state = self.inner.read().await;
             if state.node.is_some() {
@@ -151,14 +160,50 @@ impl DesktopAppState {
                 caps,
             ));
         }
+
+        // Start DHT republish and subscription sync background loops.
+        // These run every 60 seconds and push/pull DHT values to/from
+        // bootstrap peers so that published shares are discoverable and
+        // subscribed shares stay up to date.
+        {
+            let connector = DesktopSessionConnector {
+                signing_key: state
+                    .node_signing_key
+                    .clone()
+                    .unwrap_or_else(|| SigningKey::generate(&mut OsRng)),
+                capabilities: Capabilities::default(),
+            };
+            let transport: Arc<dyn scp2p_core::RequestTransport> =
+                Arc::new(OwnedRelayAwareTransport::new(Arc::new(connector)));
+            let bootstrap = handle
+                .configured_bootstrap_peers()
+                .await
+                .unwrap_or_default();
+
+            const DHT_LOOP_INTERVAL: Duration = Duration::from_secs(60);
+
+            state.dht_republish_task = Some(handle.clone().start_dht_republish_loop(
+                transport.clone(),
+                bootstrap.clone(),
+                DHT_LOOP_INTERVAL,
+            ));
+            state.subscription_sync_task = Some(handle.clone().start_subscription_sync_loop(
+                transport,
+                bootstrap,
+                DHT_LOOP_INTERVAL,
+            ));
+        }
+
         state.node = Some(handle);
         state.state_db_path = Some(db_path);
         state.content_data_dir = content_data_dir;
         drop(state);
+        info!("start_node: node started successfully");
         self.status().await
     }
 
     pub async fn stop_node(&self) -> RuntimeStatus {
+        info!("stop_node: stopping node");
         let mut state = self.inner.write().await;
         if let Some(task) = state.tls_service_task.take() {
             task.abort();
@@ -167,6 +212,12 @@ impl DesktopAppState {
             task.abort();
         }
         if let Some(task) = state.lan_discovery_task.take() {
+            task.abort();
+        }
+        if let Some(task) = state.dht_republish_task.take() {
+            task.abort();
+        }
+        if let Some(task) = state.subscription_sync_task.take() {
             task.abort();
         }
         state.node = None;
@@ -287,7 +338,7 @@ impl DesktopAppState {
         let keypair = node.ensure_publisher_identity(&label).await?;
         let share_id = keypair.share_id();
         let share_pubkey = keypair.verifying_key();
-        node.join_community(share_id, share_pubkey.to_bytes())
+        node.join_community_named(share_id, share_pubkey.to_bytes(), name.trim())
             .await?;
         Ok(CreateCommunityResult {
             share_id_hex: hex::encode(share_id.0),
@@ -322,6 +373,7 @@ impl DesktopAppState {
         &self,
         share_id_hex: &str,
     ) -> anyhow::Result<Vec<SubscriptionView>> {
+        info!(share_id = %share_id_hex, "subscribe_share");
         let node = self.node_handle().await?;
         let share_id = parse_hex_32(share_id_hex, "share_id")?;
         node.subscribe(scp2p_core::ShareId(share_id)).await?;
@@ -351,6 +403,7 @@ impl DesktopAppState {
     }
 
     pub async fn sync_now(&self) -> anyhow::Result<SyncResultView> {
+        info!("sync_now: starting manual sync");
         let node = self.node_handle().await?;
         // Snapshot subscription seqs before sync to detect updates.
         let before: std::collections::HashMap<String, u64> = {
@@ -377,6 +430,11 @@ impl DesktopAppState {
                     .is_none_or(|&old_seq| s.latest_seq > old_seq)
             })
             .count();
+        info!(
+            updated_count,
+            total = subscriptions.len(),
+            "sync_now: complete"
+        );
         Ok(SyncResultView {
             subscriptions,
             updated_count,
@@ -597,6 +655,7 @@ impl DesktopAppState {
         content_id_hex: &str,
         target_path: &str,
     ) -> anyhow::Result<()> {
+        info!(content_id = %content_id_hex, target = %target_path, "download_content: starting");
         let node = self.node_handle().await?;
         let content_id = parse_hex_32(content_id_hex, "content_id")?;
         let peers = self.sync_peer_targets(&node).await?;
@@ -615,93 +674,6 @@ impl DesktopAppState {
             None,
         )
         .await
-    }
-
-    pub async fn publish_text_share(
-        &self,
-        title: &str,
-        item_name: &str,
-        item_text: &str,
-        visibility: PublishVisibility,
-        community_ids_hex: &[String],
-    ) -> anyhow::Result<PublishResultView> {
-        let node = self.node_handle().await?;
-        let runtime = node.runtime_config().await;
-        let bind_tcp = runtime
-            .bind_tcp
-            .ok_or_else(|| anyhow::anyhow!("tcp bind must be enabled to publish"))?;
-        let peer_records = node.peer_records().await;
-        let advertise_ip = resolve_advertise_ip(bind_tcp, &peer_records)?;
-        let provider = node
-            .relayed_self_addr(PeerAddr {
-                ip: advertise_ip,
-                port: bind_tcp.port(),
-                transport: TransportProtocol::Tcp,
-                pubkey_hint: None,
-                relay_via: None,
-            })
-            .await;
-
-        let payload = item_text.as_bytes().to_vec();
-        let content = describe_content(&payload);
-        let data_dir = {
-            let state = self.inner.read().await;
-            state
-                .content_data_dir
-                .clone()
-                .unwrap_or_else(|| std::env::temp_dir().join("scp2p-content"))
-        };
-        node.register_content_from_bytes(provider.clone(), &payload, &data_dir)
-            .await?;
-
-        let share = node.ensure_publisher_identity("default").await?;
-        let now = now_unix_secs()?;
-        let communities = resolve_joined_communities(&node, community_ids_hex).await?;
-        let next_seq = node
-            .published_share_head(share.share_id())
-            .await
-            .map(|head| head.latest_seq.saturating_add(1))
-            .unwrap_or(1);
-        let manifest = ManifestV1 {
-            version: 1,
-            share_pubkey: share.verifying_key().to_bytes(),
-            share_id: share.share_id().0,
-            seq: next_seq,
-            created_at: now,
-            expires_at: None,
-            title: Some(title.trim().to_string()),
-            description: Some("published from scp2p-desktop".to_string()),
-            visibility: share_visibility(visibility),
-            communities: communities
-                .iter()
-                .map(|community| community.share_id)
-                .collect(),
-            items: vec![ItemV1 {
-                content_id: content.content_id.0,
-                size: item_text.len() as u64,
-                name: item_name.trim().to_string(),
-                path: None,
-                mime: Some("text/plain".to_string()),
-                tags: vec!["desktop".to_string(), "lan".to_string()],
-                chunk_count: content.chunk_count,
-                chunk_list_hash: content.chunk_list_hash,
-            }],
-            recommended_shares: vec![],
-            signature: None,
-        };
-        let manifest_id = node.publish_share(manifest, &share).await?;
-
-        Ok(PublishResultView {
-            share_id_hex: hex::encode(share.share_id().0),
-            share_pubkey_hex: hex::encode(share.verifying_key().to_bytes()),
-            manifest_id_hex: hex::encode(manifest_id),
-            provider_addr: format!("{}:{}", provider.ip, provider.port),
-            visibility,
-            community_ids_hex: communities
-                .iter()
-                .map(|community| hex::encode(community.share_id))
-                .collect(),
-        })
     }
 
     pub async fn save_client_config(
@@ -792,6 +764,7 @@ impl DesktopAppState {
         visibility: PublishVisibility,
         community_ids_hex: &[String],
     ) -> anyhow::Result<PublishResultView> {
+        info!(files = file_paths.len(), title = %title, ?visibility, "publish_files: starting");
         let node = self.node_handle().await?;
         let runtime = node.runtime_config().await;
         let bind_tcp = runtime
@@ -811,7 +784,8 @@ impl DesktopAppState {
 
         let paths: Vec<std::path::PathBuf> =
             file_paths.iter().map(std::path::PathBuf::from).collect();
-        let share = node.ensure_publisher_identity("default").await?;
+        let label = unique_publisher_label();
+        let share = node.ensure_publisher_identity(&label).await?;
         let communities = resolve_joined_communities(&node, community_ids_hex).await?;
         let community_ids: Vec<[u8; 32]> = communities.iter().map(|c| c.share_id).collect();
 
@@ -848,6 +822,7 @@ impl DesktopAppState {
         visibility: PublishVisibility,
         community_ids_hex: &[String],
     ) -> anyhow::Result<PublishResultView> {
+        info!(dir = %dir_path, title = %title, ?visibility, "publish_folder: starting");
         let node = self.node_handle().await?;
         let runtime = node.runtime_config().await;
         let bind_tcp = runtime
@@ -865,7 +840,8 @@ impl DesktopAppState {
             })
             .await;
 
-        let share = node.ensure_publisher_identity("default").await?;
+        let label = unique_publisher_label();
+        let share = node.ensure_publisher_identity(&label).await?;
         let communities = resolve_joined_communities(&node, community_ids_hex).await?;
         let community_ids: Vec<[u8; 32]> = communities.iter().map(|c| c.share_id).collect();
 
@@ -1041,6 +1017,7 @@ fn community_view(community: scp2p_core::PersistedCommunity) -> CommunityView {
     CommunityView {
         share_id_hex: hex::encode(community.share_id),
         share_pubkey_hex: hex::encode(community.share_pubkey),
+        name: community.name,
     }
 }
 
@@ -1053,6 +1030,16 @@ fn public_share_view(peer: &PeerAddr, share: PublicShareSummary) -> PublicShareV
         title: share.title,
         description: share.description,
     }
+}
+
+/// Generate a unique publisher identity label for each new share.
+///
+/// Every call produces a distinct label so that each publish creates an
+/// independent share instead of overwriting the previous one.
+fn unique_publisher_label() -> String {
+    let mut buf = [0u8; 8];
+    OsRng.fill_bytes(&mut buf);
+    format!("share-{}", hex::encode(buf))
 }
 
 fn owned_share_view(record: OwnedShareRecord) -> OwnedShareView {
@@ -1189,12 +1176,6 @@ fn resolve_advertise_ip(
     Ok("127.0.0.1".parse().expect("loopback ip"))
 }
 
-fn now_unix_secs() -> anyhow::Result<u64> {
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1239,6 +1220,7 @@ mod tests {
             bind_tcp: "127.0.0.1:7401".parse().ok(),
             bootstrap_peers: vec!["127.0.0.1:7501".to_string()],
             auto_start: false,
+            log_level: "info".to_string(),
         };
 
         state

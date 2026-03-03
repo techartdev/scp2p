@@ -11,6 +11,7 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 use ed25519_dalek::SigningKey;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
+use tracing::{debug, info};
 
 use crate::transport_net::{
     QuicServerHandle, TlsServerHandle, quic_accept_bi_session, tls_accept_session,
@@ -149,9 +150,15 @@ impl NodeHandle {
         target_node_id: [u8; 20],
         seed_peers: &[PeerAddr],
     ) -> anyhow::Result<Vec<PeerAddr>> {
+        let target_hex = hex::encode(&target_node_id[..8]);
         let mut peers = self
             .collect_seed_and_known_node_peers(target_node_id, seed_peers)
             .await;
+        debug!(
+            target = %target_hex,
+            initial_peers = peers.len(),
+            "dht_find_node_iterative: starting"
+        );
         let mut queried = HashSet::new();
 
         loop {
@@ -169,8 +176,24 @@ impl NodeHandle {
             let mut discovered = false;
             for peer in to_query {
                 queried.insert(peer_key(&peer));
-                if let Ok(result) = query_find_node(transport, &peer, target_node_id).await {
-                    discovered |= merge_peer_list(&mut peers, result.peers);
+                match query_find_node(transport, &peer, target_node_id).await {
+                    Ok(result) => {
+                        debug!(
+                            target = %target_hex,
+                            peer = ?peer,
+                            returned_peers = result.peers.len(),
+                            "dht_find_node_iterative: queried peer"
+                        );
+                        discovered |= merge_peer_list(&mut peers, result.peers);
+                    }
+                    Err(e) => {
+                        debug!(
+                            target = %target_hex,
+                            peer = ?peer,
+                            error = %e,
+                            "dht_find_node_iterative: peer query failed"
+                        );
+                    }
                 }
             }
             if !discovered {
@@ -180,6 +203,12 @@ impl NodeHandle {
 
         sort_peers_for_target(&mut peers, target_node_id);
         peers.truncate(K);
+        debug!(
+            target = %target_hex,
+            result_peers = peers.len(),
+            queried = queried.len(),
+            "dht_find_node_iterative: complete"
+        );
         Ok(peers)
     }
 
@@ -189,7 +218,10 @@ impl NodeHandle {
         key: [u8; 32],
         seed_peers: &[PeerAddr],
     ) -> anyhow::Result<Option<DhtValue>> {
+        let key_hex = hex::encode(&key[..8]);
+        debug!(key = %key_hex, "dht_find_value_iterative: starting");
         if let Some(value) = self.dht_find_value(key).await? {
+            debug!(key = %key_hex, "dht_find_value_iterative: found locally");
             return Ok(Some(value));
         }
 
@@ -232,6 +264,7 @@ impl NodeHandle {
                         remote.ttl_secs.max(DEFAULT_TTL_SECS),
                         now,
                     )?;
+                    debug!(key = %key_hex, "dht_find_value_iterative: found remotely");
                     return Ok(state.dht.find_value(key, now));
                 }
                 discovered |= merge_peer_list(&mut peers, result.closer_peers);
@@ -241,6 +274,7 @@ impl NodeHandle {
             }
         }
 
+        debug!(key = %key_hex, queried = queried.len(), "dht_find_value_iterative: not found");
         Ok(None)
     }
 
@@ -251,6 +285,7 @@ impl NodeHandle {
         share_pubkey: Option<[u8; 32]>,
         seed_peers: &[PeerAddr],
     ) -> anyhow::Result<Option<ShareHead>> {
+        debug!(?share_id, "dht_find_share_head_iterative: starting");
         let key = share_head_key(&share_id);
         let local_best = self
             .dht_find_value(key)
@@ -323,6 +358,19 @@ impl NodeHandle {
                 break;
             }
         }
+        if best.is_some() {
+            info!(
+                ?share_id,
+                queried = queried.len(),
+                "dht_find_share_head_iterative: found head"
+            );
+        } else {
+            debug!(
+                ?share_id,
+                queried = queried.len(),
+                "dht_find_share_head_iterative: no head found"
+            );
+        }
         Ok(best)
     }
 
@@ -348,9 +396,21 @@ impl NodeHandle {
         };
         persist_state(self).await?;
 
+        info!(
+            active_values = values.len(),
+            seed_peers = seed_peers.len(),
+            "DHT republish: starting"
+        );
+
         let mut republished = 0usize;
+        let total = values.len();
         for value in values {
             if validate_dht_value_for_known_keyspaces(value.key, &value.value).is_err() {
+                debug!(
+                    key = %hex::encode(&value.key[..8]),
+                    value_len = value.value.len(),
+                    "DHT republish: skipping value that fails validation"
+                );
                 continue;
             }
             let replication_factor = if value.is_popular() { K * 2 } else { K };
@@ -368,6 +428,7 @@ impl NodeHandle {
                 republished += 1;
             }
         }
+        info!(republished, total, "DHT republish: complete");
         Ok(republished)
     }
 
@@ -377,6 +438,11 @@ impl NodeHandle {
         seed_peers: Vec<PeerAddr>,
         interval: Duration,
     ) -> JoinHandle<()> {
+        info!(
+            interval_secs = interval.as_secs(),
+            seed_peers = seed_peers.len(),
+            "starting DHT republish loop"
+        );
         tokio::spawn(async move {
             loop {
                 let _ = self
@@ -393,6 +459,11 @@ impl NodeHandle {
         seed_peers: Vec<PeerAddr>,
         interval: Duration,
     ) -> JoinHandle<()> {
+        info!(
+            interval_secs = interval.as_secs(),
+            seed_peers = seed_peers.len(),
+            "starting subscription sync loop"
+        );
         tokio::spawn(async move {
             loop {
                 let _ = self

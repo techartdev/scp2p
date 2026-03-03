@@ -152,22 +152,6 @@ export async function downloadContent(
 
 // ── Publish ─────────────────────────────────────────────────────────────
 
-export async function publishTextShare(
-  title: string,
-  itemName: string,
-  itemText: string,
-  visibility: PublishVisibility,
-  communityIdsHex: string[]
-): Promise<PublishResultView> {
-  return invoke("publish_text_share", {
-    title,
-    itemName,
-    itemText,
-    visibility,
-    communityIdsHex,
-  });
-}
-
 export async function publishFiles(
   filePaths: string[],
   title: string,
@@ -240,4 +224,10 @@ export async function exportShareSecret(
   shareIdHex: string
 ): Promise<string> {
   return invoke("export_share_secret", { shareIdHex });
+}
+
+// ── Logging ─────────────────────────────────────────────────────────────
+
+export async function getLogFilePath(): Promise<string> {
+  return invoke("get_log_file_path");
 }

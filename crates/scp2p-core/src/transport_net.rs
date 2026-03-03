@@ -104,7 +104,12 @@ pub async fn tls_connect_session(
     let server_name = rustls::pki_types::ServerName::try_from(server_name.to_string())
         .context("invalid tls server name")?;
 
-    let tcp_stream = TcpStream::connect(remote_addr).await?;
+    let tcp_stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        TcpStream::connect(remote_addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("TCP connect timed out after 5s"))??;
     let mut tls_stream = connector.connect(server_name, tcp_stream).await?;
     let session = handshake_initiator(
         &mut tls_stream,
@@ -251,9 +256,9 @@ fn quic_transport_config() -> Arc<TransportConfig> {
     config.keep_alive_interval(Some(std::time::Duration::from_millis(
         QUIC_KEEP_ALIVE_INTERVAL_MS as u64,
     )));
-    config.max_idle_timeout(Some(
-        quinn::IdleTimeout::from(VarInt::from_u32(QUIC_MAX_IDLE_TIMEOUT_MS)),
-    ));
+    config.max_idle_timeout(Some(quinn::IdleTimeout::from(VarInt::from_u32(
+        QUIC_MAX_IDLE_TIMEOUT_MS,
+    ))));
     config.initial_rtt(std::time::Duration::from_millis(QUIC_INITIAL_RTT_MS));
     Arc::new(config)
 }
@@ -333,7 +338,12 @@ pub async fn tls_connect_session_insecure(
     let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())
         .context("invalid tls server name")?;
 
-    let tcp_stream = TcpStream::connect(remote_addr).await?;
+    let tcp_stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        TcpStream::connect(remote_addr),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("TCP connect timed out after 5s"))??;
     let mut tls_stream = connector.connect(server_name, tcp_stream).await?;
     let session = handshake_initiator(
         &mut tls_stream,
@@ -368,7 +378,9 @@ pub async fn quic_connect_bi_session_insecure(
     endpoint.set_default_client_config(quinn_client);
 
     let connecting = endpoint.connect(remote_addr, "localhost")?;
-    let connection = connecting.await?;
+    let connection = tokio::time::timeout(std::time::Duration::from_secs(5), connecting)
+        .await
+        .map_err(|_| anyhow::anyhow!("QUIC connect timed out after 5s"))??;
     let (send, recv) = connection.open_bi().await?;
     let mut stream = QuicBiStream { send, recv };
     let session = handshake_initiator(

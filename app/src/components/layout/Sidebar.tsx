@@ -153,7 +153,7 @@ export function Sidebar({ currentPage, onNavigate, nodeRunning, appVersion, down
       {/* Footer */}
       <div className="px-5 py-4 border-t border-border space-y-2">
         <a
-          href="https://github.com/nicholasgasior/scp2p"
+          href="https://docs.scp2p.com/"
           target="_blank"
           rel="noopener noreferrer"
           className="flex items-center gap-2 text-[11px] text-text-muted hover:text-accent transition-colors group"

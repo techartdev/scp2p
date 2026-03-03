@@ -231,8 +231,8 @@ pub fn load_file_config(path: Option<&std::path::Path>) -> anyhow::Result<FileCo
     let Some(p) = path else {
         return Ok(FileConfig::default());
     };
-    let raw = std::fs::read_to_string(p)
-        .with_context(|| format!("read config file: {}", p.display()))?;
+    let raw =
+        std::fs::read_to_string(p).with_context(|| format!("read config file: {}", p.display()))?;
     let cfg: FileConfig =
         toml::from_str(&raw).with_context(|| format!("parse config file: {}", p.display()))?;
     Ok(cfg)

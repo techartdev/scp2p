@@ -13,10 +13,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{InquireError, Select, Text};
 use rand::rngs::OsRng;
 use scp2p_core::{
-    BoxedStream, Capabilities, DirectRequestTransport, FetchPolicy, Node, NodeConfig, NodeId,
-    PeerAddr, PeerConnector, PersistedCommunity, SearchQuery, ShareId, ShareVisibility,
-    SqliteStore, Store, TransportProtocol, build_tls_server_handle,
-    quic_connect_bi_session_insecure, tls_connect_session_insecure,
+    BoxedStream, Capabilities, FetchPolicy, Node, NodeConfig, NodeId, OwnedRelayAwareTransport,
+    PeerAddr, PeerConnector, PersistedCommunity, RelayAwareTransport, RequestTransport,
+    SearchQuery, ShareId, ShareVisibility, SqliteStore, Store, TransportProtocol,
+    build_tls_server_handle, quic_connect_bi_session_insecure, tls_connect_session_insecure,
 };
 
 // ── Internal connector ────────────────────────────────────────────────────────
@@ -62,18 +62,27 @@ struct Ctx {
     node_key: SigningKey,
     node_id: NodeId,
     share_id: ShareId,
+    connector: CliConnector,
     db: String,
     port: u16,
     bootstrap_peers: Vec<PeerAddr>,
 }
 
 impl Ctx {
-    fn connector(&self) -> CliConnector {
-        CliConnector { signing_key: self.node_key.clone() }
+    fn new_connector(&self) -> CliConnector {
+        CliConnector {
+            signing_key: self.node_key.clone(),
+        }
     }
 
-    fn transport(&self) -> DirectRequestTransport<CliConnector> {
-        DirectRequestTransport::new(self.connector())
+    fn unique_publisher_label() -> String {
+        let mut buf = [0u8; 8];
+        rand::RngCore::fill_bytes(&mut OsRng, &mut buf);
+        format!("share-{}", hex::encode(buf))
+    }
+
+    fn transport(&self) -> RelayAwareTransport<'_, CliConnector> {
+        RelayAwareTransport::new(&self.connector)
     }
 
     fn provider_addr(&self) -> PeerAddr {
@@ -118,10 +127,41 @@ pub async fn run(db: String, bootstrap_raw: Vec<String>, port: u16) -> anyhow::R
         tls,
     );
 
-    let bootstrap_peers: Vec<PeerAddr> =
-        bootstrap_raw.iter().filter_map(|s| parse_peer(s).ok()).collect();
+    let bootstrap_peers: Vec<PeerAddr> = bootstrap_raw
+        .iter()
+        .filter_map(|s| parse_peer(s).ok())
+        .collect();
 
-    let ctx = Ctx { node, node_key, node_id, share_id, db, port, bootstrap_peers };
+    // Start background DHT republish + subscription sync loops.
+    let connector_arc = Arc::new(CliConnector {
+        signing_key: node_key.clone(),
+    });
+    let owned_transport: Arc<dyn RequestTransport> =
+        Arc::new(OwnedRelayAwareTransport::new(connector_arc));
+    let _dht_loop = node.clone().start_dht_republish_loop(
+        owned_transport.clone(),
+        bootstrap_peers.clone(),
+        Duration::from_secs(60),
+    );
+    let _sync_loop = node.clone().start_subscription_sync_loop(
+        owned_transport,
+        bootstrap_peers.clone(),
+        Duration::from_secs(60),
+    );
+
+    let connector = CliConnector {
+        signing_key: node_key.clone(),
+    };
+    let ctx = Ctx {
+        node,
+        node_key,
+        node_id,
+        share_id,
+        connector,
+        db,
+        port,
+        bootstrap_peers,
+    };
 
     // ── Welcome banner ────────────────────────────────────────────────────────
     print_banner(&ctx);
@@ -192,7 +232,11 @@ async fn cmd_status(ctx: &Ctx) -> anyhow::Result<()> {
     println!("  Partial DLs    : {}", s.partial_downloads.len());
     println!(
         "  Search index   : {}",
-        if s.search_index.is_some() { "present" } else { "absent" }
+        if s.search_index.is_some() {
+            "present"
+        } else {
+            "absent"
+        }
     );
     Ok(())
 }
@@ -200,17 +244,21 @@ async fn cmd_status(ctx: &Ctx) -> anyhow::Result<()> {
 // ── Publish files ─────────────────────────────────────────────────────────────
 
 async fn cmd_publish_files(ctx: &Ctx) -> anyhow::Result<()> {
-    let title =
-        match opt(Text::new("Share title:").with_default("Shared Files").prompt())? {
-            Some(v) => v,
-            None => return Ok(()),
-        };
+    let title = match opt(Text::new("Share title:")
+        .with_default("Shared Files")
+        .prompt())?
+    {
+        Some(v) => v,
+        None => return Ok(()),
+    };
 
-    let files_raw =
-        match opt(Text::new("File paths (comma-separated):").with_placeholder("/a/b.txt,/c/d.txt").prompt())? {
-            Some(v) => v,
-            None => return Ok(()),
-        };
+    let files_raw = match opt(Text::new("File paths (comma-separated):")
+        .with_placeholder("/a/b.txt,/c/d.txt")
+        .prompt())?
+    {
+        Some(v) => v,
+        None => return Ok(()),
+    };
 
     let vis_choice = match opt(Select::new("Visibility:", vec!["private", "public"]).prompt())? {
         Some(v) => v,
@@ -229,7 +277,8 @@ async fn cmd_publish_files(ctx: &Ctx) -> anyhow::Result<()> {
     }
 
     let vis = parse_vis(vis_choice);
-    let share = ctx.node.ensure_publisher_identity("default").await?;
+    let label = Ctx::unique_publisher_label();
+    let share = ctx.node.ensure_publisher_identity(&label).await?;
     let provider = ctx.provider_addr();
 
     let pb = spinner(format!("Publishing {} file(s)…", paths.len()).as_str());
@@ -254,7 +303,10 @@ async fn cmd_publish_folder(ctx: &Ctx) -> anyhow::Result<()> {
         None => return Ok(()),
     };
 
-    let title = match opt(Text::new("Share title:").with_default("Shared Folder").prompt())? {
+    let title = match opt(Text::new("Share title:")
+        .with_default("Shared Folder")
+        .prompt())?
+    {
         Some(v) => v,
         None => return Ok(()),
     };
@@ -265,13 +317,22 @@ async fn cmd_publish_folder(ctx: &Ctx) -> anyhow::Result<()> {
     };
 
     let vis = parse_vis(vis_choice);
-    let share = ctx.node.ensure_publisher_identity("default").await?;
+    let label = Ctx::unique_publisher_label();
+    let share = ctx.node.ensure_publisher_identity(&label).await?;
     let provider = ctx.provider_addr();
 
     let pb = spinner("Publishing folder…");
     let manifest_id = ctx
         .node
-        .publish_folder(std::path::Path::new(&dir), &title, None, vis, &[], provider, &share)
+        .publish_folder(
+            std::path::Path::new(&dir),
+            &title,
+            None,
+            vis,
+            &[],
+            provider,
+            &share,
+        )
         .await?;
     pb.finish_and_clear();
 
@@ -332,7 +393,11 @@ async fn cmd_browse_share(ctx: &Ctx) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    println!("\n  {} item(s) in share {}…", items.len(), &share_id_hex[..16]);
+    println!(
+        "\n  {} item(s) in share {}…",
+        items.len(),
+        &share_id_hex[..16]
+    );
     println!();
     for (i, item) in items.iter().enumerate() {
         println!(
@@ -383,16 +448,16 @@ async fn cmd_subscriptions(ctx: &Ctx) -> anyhow::Result<()> {
                 }
             }
             c if c.contains("Subscribe") => {
-                let share_id_hex =
-                    match opt(Text::new("Share ID (64 hex chars):").prompt())? {
-                        Some(s) => s,
-                        None => continue,
-                    };
-                let pubkey_hex = match opt(
-                    Text::new("Share public key (hex, optional – press Enter to skip):")
-                        .with_default("")
-                        .prompt(),
-                )? {
+                let share_id_hex = match opt(Text::new("Share ID (64 hex chars):").prompt())? {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let pubkey_hex = match opt(Text::new(
+                    "Share public key (hex, optional – press Enter to skip):",
+                )
+                .with_default("")
+                .prompt())?
+                {
                     Some(s) => s,
                     None => continue,
                 };
@@ -404,7 +469,9 @@ async fn cmd_subscriptions(ctx: &Ctx) -> anyhow::Result<()> {
                     Some(parse_hex_32(&pubkey_hex, "share_pubkey")?)
                 };
 
-                ctx.node.subscribe_with_pubkey(ShareId(share_id), pubkey).await?;
+                ctx.node
+                    .subscribe_with_pubkey(ShareId(share_id), pubkey)
+                    .await?;
                 println!("\n  ✓  Subscribed to {}", hex::encode(share_id));
             }
             c if c.contains("Sync") => {
@@ -443,8 +510,10 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                 } else {
                     println!("\n  {} community / communities:", communities.len());
                     for c in &communities {
+                        let label = c.name.as_deref().unwrap_or("unnamed");
                         println!(
-                            "  share_id={}  pubkey={}",
+                            "  {}  share_id={}  pubkey={}",
+                            label,
                             hex::encode(c.share_id),
                             hex::encode(c.share_pubkey),
                         );
@@ -464,13 +533,13 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                 let share_id = keypair.share_id();
                 let share_pubkey = keypair.verifying_key();
                 ctx.node
-                    .join_community(share_id, share_pubkey.to_bytes())
+                    .join_community_named(share_id, share_pubkey.to_bytes(), &name)
                     .await?;
                 pb.finish_and_clear();
 
                 let sid_hex = hex::encode(share_id.0);
-                let pk_hex  = hex::encode(share_pubkey.to_bytes());
-                let sk_hex  = hex::encode(keypair.signing_key.to_bytes());
+                let pk_hex = hex::encode(share_pubkey.to_bytes());
+                let sk_hex = hex::encode(keypair.signing_key.to_bytes());
 
                 println!();
                 println!("  \u{2713}  Community created");
@@ -483,18 +552,16 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
 
             // ── Join ─────────────────────────────────────────────────────────
             c if c.contains("Join") => {
-                let share_id_hex = match opt(
-                    Text::new("Community Share ID (64 hex chars):").prompt(),
-                )? {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let pubkey_hex = match opt(
-                    Text::new("Community Public Key (64 hex chars):").prompt(),
-                )? {
-                    Some(s) => s,
-                    None => continue,
-                };
+                let share_id_hex =
+                    match opt(Text::new("Community Share ID (64 hex chars):").prompt())? {
+                        Some(s) => s,
+                        None => continue,
+                    };
+                let pubkey_hex =
+                    match opt(Text::new("Community Public Key (64 hex chars):").prompt())? {
+                        Some(s) => s,
+                        None => continue,
+                    };
 
                 let share_id = parse_hex_32(&share_id_hex, "share_id")?;
                 let share_pubkey = parse_hex_32(&pubkey_hex, "share_pubkey")?;
@@ -515,12 +582,12 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                     .iter()
                     .map(|c| format!("{}...", hex::encode(&c.share_id[..8])))
                     .collect();
-                let pick = match opt(
-                    Select::new("Pick a community to leave:", choices.clone()).prompt(),
-                )? {
-                    Some(p) => p,
-                    None => continue,
-                };
+                let pick =
+                    match opt(Select::new("Pick a community to leave:", choices.clone()).prompt())?
+                    {
+                        Some(p) => p,
+                        None => continue,
+                    };
                 let idx = choices.iter().position(|ch| *ch == pick).unwrap_or(0);
                 let target = &communities[idx];
                 ctx.node.leave_community(ShareId(target.share_id)).await?;
@@ -538,9 +605,7 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                     continue;
                 }
                 if ctx.bootstrap_peers.is_empty() {
-                    println!(
-                        "\n  No bootstrap peers configured — unable to browse without peers."
-                    );
+                    println!("\n  No bootstrap peers configured — unable to browse without peers.");
                     continue;
                 }
 
@@ -549,7 +614,7 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                     .map(|c| format!("{}...", hex::encode(&c.share_id[..8])))
                     .collect();
                 let pick = match opt(
-                    Select::new("Pick a community to browse:", choices.clone()).prompt(),
+                    Select::new("Pick a community to browse:", choices.clone()).prompt()
                 )? {
                     Some(p) => p,
                     None => continue,
@@ -576,10 +641,7 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                 }
                 pb.finish_and_clear();
 
-                println!(
-                    "\n  Community {}",
-                    hex::encode(community.share_id)
-                );
+                println!("\n  Community {}", hex::encode(community.share_id));
                 if participants.is_empty() {
                     println!("  No participants discovered via bootstrap peers.");
                 } else {
@@ -643,7 +705,7 @@ async fn cmd_download_content(ctx: &Ctx) -> anyhow::Result<()> {
     let mut peers = ctx.bootstrap_peers.clone();
     peers.extend(extra);
 
-    let connector = ctx.connector();
+    let connector = ctx.new_connector();
     let pb = spinner("Downloading…");
     ctx.node
         .download_from_peers(
@@ -687,7 +749,12 @@ async fn cmd_download_share(ctx: &Ctx) -> anyhow::Result<()> {
     println!("\n  {} item(s) available:", items.len());
     println!();
     for (i, item) in items.iter().enumerate() {
-        println!("  [{:>3}]  {}  ({})", i + 1, item.name, human_size(item.size));
+        println!(
+            "  [{:>3}]  {}  ({})",
+            i + 1,
+            item.name,
+            human_size(item.size)
+        );
     }
     println!();
 
@@ -700,7 +767,8 @@ async fn cmd_download_share(ctx: &Ctx) -> anyhow::Result<()> {
         None => return Ok(()),
     };
 
-    let to_download: Vec<&scp2p_core::ShareItemInfo> = if sel_raw.trim().eq_ignore_ascii_case("all") {
+    let to_download: Vec<&scp2p_core::ShareItemInfo> = if sel_raw.trim().eq_ignore_ascii_case("all")
+    {
         items.iter().collect()
     } else {
         let indices: Vec<usize> = sel_raw
@@ -720,7 +788,7 @@ async fn cmd_download_share(ctx: &Ctx) -> anyhow::Result<()> {
     let mut peers = ctx.bootstrap_peers.clone();
     peers.extend(extra);
 
-    let connector = ctx.connector();
+    let connector = ctx.new_connector();
     let policy = FetchPolicy::default();
     let target = std::path::Path::new(&out_dir);
 
@@ -733,7 +801,9 @@ async fn cmd_download_share(ctx: &Ctx) -> anyhow::Result<()> {
         let dest = rel_norm
             .split('/')
             .filter(|p: &&str| !p.is_empty() && *p != "..")
-            .fold(target.to_path_buf(), |acc: std::path::PathBuf, p| acc.join(p));
+            .fold(target.to_path_buf(), |acc: std::path::PathBuf, p| {
+                acc.join(p)
+            });
         if let Some(parent) = dest.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -749,11 +819,18 @@ async fn cmd_download_share(ctx: &Ctx) -> anyhow::Result<()> {
             )
             .await?;
         count += 1;
-        pb.set_message(format!("Downloading {}/{} file(s)…", count, to_download.len()));
+        pb.set_message(format!(
+            "Downloading {}/{} file(s)…",
+            count,
+            to_download.len()
+        ));
     }
     pb.finish_and_clear();
 
-    println!("\n  ✓  Downloaded {} file(s)  →  {out_dir}", to_download.len());
+    println!(
+        "\n  ✓  Downloaded {} file(s)  →  {out_dir}",
+        to_download.len()
+    );
     Ok(())
 }
 
@@ -772,7 +849,9 @@ async fn cmd_sync(ctx: &Ctx) -> anyhow::Result<()> {
 
     let transport = ctx.transport();
     let pb = spinner("Syncing subscriptions…");
-    ctx.node.sync_subscriptions_over_dht(&transport, &peers).await?;
+    ctx.node
+        .sync_subscriptions_over_dht(&transport, &peers)
+        .await?;
     pb.finish_and_clear();
 
     let s = ctx.load_state().await?;
@@ -869,11 +948,12 @@ fn human_size(bytes: u64) -> String {
 /// Prompt for extra peer addresses to use for a single operation.
 /// Returns an empty vec on cancel or empty input.
 fn prompt_extra_peers() -> anyhow::Result<Vec<PeerAddr>> {
-    let raw = match opt(
-        Text::new("Extra peer addresses (comma-separated IP:PORT, or Enter to skip):")
-            .with_default("")
-            .prompt(),
-    )? {
+    let raw = match opt(Text::new(
+        "Extra peer addresses (comma-separated IP:PORT, or Enter to skip):",
+    )
+    .with_default("")
+    .prompt())?
+    {
         Some(s) => s,
         None => return Ok(vec![]),
     };
@@ -900,15 +980,15 @@ fn prompt_extra_peers() -> anyhow::Result<Vec<PeerAddr>> {
 fn print_banner(ctx: &Ctx) {
     let col = std::io::stdout().is_terminal();
     let b = if col { "\x1b[94m" } else { "" }; // bright blue  — nodes + lines
-    let d = if col { "\x1b[2m"  } else { "" }; // dim          — ring dots
-    let r = if col { "\x1b[0m"  } else { "" }; // reset
-    let w = if col { "\x1b[1m"  } else { "" }; // bold         — wordmark
+    let d = if col { "\x1b[2m" } else { "" }; // dim          — ring dots
+    let r = if col { "\x1b[0m" } else { "" }; // reset
+    let w = if col { "\x1b[1m" } else { "" }; // bold         — wordmark
 
     println!();
     //                              col: 0         1         2         3
     //                                   0123456789012345678901234567890123456
-    println!("  {d}             · · · · · ·{r}");               // ring top
-    println!("  {d}     ·                     ·{r}");             // ring arc
+    println!("  {d}             · · · · · ·{r}"); // ring top
+    println!("  {d}     ·                     ·{r}"); // ring arc
     println!("  {d}   · {r}            {b}●{r}{d}            ·{r}"); // top node (col 19)
     println!("  {d}  · {r}         {b}╱   │   ╲{r}{d}          ·{r}"); // diag row 1
     println!("  {d} · {r}     {b}╱        │        ╲{r}{d}      ·{r}"); // diag row 2
@@ -917,7 +997,7 @@ fn print_banner(ctx: &Ctx) {
     println!("  {d}  · {r}         {b}╲   │   ╱{r}{d}         ·{r}"); // diag row 1
     println!("  {d}   · {r}            {b}●{r}{d}           ·{r}"); // bottom node
     println!("  {d}     ·                     ·{r}"); // ring arc
-    println!("  {d}             · · · · · ·{r}");               // ring bottom
+    println!("  {d}             · · · · · ·{r}"); // ring bottom
     println!();
     println!("  {w}           S  C  P  2  P{r}  \u{2014}  Interactive Shell");
     println!();

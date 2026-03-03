@@ -27,6 +27,13 @@ pub struct DesktopClientConfig {
     /// When true, the desktop app will start the node automatically on launch.
     #[serde(default)]
     pub auto_start: bool,
+    /// Tracing log level filter (e.g. "warn", "info", "debug", "trace").
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 impl Default for DesktopClientConfig {
@@ -38,6 +45,7 @@ impl Default for DesktopClientConfig {
             bind_tcp: config.bind_tcp,
             bootstrap_peers: config.bootstrap_peers,
             auto_start: false,
+            log_level: "info".to_string(),
         }
     }
 }
@@ -85,6 +93,8 @@ pub struct SubscriptionView {
 pub struct CommunityView {
     pub share_id_hex: String,
     pub share_pubkey_hex: String,
+    /// Human-readable label (set at creation or join time).
+    pub name: Option<String>,
 }
 
 /// Returned when a new community is created.
@@ -232,6 +242,7 @@ mod tests {
         let view = CommunityView {
             share_id_hex: "03".repeat(32),
             share_pubkey_hex: "04".repeat(32),
+            name: Some("Test Community".to_string()),
         };
         let bytes = scp2p_core::cbor::to_vec(&view).expect("encode");
         let decoded: CommunityView = scp2p_core::cbor::from_slice(&bytes).expect("decode");
@@ -247,8 +258,7 @@ mod tests {
             name: "test-community".to_string(),
         };
         let bytes = scp2p_core::cbor::to_vec(&result).expect("encode");
-        let decoded: CreateCommunityResult =
-            scp2p_core::cbor::from_slice(&bytes).expect("decode");
+        let decoded: CreateCommunityResult = scp2p_core::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, result);
     }
 

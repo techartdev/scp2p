@@ -209,6 +209,8 @@ impl CommunityMembershipToken {
 struct CommunityMembership {
     pubkey: [u8; 32],
     token: Option<CommunityMembershipToken>,
+    /// Local human-readable label.
+    name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -473,6 +475,7 @@ impl NodeState {
                     CommunityMembership {
                         pubkey: community.share_pubkey,
                         token,
+                        name: community.name,
                     },
                 )
             })
@@ -482,7 +485,9 @@ impl NodeState {
         let mut publisher_identities: HashMap<String, [u8; 32]> = publisher_identities_raw
             .iter()
             .filter_map(|identity| {
-                identity.share_secret.map(|secret| (identity.label.clone(), secret))
+                identity
+                    .share_secret
+                    .map(|secret| (identity.label.clone(), secret))
             })
             .collect();
         let mut node_key_encrypted_publisher_secrets: HashMap<String, EncryptedSecret> =
@@ -608,6 +613,7 @@ impl NodeState {
                     .token
                     .as_ref()
                     .and_then(|t| crate::cbor::to_vec(t).ok()),
+                name: membership.name.clone(),
             })
             .collect();
         let publisher_identities = self
@@ -629,7 +635,10 @@ impl NodeState {
                     PersistedPublisherIdentity {
                         label: label.clone(),
                         // Omit plaintext when a node-key-encrypted form is available.
-                        share_secret: if self.node_key_encrypted_publisher_secrets.contains_key(label) {
+                        share_secret: if self
+                            .node_key_encrypted_publisher_secrets
+                            .contains_key(label)
+                        {
                             None
                         } else {
                             Some(*share_secret)
@@ -731,7 +740,7 @@ impl NodeHandle {
         let state = self.state.read().await;
         let config = state.runtime_config.clone();
         let pinned = &state.pinned_bootstrap_keys;
-        config
+        let mut peers = config
             .bootstrap_peers
             .iter()
             .map(|entry| {
@@ -783,7 +792,34 @@ impl NodeHandle {
                     relay_via: None,
                 })
             })
-            .collect()
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        // For each bootstrap peer, also add the alternate transport variant
+        // (TCP ↔ QUIC) so DHT operations can fall back if one protocol is
+        // blocked by the network.  Convention: TCP port = QUIC port + 1.
+        let mut extra = Vec::new();
+        for peer in &peers {
+            let alt = match peer.transport {
+                TransportProtocol::Quic => PeerAddr {
+                    port: peer.port.saturating_add(1),
+                    transport: TransportProtocol::Tcp,
+                    ..peer.clone()
+                },
+                TransportProtocol::Tcp => PeerAddr {
+                    port: peer.port.saturating_sub(1),
+                    transport: TransportProtocol::Quic,
+                    ..peer.clone()
+                },
+            };
+            if !peers
+                .iter()
+                .any(|p| p.ip == alt.ip && p.port == alt.port && p.transport == alt.transport)
+            {
+                extra.push(alt);
+            }
+        }
+        peers.extend(extra);
+        Ok(peers)
     }
 
     /// Record a TOFU-pinned public key for a bootstrap peer.
@@ -883,6 +919,7 @@ impl NodeHandle {
                     .token
                     .as_ref()
                     .and_then(|t| crate::cbor::to_vec(t).ok()),
+                name: membership.name.clone(),
             })
             .collect()
     }
@@ -939,7 +976,10 @@ impl NodeHandle {
             let mut changed = false;
             let labels: Vec<_> = state.publisher_identities.keys().cloned().collect();
             for label in labels {
-                if state.node_key_encrypted_publisher_secrets.contains_key(&label) {
+                if state
+                    .node_key_encrypted_publisher_secrets
+                    .contains_key(&label)
+                {
                     continue;
                 }
                 let secret = state.publisher_identities[&label];
@@ -1155,8 +1195,9 @@ impl NodeHandle {
                 anyhow::anyhow!("community strict mode: membership proof required")
             })?;
             let token: CommunityMembershipToken =
-                crate::cbor::from_slice(proof_bytes)
-                    .map_err(|_| anyhow::anyhow!("community strict mode: invalid membership proof encoding"))?;
+                crate::cbor::from_slice(proof_bytes).map_err(|_| {
+                    anyhow::anyhow!("community strict mode: invalid membership proof encoding")
+                })?;
             if token.member_node_pubkey != rpk {
                 anyhow::bail!(
                     "community strict mode: proof member_node_pubkey does not match requester"
@@ -1328,7 +1369,18 @@ impl NodeHandle {
         share_id: ShareId,
         share_pubkey: [u8; 32],
     ) -> anyhow::Result<()> {
-        self.join_community_with_token(share_id, share_pubkey, None)
+        self.join_community_with_options(share_id, share_pubkey, None, None)
+            .await
+    }
+
+    /// Join a community with a human-readable name.
+    pub async fn join_community_named(
+        &self,
+        share_id: ShareId,
+        share_pubkey: [u8; 32],
+        name: &str,
+    ) -> anyhow::Result<()> {
+        self.join_community_with_options(share_id, share_pubkey, None, Some(name.to_owned()))
             .await
     }
 
@@ -1343,6 +1395,18 @@ impl NodeHandle {
         share_id: ShareId,
         share_pubkey: [u8; 32],
         token: Option<CommunityMembershipToken>,
+    ) -> anyhow::Result<()> {
+        self.join_community_with_options(share_id, share_pubkey, token, None)
+            .await
+    }
+
+    /// Join a community with optional token and optional name.
+    pub async fn join_community_with_options(
+        &self,
+        share_id: ShareId,
+        share_pubkey: [u8; 32],
+        token: Option<CommunityMembershipToken>,
+        name: Option<String>,
     ) -> anyhow::Result<()> {
         let pubkey = VerifyingKey::from_bytes(&share_pubkey)?;
         let derived = ShareId::from_pubkey(&pubkey);
@@ -1362,6 +1426,7 @@ impl NodeHandle {
             CommunityMembership {
                 pubkey: share_pubkey,
                 token,
+                name,
             },
         );
         state.dirty.communities = true;

@@ -20,3 +20,7 @@ serde_json = "1"
 scp2p-desktop = { path = "../../crates/scp2p-desktop" }
 scp2p-core = { path = "../../crates/scp2p-core" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+dirs-next = "2"

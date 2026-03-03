@@ -92,6 +92,9 @@ pub struct PersistedCommunity {
     /// verifiable by any peer; when absent, membership is self-asserted.
     #[serde(default)]
     pub membership_token: Option<Vec<u8>>,
+    /// Local human-readable label set at creation or join time.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -947,7 +950,10 @@ pub fn decrypt_secret(secret: &EncryptedSecret, passphrase: &str) -> anyhow::Res
 /// because `node_key` is already a 32-byte random value.  Domain
 /// separation is provided by blake3's `derive_key` with a fixed context.
 /// Used by the publisher-key auto-protect-at-rest feature.
-pub fn encrypt_secret_with_key(secret: &[u8], node_key: &[u8; 32]) -> anyhow::Result<EncryptedSecret> {
+pub fn encrypt_secret_with_key(
+    secret: &[u8],
+    node_key: &[u8; 32],
+) -> anyhow::Result<EncryptedSecret> {
     let derived = blake3::derive_key("scp2p publisher-identity v1", node_key);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
     let mut nonce = [0u8; 24];
@@ -963,11 +969,17 @@ pub fn encrypt_secret_with_key(secret: &[u8], node_key: &[u8; 32]) -> anyhow::Re
 }
 
 /// Decrypt a secret that was encrypted by [`encrypt_secret_with_key`].
-pub fn decrypt_secret_with_key(secret: &EncryptedSecret, node_key: &[u8; 32]) -> anyhow::Result<Vec<u8>> {
+pub fn decrypt_secret_with_key(
+    secret: &EncryptedSecret,
+    node_key: &[u8; 32],
+) -> anyhow::Result<Vec<u8>> {
     let derived = blake3::derive_key("scp2p publisher-identity v1", node_key);
     let cipher = XChaCha20Poly1305::new(Key::from_slice(&derived));
     cipher
-        .decrypt(XNonce::from_slice(&secret.nonce), secret.ciphertext.as_ref())
+        .decrypt(
+            XNonce::from_slice(&secret.nonce),
+            secret.ciphertext.as_ref(),
+        )
         .map_err(|_| anyhow::anyhow!("failed to decrypt secret with key"))
 }
 
@@ -1163,7 +1175,10 @@ mod tests {
             .expect("ubuntu item");
         assert_eq!(ubuntu.tags, vec!["linux", "ubuntu"]);
         assert_eq!(ubuntu.title.as_deref(), Some("Linux Downloads"));
-        assert_eq!(ubuntu.description.as_deref(), Some("Open source Linux distributions"));
+        assert_eq!(
+            ubuntu.description.as_deref(),
+            Some("Open source Linux distributions")
+        );
 
         let fedora = loaded_items
             .iter()

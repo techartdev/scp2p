@@ -8,6 +8,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io::SeekFrom,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -221,6 +222,57 @@ impl<'a, C: PeerConnector> RequestTransport for RelayAwareTransport<'a, C> {
     }
 }
 
+/// Owning version of [`RelayAwareTransport`] that can be wrapped in `Arc` for
+/// use with long-running background loops (`start_dht_republish_loop`, etc.).
+pub struct OwnedRelayAwareTransport<C> {
+    connector: Arc<C>,
+}
+
+impl<C> OwnedRelayAwareTransport<C> {
+    pub fn new(connector: Arc<C>) -> Self {
+        Self { connector }
+    }
+}
+
+#[async_trait]
+impl<C: PeerConnector> RequestTransport for OwnedRelayAwareTransport<C> {
+    async fn request(
+        &self,
+        peer: &PeerAddr,
+        request: Envelope,
+        timeout_dur: Duration,
+    ) -> anyhow::Result<Envelope> {
+        if let Some(relay_route) = &peer.relay_via {
+            let mut stream = self.connector.connect(&relay_route.relay_addr).await?;
+            let inner_bytes = request.encode()?;
+            let relay_stream_msg = crate::wire::RelayStream {
+                relay_slot_id: relay_route.slot_id,
+                stream_id: 0,
+                kind: crate::wire::RelayPayloadKind::Content,
+                payload: inner_bytes,
+            };
+            let outer_request = Envelope::from_typed(
+                request.req_id,
+                0,
+                &WirePayload::RelayStream(relay_stream_msg),
+            )?;
+            let outer_response =
+                send_request_on_stream(&mut stream, outer_request, timeout_dur).await?;
+            let typed = outer_response.decode_typed()?;
+            match typed {
+                WirePayload::RelayStream(resp) => Envelope::decode(&resp.payload),
+                _ => anyhow::bail!(
+                    "relay tunnel: unexpected response type {:?}",
+                    outer_response.r#type
+                ),
+            }
+        } else {
+            let mut stream = self.connector.connect(peer).await?;
+            send_request_on_stream(&mut stream, request, timeout_dur).await
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FetchPolicy {
     pub attempts_per_peer: usize,
@@ -410,7 +462,10 @@ pub async fn download_swarm_over_network<T: RequestTransport + ?Sized>(
             let initial_score = policy.initial_reputations.get(&key).copied().unwrap_or(0);
             (
                 key,
-                PeerRuntimeStats { score: initial_score, ..PeerRuntimeStats::default() },
+                PeerRuntimeStats {
+                    score: initial_score,
+                    ..PeerRuntimeStats::default()
+                },
             )
         })
         .collect();
@@ -577,7 +632,10 @@ pub async fn download_swarm_to_file<T: RequestTransport + ?Sized>(
             let initial_score = policy.initial_reputations.get(&key).copied().unwrap_or(0);
             (
                 key,
-                PeerRuntimeStats { score: initial_score, ..PeerRuntimeStats::default() },
+                PeerRuntimeStats {
+                    score: initial_score,
+                    ..PeerRuntimeStats::default()
+                },
             )
         })
         .collect();

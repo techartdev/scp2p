@@ -14,14 +14,14 @@ use std::{
 };
 
 use crate::{
-    dht_keys::{content_provider_key, share_head_key},
+    dht_keys::{content_provider_key, manifest_loc_key, share_head_key},
     ids::{NodeId, ShareId},
-    manifest::{PublicShareSummary, ShareHead},
+    manifest::{ManifestV1, PublicShareSummary, ShareHead},
     net_fetch::RequestTransport,
     peer::PeerAddr,
     relay::{
-        RelayAnnouncement, RelayPayloadKind as RelayInternalPayloadKind,
-        current_rendezvous_bucket, relay_rendezvous_index, relay_rendezvous_key,
+        RelayAnnouncement, RelayPayloadKind as RelayInternalPayloadKind, current_rendezvous_bucket,
+        relay_rendezvous_index, relay_rendezvous_key,
     },
     search::IndexedItem,
     wire::{
@@ -31,6 +31,8 @@ use crate::{
         RelayPayloadKind as WireRelayPayloadKind, Store as WireStore, WirePayload,
     },
 };
+
+use tracing::{debug, warn};
 
 use super::{NodeHandle, RequestClass};
 
@@ -147,6 +149,17 @@ pub(super) fn validate_dht_value_for_known_keyspaces(
             anyhow::bail!("providers value does not match content provider key");
         }
         return Ok(());
+    }
+    // Manifests are stored at manifest_loc_key so peers behind NAT can
+    // fetch them from the DHT without a direct publisher connection.
+    if let Ok(manifest) = crate::cbor::from_slice::<ManifestV1>(value) {
+        if let Ok(mid) = manifest.manifest_id() {
+            let expected = manifest_loc_key(&mid);
+            if expected == key {
+                return Ok(());
+            }
+        }
+        anyhow::bail!("manifest value does not match manifest loc key");
     }
     // Relay announcements are stored at DHT rendezvous keys (§4.9).
     if let Ok(ann) = crate::cbor::from_slice::<RelayAnnouncement>(value) {
@@ -401,21 +414,33 @@ pub(super) async fn replicate_store_to_closest<T: RequestTransport + ?Sized>(
     seed_peers: &[PeerAddr],
     replication_factor: usize,
 ) -> anyhow::Result<usize> {
+    let key_hex = hex::encode(&key[..8]);
     let mut target = [0u8; 20];
     target.copy_from_slice(&key[..20]);
     let peers = handle
         .dht_find_node_iterative(transport, target, seed_peers)
         .await?;
 
+    debug!(
+        key = %key_hex,
+        closest_peers = peers.len(),
+        replication_factor,
+        "replicate_store_to_closest: found closest peers"
+    );
+
     let mut stored = 0usize;
     for peer in peers.into_iter().take(replication_factor) {
-        if query_store(transport, &peer, key, value.clone(), ttl_secs)
-            .await
-            .is_ok()
-        {
-            stored += 1;
+        match query_store(transport, &peer, key, value.clone(), ttl_secs).await {
+            Ok(()) => {
+                debug!(key = %key_hex, peer = ?peer, "replicate_store: stored on peer");
+                stored += 1;
+            }
+            Err(e) => {
+                warn!(key = %key_hex, peer = ?peer, error = %e, "replicate_store: failed to store on peer");
+            }
         }
     }
+    debug!(key = %key_hex, stored, "replicate_store_to_closest: done");
     Ok(stored)
 }
 

@@ -29,8 +29,10 @@ export function Settings({ status }: SettingsProps) {
     bind_tcp: "0.0.0.0:7001",
     bootstrap_peers: [],
     auto_start: false,
+    log_level: "info",
   });
   const [bootstrapPeers, setBootstrapPeers] = useState<string[]>([]);
+  const [logFilePath, setLogFilePath] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{
@@ -105,6 +107,7 @@ export function Settings({ status }: SettingsProps) {
   // Try to load config on mount
   useEffect(() => {
     handleLoad().catch(() => {});
+    cmd.getLogFilePath().then(setLogFilePath).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -353,6 +356,47 @@ export function Settings({ status }: SettingsProps) {
             </p>
           </div>
         </label>
+      </Card>
+
+      {/* Logging */}
+      <Card className="mt-6">
+        <CardHeader
+          title="Logging"
+          subtitle="Diagnostic log level and file location"
+          icon={<Server className="h-4 w-4" />}
+        />
+        <div className="space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-text-secondary mb-1.5">
+              Log Level
+            </label>
+            <select
+              value={config.log_level}
+              onChange={(e) =>
+                setConfig({ ...config, log_level: e.target.value })
+              }
+              className="w-full px-3 py-2 rounded-xl text-xs font-medium border border-border bg-surface text-text-primary focus:outline-none focus:ring-2 focus:ring-accent/50"
+            >
+              <option value="error">Error</option>
+              <option value="warn">Warn</option>
+              <option value="info">Info</option>
+              <option value="debug">Debug</option>
+              <option value="trace">Trace</option>
+            </select>
+            <p className="text-xs text-text-muted mt-1">
+              Higher levels produce more output. "Debug" is recommended for
+              troubleshooting. Changes take effect after restarting the app.
+            </p>
+          </div>
+          {logFilePath && (
+            <div>
+              <p className="text-xs font-medium text-text-secondary mb-1">Log File Directory</p>
+              <p className="text-xs font-mono text-text-muted break-all bg-surface rounded-lg px-3 py-2 border border-border">
+                {logFilePath}
+              </p>
+            </div>
+          )}
+        </div>
       </Card>
 
       {/* Info section */}

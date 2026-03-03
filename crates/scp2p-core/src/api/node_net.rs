@@ -13,11 +13,12 @@ use std::time::Duration;
 
 use ed25519_dalek::VerifyingKey;
 use tokio::task::JoinHandle;
+use tracing::{debug, info, warn};
 
 use crate::{
     content::ChunkedContent,
-    dht_keys::{content_provider_key, share_head_key},
-    ids::{ContentId, ShareId},
+    dht_keys::{content_provider_key, manifest_loc_key, share_head_key},
+    ids::{ContentId, ManifestId, ShareId},
     manifest::{ManifestV1, ShareVisibility},
     net_fetch::{
         FetchPolicy, PeerConnector, ProgressCallback, RelayAwareTransport, RequestTransport,
@@ -77,7 +78,8 @@ impl NodeHandle {
                     continue;
                 }
 
-                let Some(manifest) = state.manifest_cache.get(&head.latest_manifest_id).cloned() else {
+                let Some(manifest) = state.manifest_cache.get(&head.latest_manifest_id).cloned()
+                else {
                     continue;
                 };
                 manifest.verify()?;
@@ -136,8 +138,15 @@ impl NodeHandle {
         };
 
         if subscription_meta.is_empty() {
+            debug!("sync: no subscriptions to sync");
             return Ok(());
         }
+
+        info!(
+            subscriptions = subscription_meta.len(),
+            seed_peers = seed_peers.len(),
+            "sync: starting subscription sync over DHT"
+        );
 
         // Phase 1: concurrent network — DHT head lookups + manifest fetches
         // processed in batches of SYNC_CONCURRENCY.  No state mutations here.
@@ -216,19 +225,31 @@ impl NodeHandle {
         seed_peers: &[PeerAddr],
     ) -> anyhow::Result<Option<([u8; 32], [u8; 32], ManifestV1, u64)>> {
         let Some(head) = self
-            .dht_find_share_head_iterative(
-                transport,
-                ShareId(share_id),
-                share_pubkey,
-                seed_peers,
-            )
+            .dht_find_share_head_iterative(transport, ShareId(share_id), share_pubkey, seed_peers)
             .await?
         else {
+            debug!(
+                share_id = hex::encode(share_id),
+                "sync: no share head found in DHT"
+            );
             return Ok(None);
         };
         if head.latest_seq <= local_seq {
+            debug!(
+                share_id = hex::encode(share_id),
+                remote_seq = head.latest_seq,
+                local_seq,
+                "sync: already up to date"
+            );
             return Ok(None);
         }
+
+        info!(
+            share_id = hex::encode(share_id),
+            remote_seq = head.latest_seq,
+            local_seq,
+            "sync: newer head found, fetching manifest"
+        );
 
         let manifest_id = head.latest_manifest_id;
 
@@ -241,23 +262,63 @@ impl NodeHandle {
         let manifest = if let Some(cached) = cached_manifest {
             cached
         } else {
-            let mut target = [0u8; 20];
-            target.copy_from_slice(&manifest_id[..20]);
-            let mut peers = seed_peers.to_vec();
-            let discovered = self
-                .dht_find_node_iterative(transport, target, seed_peers)
-                .await?;
-            merge_peer_list(&mut peers, discovered);
-            match fetch_manifest_with_retry(
-                transport,
-                &peers,
-                manifest_id,
-                &FetchPolicy::default(),
-            )
-            .await
-            {
-                Ok(m) => m,
-                Err(_) => return Ok(None),
+            // Try the DHT first — the publisher stores serialised manifests
+            // at manifest_loc_key so they can be retrieved without a direct
+            // connection (essential when both peers are behind NAT).
+            let dht_key = manifest_loc_key(&ManifestId(manifest_id));
+            let dht_manifest = self
+                .dht_find_value_iterative(transport, dht_key, seed_peers)
+                .await?
+                .and_then(|v| crate::cbor::from_slice::<ManifestV1>(&v.value).ok())
+                .filter(|m| {
+                    m.manifest_id()
+                        .map(|mid| mid.0 == manifest_id)
+                        .unwrap_or(false)
+                });
+
+            if let Some(m) = dht_manifest {
+                info!(
+                    manifest_id = hex::encode(manifest_id),
+                    "sync: manifest found in DHT"
+                );
+                m
+            } else {
+                debug!(
+                    manifest_id = hex::encode(manifest_id),
+                    "sync: manifest not in DHT, trying direct peer fetch"
+                );
+                // Fallback: direct peer fetch (works when publisher is reachable).
+                let mut target = [0u8; 20];
+                target.copy_from_slice(&manifest_id[..20]);
+                let mut peers = seed_peers.to_vec();
+                let discovered = self
+                    .dht_find_node_iterative(transport, target, seed_peers)
+                    .await?;
+                merge_peer_list(&mut peers, discovered);
+                match fetch_manifest_with_retry(
+                    transport,
+                    &peers,
+                    manifest_id,
+                    &FetchPolicy::default(),
+                )
+                .await
+                {
+                    Ok(m) => {
+                        info!(
+                            manifest_id = hex::encode(manifest_id),
+                            "sync: manifest fetched from peer"
+                        );
+                        m
+                    }
+                    Err(e) => {
+                        warn!(
+                            manifest_id = hex::encode(manifest_id),
+                            err = %e,
+                            "sync: manifest fetch failed from all peers"
+                        );
+                        return Ok(None);
+                    }
+                }
             }
         };
 
@@ -303,7 +364,12 @@ impl NodeHandle {
                         .items
                         .iter()
                         .find(|i| i.name == BLOCKLIST_ITEM_NAME)?;
-                    Some((*share_id, item.content_id, item.chunk_count, item.chunk_list_hash))
+                    Some((
+                        *share_id,
+                        item.content_id,
+                        item.chunk_count,
+                        item.chunk_list_hash,
+                    ))
                 })
                 .collect()
         };
@@ -353,7 +419,11 @@ impl NodeHandle {
                 continue;
             };
 
-            if self.set_blocklist_rules(ShareId(share_id), rules).await.is_ok() {
+            if self
+                .set_blocklist_rules(ShareId(share_id), rules)
+                .await
+                .is_ok()
+            {
                 updated += 1;
             }
         }

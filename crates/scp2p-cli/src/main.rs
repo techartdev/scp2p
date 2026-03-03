@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2024-2026 Vanyo Vanev / Tech Art Ltd
+// Copyright (c) 2024-2026 Vanyo Vanev / Tech Art Ltd
 // SPDX-License-Identifier: MPL-2.0
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
@@ -46,8 +46,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     // Initialise tracing. RUST_LOG overrides --log-level when set.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&args.log_level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
     fmt().with_env_filter(filter).with_target(false).init();
 
     shell::run(args.db, args.bootstrap, args.port).await

@@ -669,7 +669,9 @@ mod tests {
             recommended_shares: vec![],
             signature: None,
         };
-        manifest.check_limits().expect("3000 items should be within limits");
+        manifest
+            .check_limits()
+            .expect("3000 items should be within limits");
         let bytes = crate::cbor::to_vec(&manifest).expect("serialize");
         assert!(
             bytes.len() < crate::wire::MAX_ENVELOPE_PAYLOAD_BYTES,

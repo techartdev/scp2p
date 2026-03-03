@@ -24,6 +24,7 @@ export interface DesktopClientConfig {
   bind_tcp: string | null;
   bootstrap_peers: string[];
   auto_start: boolean;
+  log_level: string;
 }
 
 export interface PeerView {
@@ -47,6 +48,8 @@ export interface SubscriptionView {
 export interface CommunityView {
   share_id_hex: string;
   share_pubkey_hex: string;
+  /** Human-readable label set at creation or join time. */
+  name?: string;
 }
 
 /** Returned when a new community is created via `create_community`. */

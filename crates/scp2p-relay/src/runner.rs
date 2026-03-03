@@ -16,10 +16,9 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use ed25519_dalek::SigningKey;
 use scp2p_core::{
-    BoxedStream, Capabilities, DirectRequestTransport, Node, NodeConfig, NodeHandle,
-    PeerAddr, PeerConnector, RelayCapacity, SqliteStore, TransportProtocol,
-    build_tls_server_handle, quic_connect_bi_session_insecure, start_quic_server,
-    tls_connect_session_insecure,
+    BoxedStream, Capabilities, DirectRequestTransport, Node, NodeConfig, NodeHandle, PeerAddr,
+    PeerConnector, RelayCapacity, SqliteStore, TransportProtocol, build_tls_server_handle,
+    quic_connect_bi_session_insecure, start_quic_server, tls_connect_session_insecure,
 };
 use tracing::{info, warn};
 
@@ -77,9 +76,8 @@ impl PeerConnector for RelayConnector {
 /// 6. Waits for Ctrl-C / SIGTERM, then returns cleanly.
 pub async fn run(config: RelayConfig) -> anyhow::Result<()> {
     // ── 1. Storage ────────────────────────────────────────────────
-    std::fs::create_dir_all(&config.data_dir).with_context(|| {
-        format!("create data directory: {}", config.data_dir.display())
-    })?;
+    std::fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("create data directory: {}", config.data_dir.display()))?;
     let db_path = config.data_dir.join("relay.db");
     let store = SqliteStore::open(&db_path)
         .with_context(|| format!("open state database: {}", db_path.display()))?;
@@ -108,7 +106,10 @@ pub async fn run(config: RelayConfig) -> anyhow::Result<()> {
 
     // Stable node identity — persisted so the relay keeps the same pubkey
     // across restarts (essential for reputation and pinned-key clients).
-    let signing_key = handle.ensure_node_identity().await.context("ensure node identity")?;
+    let signing_key = handle
+        .ensure_node_identity()
+        .await
+        .context("ensure node identity")?;
 
     let relay_caps = Capabilities {
         dht: true,
@@ -134,8 +135,7 @@ pub async fn run(config: RelayConfig) -> anyhow::Result<()> {
     }
 
     if let Some(quic_addr) = config.bind_quic {
-        let quic_server =
-            start_quic_server(quic_addr).context("start QUIC server")?;
+        let quic_server = start_quic_server(quic_addr).context("start QUIC server")?;
         let _task = handle.clone().start_quic_dht_service(
             quic_server,
             signing_key.clone(),
@@ -205,7 +205,8 @@ pub async fn run(config: RelayConfig) -> anyhow::Result<()> {
 
         tokio::spawn(async move {
             loop {
-                match publish_announcement(&h2, &sk2, addrs2.clone(), cap2.clone(), &t2, &bp2).await {
+                match publish_announcement(&h2, &sk2, addrs2.clone(), cap2.clone(), &t2, &bp2).await
+                {
                     Ok(n) => info!(stores = n, "relay announcement published to DHT"),
                     Err(e) => warn!(err = %e, "relay announcement failed"),
                 }

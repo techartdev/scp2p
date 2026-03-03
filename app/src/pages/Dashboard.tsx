@@ -90,6 +90,7 @@ export function Dashboard({ status, onRefresh, onNavigate }: DashboardProps) {
           bind_tcp: "0.0.0.0:7001",
           bootstrap_peers: [],
           auto_start: false,
+          log_level: "info",
         };
       }
       await cmd.startNode({

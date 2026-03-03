@@ -267,8 +267,9 @@ impl NodeHandle {
     ) -> anyhow::Result<usize> {
         let mut total = 0usize;
         for peer in seed_peers {
-            if let Ok(announcements) =
-                self.fetch_relay_list_from_peer(transport, peer, max_per_peer).await
+            if let Ok(announcements) = self
+                .fetch_relay_list_from_peer(transport, peer, max_per_peer)
+                .await
             {
                 total += self.ingest_relay_announcements(announcements).await?;
             }
@@ -319,25 +320,34 @@ impl NodeHandle {
         ann: &RelayAnnouncement,
         seed_peers: &[PeerAddr],
     ) -> anyhow::Result<usize> {
-        use crate::relay::{current_rendezvous_bucket, relay_rendezvous_index, relay_rendezvous_key};
-        use crate::dht::{DEFAULT_TTL_SECS, K};
         use super::helpers::replicate_store_to_closest;
+        use crate::dht::{DEFAULT_TTL_SECS, K};
+        use crate::relay::{
+            current_rendezvous_bucket, relay_rendezvous_index, relay_rendezvous_key,
+        };
 
         let now = now_unix_secs()?;
         let bucket_id = current_rendezvous_bucket(now);
         let encoded = crate::cbor::to_vec(ann)?;
         // TTL = remaining seconds until bucket rolls over.
-        let bucket_end =
-            (bucket_id + 1) * crate::relay::RELAY_RENDEZVOUS_BUCKET_SECS;
+        let bucket_end = (bucket_id + 1) * crate::relay::RELAY_RENDEZVOUS_BUCKET_SECS;
         let ttl = bucket_end.saturating_sub(now).max(DEFAULT_TTL_SECS);
 
         let mut total = 0usize;
         for which in 0u8..2 {
             let slot = relay_rendezvous_index(&ann.relay_pubkey, bucket_id, which);
             let key = relay_rendezvous_key(bucket_id, slot);
-            total += replicate_store_to_closest(transport, self, key, encoded.clone(), ttl, seed_peers, K)
-                .await
-                .unwrap_or(0);
+            total += replicate_store_to_closest(
+                transport,
+                self,
+                key,
+                encoded.clone(),
+                ttl,
+                seed_peers,
+                K,
+            )
+            .await
+            .unwrap_or(0);
         }
         Ok(total)
     }
@@ -356,8 +366,8 @@ impl NodeHandle {
         seed_peers: &[PeerAddr],
     ) -> anyhow::Result<usize> {
         use crate::relay::{
-            RelayAnnouncement as RA, current_rendezvous_bucket, relay_rendezvous_key,
-            RELAY_RENDEZVOUS_N,
+            RELAY_RENDEZVOUS_N, RelayAnnouncement as RA, current_rendezvous_bucket,
+            relay_rendezvous_key,
         };
 
         let now = now_unix_secs()?;

@@ -134,25 +134,6 @@ pub async fn download_content(
         .await
 }
 
-pub async fn publish_text_share(
-    app_state: &DesktopAppState,
-    title: String,
-    item_name: String,
-    item_text: String,
-    visibility: PublishVisibility,
-    community_ids_hex: Vec<String>,
-) -> anyhow::Result<PublishResultView> {
-    app_state
-        .publish_text_share(
-            &title,
-            &item_name,
-            &item_text,
-            visibility,
-            &community_ids_hex,
-        )
-        .await
-}
-
 pub async fn publish_files(
     app_state: &DesktopAppState,
     file_paths: Vec<String>,

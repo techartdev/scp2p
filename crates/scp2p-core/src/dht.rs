@@ -199,11 +199,7 @@ impl Dht {
         let ttl = ttl_secs.clamp(1, MAX_TTL_SECS);
         // Preserve the in-memory access counter so that a re-store
         // triggered by the republish loop does not reset popularity.
-        let existing_access_count = self
-            .values
-            .get(&key)
-            .map(|v| v.access_count)
-            .unwrap_or(0);
+        let existing_access_count = self.values.get(&key).map(|v| v.access_count).unwrap_or(0);
         self.values.insert(
             key,
             DhtValue {
@@ -470,9 +466,16 @@ mod tests {
 
     #[test]
     fn dht_value_is_popular_respects_threshold() {
-        let mut v =
-            super::DhtValue { key: [0u8; 32], value: vec![], expires_at_unix: 99_999, access_count: 0 };
-        assert!(!v.is_popular(), "score below threshold should not be popular");
+        let mut v = super::DhtValue {
+            key: [0u8; 32],
+            value: vec![],
+            expires_at_unix: 99_999,
+            access_count: 0,
+        };
+        assert!(
+            !v.is_popular(),
+            "score below threshold should not be popular"
+        );
         v.access_count = POPULAR_ACCESS_THRESHOLD - 1;
         assert!(!v.is_popular());
         v.access_count = POPULAR_ACCESS_THRESHOLD;
@@ -485,7 +488,8 @@ mod tests {
     fn store_preserves_access_count_on_reinsert() {
         let mut dht = Dht::default();
         let key = [6u8; 32];
-        dht.store(key, vec![1], DEFAULT_TTL_SECS, 1_000).expect("store");
+        dht.store(key, vec![1], DEFAULT_TTL_SECS, 1_000)
+            .expect("store");
         // Look it up a few times to accumulate access_count.
         for _ in 0..3 {
             dht.find_value(key, 1_001);
@@ -493,8 +497,15 @@ mod tests {
         let before = dht.find_value(key, 1_001).expect("hit").access_count;
         assert_eq!(before, 4); // 3 above + 1 this call
         // Re-store the same key (simulates a republish); access_count must be preserved.
-        dht.store(key, vec![2], DEFAULT_TTL_SECS, 1_002).expect("re-store");
-        let after = dht.find_value(key, 1_002).expect("hit after re-store").access_count;
-        assert_eq!(after, 5, "access count should be preserved across re-stores and incremented by this find");
+        dht.store(key, vec![2], DEFAULT_TTL_SECS, 1_002)
+            .expect("re-store");
+        let after = dht
+            .find_value(key, 1_002)
+            .expect("hit after re-store")
+            .access_count;
+        assert_eq!(
+            after, 5,
+            "access count should be preserved across re-stores and incremented by this find"
+        );
     }
 }
