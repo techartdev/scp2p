@@ -16,9 +16,13 @@ Implement SCP2P from `SPECIFICATION.md` in milestone-oriented increments, priori
 5. Keep wire-compatibility in mind: changing serialized structures requires a short migration note in commit body.
 
 ## Project layout conventions
-- `crates/scp2p-core`: shared protocol/data logic.
-- `crates/scp2p-cli`: reference CLI and manual test harness.
-- Add additional crates only when separation is meaningful (e.g., `scp2p-dht`, `scp2p-transport`).
+- `crates/scp2p-core`: shared protocol/data logic (DHT, transport, wire format, store, etc.).
+- `crates/scp2p-cli`: interactive command-line client.
+- `crates/scp2p-relay`: standalone relay node binary.
+- `crates/scp2p-desktop`: desktop-specific state management and Tauri command layer.
+- `app/src-tauri`: Tauri v2 app shell (wraps `scp2p-desktop`).
+- `app/`: React + TypeScript + Tailwind CSS frontend (Vite build).
+- Add additional crates only when separation is meaningful.
 
 ## Coding conventions
 - Rust edition 2024.
