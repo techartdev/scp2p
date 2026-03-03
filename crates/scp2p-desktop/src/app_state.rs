@@ -22,7 +22,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::dto::{
     CommunityBrowseView, CommunityParticipantView, CommunityView, CreateCommunityResult,
@@ -49,6 +49,10 @@ struct RuntimeState {
     dht_republish_task: Option<JoinHandle<()>>,
     subscription_sync_task: Option<JoinHandle<()>>,
     last_public_shares: Vec<PublicShareView>,
+    /// Transport used for DHT replication (same instance as background loops).
+    dht_transport: Option<Arc<dyn scp2p_core::RequestTransport>>,
+    /// Bootstrap peers used for DHT replication.
+    dht_bootstrap_peers: Vec<PeerAddr>,
 }
 
 const LAN_DISCOVERY_PORT: u16 = 46123;
@@ -188,10 +192,12 @@ impl DesktopAppState {
                 DHT_LOOP_INTERVAL,
             ));
             state.subscription_sync_task = Some(handle.clone().start_subscription_sync_loop(
-                transport,
-                bootstrap,
+                transport.clone(),
+                bootstrap.clone(),
                 DHT_LOOP_INTERVAL,
             ));
+            state.dht_transport = Some(transport);
+            state.dht_bootstrap_peers = bootstrap;
         }
 
         state.node = Some(handle);
@@ -711,6 +717,26 @@ impl DesktopAppState {
             .context("node is not running")
     }
 
+    /// Fire-and-forget: run one DHT republish cycle so newly published
+    /// share heads + manifests reach the relay immediately instead of
+    /// waiting for the next background interval.
+    async fn trigger_dht_republish(&self) {
+        let (node, transport, peers) = {
+            let state = self.inner.read().await;
+            match (&state.node, &state.dht_transport) {
+                (Some(n), Some(t)) => {
+                    (n.clone(), t.clone(), state.dht_bootstrap_peers.clone())
+                }
+                _ => return,
+            }
+        };
+        tokio::spawn(async move {
+            if let Err(e) = node.dht_republish_once(transport.as_ref(), &peers).await {
+                warn!(error = %e, "immediate DHT republish after publish failed");
+            }
+        });
+    }
+
     async fn sync_peer_targets(&self, node: &NodeHandle) -> anyhow::Result<Vec<PeerAddr>> {
         let mut peers = node.configured_bootstrap_peers().await?;
         for record in node.peer_records().await {
@@ -802,6 +828,11 @@ impl DesktopAppState {
             )
             .await?;
 
+        // Immediately replicate share head + manifest to DHT peers so
+        // subscribers can discover the share without waiting for the
+        // next background republish cycle.
+        self.trigger_dht_republish().await;
+
         Ok(PublishResultView {
             share_id_hex: hex::encode(share.share_id().0),
             share_pubkey_hex: hex::encode(share.verifying_key().to_bytes()),
@@ -857,6 +888,9 @@ impl DesktopAppState {
                 &share,
             )
             .await?;
+
+        // Immediately replicate share head + manifest to DHT peers.
+        self.trigger_dht_republish().await;
 
         Ok(PublishResultView {
             share_id_hex: hex::encode(share.share_id().0),

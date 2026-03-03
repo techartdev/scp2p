@@ -1462,4 +1462,58 @@ impl NodeHandle {
         }
         Ok(refreshed)
     }
+
+    /// Re-populate the in-memory DHT with share heads **and** manifests for
+    /// shares we have *published*.  `reannounce_subscribed_share_heads` only
+    /// covers the subscriber side (iterates `subscriptions`); this covers the
+    /// publisher side so that data survives an app restart where the ephemeral
+    /// DHT is empty.
+    pub async fn reannounce_published_share_data(&self) -> anyhow::Result<usize> {
+        let now = super::helpers::now_unix_secs()?;
+        let mut state = self.state.write().await;
+        let mut refreshed = 0usize;
+
+        // Collect keys first to avoid borrow issues.
+        let heads: Vec<([u8; 32], crate::manifest::ShareHead)> = state
+            .published_share_heads
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+
+        for (share_id, head) in heads {
+            // 1. Re-announce the share head itself.
+            let head_key = share_head_key(&ShareId(share_id));
+            let head_bytes = match crate::cbor::to_vec(&head) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            state
+                .dht
+                .store(head_key, head_bytes, crate::dht::DEFAULT_TTL_SECS, now)?;
+            refreshed += 1;
+
+            // 2. Re-announce the manifest so subscribers behind NAT can
+            //    fetch it from the relay / DHT.
+            let manifest_id = head.latest_manifest_id;
+            if let Some(manifest) = state.manifest_cache.get(&manifest_id) {
+                let manifest_bytes = match crate::cbor::to_vec(manifest) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                state.dht.store(
+                    manifest_loc_key(&ManifestId(manifest_id)),
+                    manifest_bytes,
+                    crate::dht::DEFAULT_TTL_SECS,
+                    now,
+                )?;
+                refreshed += 1;
+            }
+        }
+
+        if refreshed > 0 {
+            debug!(refreshed, "reannounce_published_share_data: DHT entries restored");
+        }
+
+        Ok(refreshed)
+    }
 }

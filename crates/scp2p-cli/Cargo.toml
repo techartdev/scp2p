@@ -15,7 +15,7 @@ clap = { workspace = true, features = ["env"] }
 ed25519-dalek.workspace = true
 hex.workspace = true
 rand.workspace = true
-scp2p-core = { path = "../scp2p-core", version = "0.1.0" }
+scp2p-core = { path = "../scp2p-core", version = "0.2.0" }
 tokio.workspace = true
 inquire = "0.7"
 indicatif = "0.17"

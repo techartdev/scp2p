@@ -147,13 +147,17 @@ async fn configured_bootstrap_peers_parse_from_runtime_config() {
         .configured_bootstrap_peers()
         .await
         .expect("configured peers");
-    assert_eq!(peers.len(), 1);
+    // Primary TCP peer + QUIC fallback
+    assert_eq!(peers.len(), 2);
     assert_eq!(
         peers[0].ip,
         "127.0.0.1".parse::<std::net::IpAddr>().expect("ip")
     );
     assert_eq!(peers[0].port, 7301);
     assert_eq!(peers[0].transport, crate::peer::TransportProtocol::Tcp);
+    // Alternate QUIC variant at port - 1
+    assert_eq!(peers[1].port, 7300);
+    assert_eq!(peers[1].transport, crate::peer::TransportProtocol::Quic);
 }
 
 #[tokio::test]
@@ -172,7 +176,8 @@ async fn configured_bootstrap_peers_with_transport_prefix() {
         .configured_bootstrap_peers()
         .await
         .expect("configured peers");
-    assert_eq!(peers.len(), 3);
+    // 3 explicit + 3 alternate-transport fallbacks
+    assert_eq!(peers.len(), 6);
     assert_eq!(peers[0].transport, crate::peer::TransportProtocol::Quic);
     assert_eq!(peers[0].port, 9000);
     assert_eq!(peers[1].transport, crate::peer::TransportProtocol::Tcp);
@@ -196,7 +201,8 @@ async fn configured_bootstrap_peers_parse_pubkey_suffix() {
         .configured_bootstrap_peers()
         .await
         .expect("configured peers");
-    assert_eq!(peers.len(), 2);
+    // 2 explicit + 2 alternate-transport fallbacks
+    assert_eq!(peers.len(), 4);
     assert_eq!(peers[0].pubkey_hint, Some([0xaa; 32]));
     assert_eq!(peers[0].port, 9500);
     // Entry without pubkey suffix should have None.
