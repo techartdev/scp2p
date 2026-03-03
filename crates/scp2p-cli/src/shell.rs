@@ -14,10 +14,12 @@ use inquire::{InquireError, Select, Text};
 use rand::rngs::OsRng;
 use scp2p_core::{
     BoxedStream, Capabilities, FetchPolicy, Node, NodeConfig, NodeId, OwnedRelayAwareTransport,
-    PeerAddr, PeerConnector, PersistedCommunity, RelayAwareTransport, RequestTransport,
-    SearchQuery, ShareId, ShareVisibility, SqliteStore, Store, TransportProtocol,
-    build_tls_server_handle, quic_connect_bi_session_insecure, tls_connect_session_insecure,
+    PeerAddr, PeerConnector, PeerRecord, PersistedCommunity, RelayAwareTransport,
+    RequestTransport, SearchQuery, ShareId, ShareVisibility, SqliteStore, Store,
+    TransportProtocol, build_tls_server_handle, quic_connect_bi_session_insecure,
+    start_quic_server, tls_connect_session_insecure,
 };
+use tracing::{info, warn};
 
 // ── Internal connector ────────────────────────────────────────────────────────
 
@@ -65,7 +67,9 @@ struct Ctx {
     connector: CliConnector,
     db: String,
     port: u16,
+    quic_port: u16,
     bootstrap_peers: Vec<PeerAddr>,
+    dht_transport: Arc<dyn RequestTransport>,
 }
 
 impl Ctx {
@@ -103,7 +107,7 @@ impl Ctx {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub async fn run(db: String, bootstrap_raw: Vec<String>, port: u16) -> anyhow::Result<()> {
+pub async fn run(db: String, bootstrap_raw: Vec<String>, port: u16, quic_port: u16) -> anyhow::Result<()> {
     let pb = spinner("Opening database…");
     let store = SqliteStore::open(&db)?;
     let config = NodeConfig {
@@ -119,13 +123,26 @@ pub async fn run(db: String, bootstrap_raw: Vec<String>, port: u16) -> anyhow::R
 
     // Start background TLS listener so we can serve content to peers.
     let tls = Arc::new(build_tls_server_handle().expect("TLS server handle"));
-    let bind_addr: SocketAddr = format!("0.0.0.0:{port}").parse()?;
+    let bind_tcp: SocketAddr = format!("0.0.0.0:{port}").parse()?;
     let _svc = node.clone().start_tls_dht_service(
-        bind_addr,
+        bind_tcp,
         node_key.clone(),
         Capabilities::default(),
         tls,
     );
+
+    // Start QUIC listener (disabled when quic_port == 0).
+    let _quic_svc = if quic_port > 0 {
+        let bind_quic: SocketAddr = format!("0.0.0.0:{quic_port}").parse()?;
+        let quic_server = start_quic_server(bind_quic)?;
+        Some(node.clone().start_quic_dht_service(
+            quic_server,
+            node_key.clone(),
+            Capabilities::default(),
+        ))
+    } else {
+        None
+    };
 
     let bootstrap_peers: Vec<PeerAddr> = bootstrap_raw
         .iter()
@@ -144,10 +161,79 @@ pub async fn run(db: String, bootstrap_raw: Vec<String>, port: u16) -> anyhow::R
         Duration::from_secs(60),
     );
     let _sync_loop = node.clone().start_subscription_sync_loop(
-        owned_transport,
+        owned_transport.clone(),
         bootstrap_peers.clone(),
         Duration::from_secs(60),
     );
+
+    // ── Relay tunnel registration ─────────────────────────────────────────
+    // Maintain a persistent relay tunnel so that peers behind NAT can reach
+    // us for content downloads.
+    let _relay_tunnel = {
+        let tunnel_handle = node.clone();
+        let tunnel_key = node_key.clone();
+        let tunnel_bootstrap = bootstrap_peers.clone();
+        let tunnel_transport = owned_transport.clone();
+        tokio::spawn(async move {
+            let connector = CliConnector {
+                signing_key: tunnel_key,
+            };
+            loop {
+                if !tunnel_handle.active_relay_slots().await.is_empty() {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
+                let mut registered = false;
+                for peer in &tunnel_bootstrap {
+                    match tunnel_handle.register_relay_tunnel(&connector, peer).await {
+                        Ok(slot) => {
+                            info!(
+                                slot_id = slot.slot_id,
+                                relay = %format!("{}:{}", peer.ip, peer.port),
+                                "relay tunnel registered"
+                            );
+                            registered = true;
+                            // Re-announce provider entries with relayed address.
+                            let peer_records = tunnel_handle.peer_records().await;
+                            if let Ok(adv_ip) = resolve_advertise_ip(bind_tcp, &peer_records) {
+                                let self_addr = tunnel_handle
+                                    .relayed_self_addr(PeerAddr {
+                                        ip: adv_ip,
+                                        port: bind_tcp.port(),
+                                        transport: TransportProtocol::Tcp,
+                                        pubkey_hint: None,
+                                        relay_via: None,
+                                    })
+                                    .await;
+                                let _ = tunnel_handle
+                                    .reannounce_content_providers(self_addr)
+                                    .await;
+                            }
+                            // Push to relay immediately.
+                            let _ = tunnel_handle
+                                .dht_republish_once(
+                                    tunnel_transport.as_ref(),
+                                    &tunnel_bootstrap,
+                                )
+                                .await;
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                relay = %format!("{}:{}", peer.ip, peer.port),
+                                error = %e,
+                                "relay tunnel registration failed, trying next"
+                            );
+                        }
+                    }
+                }
+                if !registered {
+                    warn!("relay tunnel: no peer accepted, retrying in 30s");
+                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        })
+    };
 
     let connector = CliConnector {
         signing_key: node_key.clone(),
@@ -160,7 +246,9 @@ pub async fn run(db: String, bootstrap_raw: Vec<String>, port: u16) -> anyhow::R
         connector,
         db,
         port,
+        quic_port,
         bootstrap_peers,
+        dht_transport: owned_transport,
     };
 
     // ── Welcome banner ────────────────────────────────────────────────────────
@@ -227,6 +315,10 @@ async fn cmd_status(ctx: &Ctx) -> anyhow::Result<()> {
     println!("  Share ID : {}", hex::encode(ctx.share_id.0));
     println!("  Database : {}", ctx.db);
     println!("  TCP port : {}", ctx.port);
+    println!(
+        "  QUIC port: {}",
+        if ctx.quic_port > 0 { ctx.quic_port.to_string() } else { "disabled".to_owned() }
+    );
     println!("  Subscriptions  : {}", s.subscriptions.len());
     println!("  Manifests      : {}", s.manifests.len());
     println!("  Partial DLs    : {}", s.partial_downloads.len());
@@ -288,6 +380,9 @@ async fn cmd_publish_files(ctx: &Ctx) -> anyhow::Result<()> {
         .await?;
     pb.finish_and_clear();
 
+    // Push to DHT immediately so the share is discoverable right away.
+    trigger_dht_republish(ctx).await;
+
     println!();
     println!("  ✓  Published {} file(s)", paths.len());
     println!("  Share ID    : {}", hex::encode(share.share_id().0));
@@ -335,6 +430,9 @@ async fn cmd_publish_folder(ctx: &Ctx) -> anyhow::Result<()> {
         )
         .await?;
     pb.finish_and_clear();
+
+    // Push to DHT immediately so the share is discoverable right away.
+    trigger_dht_republish(ctx).await;
 
     println!();
     println!("  ✓  Folder published");
@@ -1008,6 +1106,10 @@ fn print_banner(ctx: &Ctx) {
     println!("  Database : {}", ctx.db);
     println!("  TCP port : {}", ctx.port);
     println!(
+        "  QUIC port: {}",
+        if ctx.quic_port > 0 { ctx.quic_port.to_string() } else { "disabled".to_owned() }
+    );
+    println!(
         "  Network  : {}",
         if ctx.bootstrap_peers.is_empty() {
             "offline \u{2013} no bootstrap peers".to_owned()
@@ -1015,4 +1117,37 @@ fn print_banner(ctx: &Ctx) {
             format!("{} bootstrap peer(s)", ctx.bootstrap_peers.len())
         }
     );
+}
+
+// ── Immediate DHT republish after publish ─────────────────────────────────────
+
+async fn trigger_dht_republish(ctx: &Ctx) {
+    let node = ctx.node.clone();
+    let transport = ctx.dht_transport.clone();
+    let peers = ctx.bootstrap_peers.clone();
+    tokio::spawn(async move {
+        if let Err(e) = node.dht_republish_once(transport.as_ref(), &peers).await {
+            warn!(error = %e, "immediate DHT republish after publish failed");
+        }
+    });
+}
+
+// ── Resolve advertise IP (for relay provider entries) ─────────────────────────
+
+fn resolve_advertise_ip(
+    bind_tcp: SocketAddr,
+    peers: &[PeerRecord],
+) -> anyhow::Result<std::net::IpAddr> {
+    if !bind_tcp.ip().is_unspecified() {
+        return Ok(bind_tcp.ip());
+    }
+    if let Some(peer) = peers.first() {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        let _ = socket.connect(SocketAddr::new(peer.addr.ip, peer.addr.port));
+        let local = socket.local_addr()?;
+        if !local.ip().is_unspecified() {
+            return Ok(local.ip());
+        }
+    }
+    Ok("127.0.0.1".parse().expect("loopback ip"))
 }

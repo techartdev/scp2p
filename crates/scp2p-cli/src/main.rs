@@ -35,6 +35,11 @@ struct Args {
     #[arg(long, default_value_t = 7001, env = "SCP2P_PORT")]
     port: u16,
 
+    /// QUIC port this node listens on (default: TCP port - 1).
+    /// Set to 0 to disable the QUIC listener.
+    #[arg(long, env = "SCP2P_QUIC_PORT")]
+    quic_port: Option<u16>,
+
     /// Log level: error, warn, info, debug, trace.
     /// Can also be set via RUST_LOG (e.g. RUST_LOG=scp2p_core=debug).
     #[arg(long, default_value = "warn", env = "SCP2P_LOG")]
@@ -50,5 +55,6 @@ async fn main() -> anyhow::Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
     fmt().with_env_filter(filter).with_target(false).init();
 
-    shell::run(args.db, args.bootstrap, args.port).await
+    let quic_port = args.quic_port.unwrap_or_else(|| args.port.saturating_sub(1));
+    shell::run(args.db, args.bootstrap, args.port, quic_port).await
 }
