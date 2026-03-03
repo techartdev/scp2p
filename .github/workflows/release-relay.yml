@@ -20,9 +20,18 @@ on:
   push:
     tags:
       - "relay-v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. relay-v0.2.1)'
+        required: true
+        type: string
 
 permissions:
-  contents: write   # needed to create releases and upload assets
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}   # needed to create releases and upload assets
 
 jobs:
   # ── Build matrix ──────────────────────────────────────────────────────────
@@ -134,16 +143,16 @@ jobs:
       # Derive a human-readable version from the tag (strip "relay-v" prefix).
       - name: Derive version
         id: version
-        run: echo "ver=${GITHUB_REF_NAME#relay-v}" >> "$GITHUB_OUTPUT"
+        run: echo "ver=${RELEASE_TAG#relay-v}" >> "$GITHUB_OUTPUT"
 
       # Create the release and upload all assets.
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           name: "scp2p-relay v${{ steps.version.outputs.ver }}"
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}  # x.y.z-beta → prerelease
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}  # x.y.z-beta → prerelease
           body: |
             ## scp2p-relay v${{ steps.version.outputs.ver }}
 

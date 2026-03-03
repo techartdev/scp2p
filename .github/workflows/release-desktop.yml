@@ -20,9 +20,18 @@ on:
   push:
     tags:
       - "desktop-v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. desktop-v0.2.1)'
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
   # ── Build matrix ──────────────────────────────────────────────────────────
@@ -139,7 +148,7 @@ jobs:
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         with:
           projectPath: app
-          tagName: ${{ github.ref_name }}
+          tagName: ${{ env.RELEASE_TAG }}
           releaseName: "SCP2P Desktop v__VERSION__"
           releaseBody: |
             ## SCP2P Desktop v__VERSION__
@@ -156,5 +165,5 @@ jobs:
 
             See the [README](https://github.com/${{ github.repository }}#readme) for configuration help.
           releaseDraft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           args: ${{ matrix.args }}
