@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
+    community_index::CommunityIndex,
     config::NodeConfig,
     content::ChunkedContent,
     dht::{DEFAULT_TTL_SECS, Dht},
@@ -211,6 +212,8 @@ struct CommunityMembership {
     token: Option<CommunityMembershipToken>,
     /// Local human-readable label.
     name: Option<String>,
+    /// Last event cursor from the community event log (§15.6.3).
+    last_event_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -336,6 +339,12 @@ struct NodeState {
     store: Arc<dyn Store>,
     /// Tracks which sections have been mutated since the last persist.
     dirty: DirtyFlags,
+    /// In-memory secondary index for community members and shares (§15.5).
+    ///
+    /// Built by ingesting validated [`CommunityMemberRecord`] and
+    /// [`CommunityShareRecord`] values from the DHT.  Serves paged browse,
+    /// search, and delta-sync wire requests.
+    community_index: CommunityIndex,
 }
 
 /// Tracks an active relay registration for a firewalled node.
@@ -368,6 +377,10 @@ pub struct AbuseLimits {
     /// `CHUNK_SIZE` (256 KiB), so this effectively caps transfer at
     /// `max_chunk_requests_per_window × 256 KiB` per window period.
     pub max_chunk_requests_per_window: u32,
+    /// Maximum community index queries (browse pages, search, events)
+    /// per window per peer.  Separate from `Fetch` so that community
+    /// browse cannot starve manifest/chunk-hash fetches.
+    pub max_community_requests_per_window: u32,
 }
 
 impl Default for AbuseLimits {
@@ -380,6 +393,8 @@ impl Default for AbuseLimits {
             max_relay_requests_per_window: 180,
             // 600 chunks × 256 KiB ≈ 150 MiB per minute per peer.
             max_chunk_requests_per_window: 600,
+            // Community index queries: pages, search, events.
+            max_community_requests_per_window: 120,
         }
     }
 }
@@ -391,6 +406,8 @@ enum RequestClass {
     Relay,
     /// Chunk data transfer requests (`GetChunk`).
     Chunk,
+    /// Community index queries: member/share pages, search, events.
+    Community,
     Other,
 }
 
@@ -403,6 +420,8 @@ struct AbuseCounter {
     relay: u32,
     /// Chunk data requests in this window.
     chunk: u32,
+    /// Community index queries in this window.
+    community: u32,
 }
 
 pub struct Node;
@@ -476,6 +495,7 @@ impl NodeState {
                         pubkey: community.share_pubkey,
                         token,
                         name: community.name,
+                        last_event_cursor: community.last_event_cursor,
                     },
                 )
             })
@@ -588,6 +608,7 @@ impl NodeState {
             active_relay_slots: Vec::new(),
             store,
             dirty: DirtyFlags::default(),
+            community_index: CommunityIndex::default(),
         })
     }
 
@@ -614,6 +635,7 @@ impl NodeState {
                     .as_ref()
                     .and_then(|t| crate::cbor::to_vec(t).ok()),
                 name: membership.name.clone(),
+                last_event_cursor: membership.last_event_cursor.clone(),
             })
             .collect();
         let publisher_identities = self
@@ -689,6 +711,7 @@ impl NodeState {
                 fetch: 0,
                 relay: 0,
                 chunk: 0,
+                community: 0,
             });
 
         if now_unix.saturating_sub(counter.window_start_unix) >= window {
@@ -699,6 +722,7 @@ impl NodeState {
                 fetch: 0,
                 relay: 0,
                 chunk: 0,
+                community: 0,
             };
         }
 
@@ -708,6 +732,7 @@ impl NodeState {
             RequestClass::Fetch => counter.fetch = counter.fetch.saturating_add(1),
             RequestClass::Relay => counter.relay = counter.relay.saturating_add(1),
             RequestClass::Chunk => counter.chunk = counter.chunk.saturating_add(1),
+            RequestClass::Community => counter.community = counter.community.saturating_add(1),
             // Truly uncategorized requests are still exempt.
             RequestClass::Other => return Ok(()),
         }
@@ -726,6 +751,9 @@ impl NodeState {
         }
         if counter.chunk > self.abuse_limits.max_chunk_requests_per_window {
             anyhow::bail!("chunk request rate limit exceeded");
+        }
+        if counter.community > self.abuse_limits.max_community_requests_per_window {
+            anyhow::bail!("community request rate limit exceeded");
         }
         Ok(())
     }
@@ -928,6 +956,7 @@ impl NodeHandle {
                     .as_ref()
                     .and_then(|t| crate::cbor::to_vec(t).ok()),
                 name: membership.name.clone(),
+                last_event_cursor: membership.last_event_cursor.clone(),
             })
             .collect()
     }
@@ -1305,6 +1334,56 @@ impl NodeHandle {
         .await
     }
 
+    /// Fetch a paged member list from a remote peer (\u00a715.6.1).
+    pub async fn fetch_community_members_page<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        peer: &PeerAddr,
+        community_id: [u8; 32],
+        cursor: Option<String>,
+        limit: u16,
+    ) -> anyhow::Result<crate::wire::CommunityMembersPageResponse> {
+        query_community_members_page(transport, peer, community_id, cursor, limit).await
+    }
+
+    /// Fetch a paged share list from a remote peer (\u00a715.6.1).
+    pub async fn fetch_community_shares_page<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        peer: &PeerAddr,
+        community_id: [u8; 32],
+        cursor: Option<String>,
+        limit: u16,
+        since_unix: Option<u64>,
+    ) -> anyhow::Result<crate::wire::CommunitySharesPageResponse> {
+        query_community_shares_page(transport, peer, community_id, cursor, limit, since_unix).await
+    }
+
+    /// Search community shares on a remote peer (§15.6.2).
+    pub async fn fetch_community_search_shares<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        peer: &PeerAddr,
+        community_id: [u8; 32],
+        query: String,
+        cursor: Option<String>,
+        limit: u16,
+    ) -> anyhow::Result<crate::wire::CommunitySearchResultsResp> {
+        query_community_search_shares(transport, peer, community_id, query, cursor, limit).await
+    }
+
+    /// Fetch community delta events from a remote peer (§15.6.3).
+    pub async fn fetch_community_events<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        peer: &PeerAddr,
+        community_id: [u8; 32],
+        since_cursor: Option<String>,
+        limit: u16,
+    ) -> anyhow::Result<crate::wire::CommunityEventsResp> {
+        query_community_events(transport, peer, community_id, since_cursor, limit).await
+    }
+
     pub async fn connect(&self, peer_addr: PeerAddr) -> anyhow::Result<()> {
         self.record_peer_seen(peer_addr).await
     }
@@ -1436,6 +1515,7 @@ impl NodeHandle {
                 pubkey: share_pubkey,
                 token,
                 name,
+                last_event_cursor: None,
             },
         );
         state.dirty.communities = true;
@@ -1465,6 +1545,33 @@ impl NodeHandle {
         }
         drop(state);
         persist_state(self).await
+    }
+
+    /// Persist the last received event cursor for a community (§15.6.3).
+    ///
+    /// Called by the desktop/CLI layer after successfully fetching a
+    /// page of events so subsequent polls resume from the right offset.
+    pub async fn update_community_event_cursor(
+        &self,
+        share_id: ShareId,
+        cursor: &str,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.write().await;
+        if let Some(membership) = state.communities.get_mut(&share_id.0) {
+            membership.last_event_cursor = Some(cursor.to_owned());
+            state.dirty.communities = true;
+        }
+        drop(state);
+        persist_state(self).await
+    }
+
+    /// Return the last persisted event cursor for a community, if any.
+    pub async fn community_event_cursor(&self, share_id: ShareId) -> Option<String> {
+        let state = self.state.read().await;
+        state
+            .communities
+            .get(&share_id.0)
+            .and_then(|m| m.last_event_cursor.clone())
     }
 
     pub async fn subscribe_with_pubkey(

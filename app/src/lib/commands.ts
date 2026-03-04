@@ -8,6 +8,8 @@ import type {
   SubscriptionTrustLevel,
   CommunityView,
   CommunityBrowseView,
+  CommunitySearchView,
+  CommunityEventsView,
   CreateCommunityResult,
   SearchResultsView,
   PublicShareView,
@@ -113,6 +115,20 @@ export async function browseCommunity(
   shareIdHex: string
 ): Promise<CommunityBrowseView> {
   return invoke("browse_community", { shareIdHex });
+}
+
+export async function searchCommunity(
+  shareIdHex: string,
+  query: string
+): Promise<CommunitySearchView> {
+  return invoke("search_community", { shareIdHex, query });
+}
+
+export async function communityEvents(
+  shareIdHex: string,
+  sinceCursor?: string | null
+): Promise<CommunityEventsView> {
+  return invoke("community_events", { shareIdHex, sinceCursor: sinceCursor ?? null });
 }
 
 export async function createCommunity(

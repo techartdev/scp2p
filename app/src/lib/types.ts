@@ -73,6 +73,34 @@ export interface CommunityBrowseView {
   public_shares: PublicShareView[];
 }
 
+// ── Community search / events types (§15.6) ─────────────────────────────
+
+export interface CommunitySearchHitView {
+  share_id_hex: string;
+  share_pubkey_hex: string;
+  latest_seq: number;
+  title: string | null;
+  description: string | null;
+  score: number;
+}
+
+export interface CommunitySearchView {
+  community_share_id_hex: string;
+  results: CommunitySearchHitView[];
+  next_cursor: string | null;
+}
+
+export type CommunityEventView =
+  | { type: "member_joined"; member_node_pubkey_hex: string; announce_seq: number }
+  | { type: "member_left"; member_node_pubkey_hex: string; announce_seq: number }
+  | { type: "share_upserted"; share_id_hex: string; latest_seq: number; title: string | null };
+
+export interface CommunityEventsView {
+  community_share_id_hex: string;
+  events: CommunityEventView[];
+  next_cursor: string | null;
+}
+
 export interface SearchResultView {
   share_id_hex: string;
   content_id_hex: string;

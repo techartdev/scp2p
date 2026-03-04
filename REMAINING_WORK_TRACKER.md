@@ -222,17 +222,19 @@ Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community
 
 ### J.1 Data model redesign (required)
 
-- [ ] **J-1A: Replace monolithic `community:info` member list with per-member records**
-  - New DHT keyspace: `community:member:<community_id>:<member_node_pubkey>`
-  - Value: signed `CommunityMemberRecord { community_id, member_node_pubkey, announce_seq, status(join|leave), issued_at, expires_at, signature }`
-  - Validation rule: key must match `(community_id, member_node_pubkey)` and signature must verify against `member_node_pubkey`.
-  - Rationale: removes 64 KiB single-value bottleneck; enables safe leave tombstones.
+- [x] **J-1A: Replace monolithic `community:info` member list with per-member records**
+  - New DHT keyspace: `community:member:<community_id>:<member_node_pubkey>` — `community_member_key()` in `dht_keys.rs`
+  - Value: signed `CommunityMemberRecord` — `wire.rs`; `new_signed()` / `verify_signature()` / `encode_tagged()` / `decode_tagged()`
+  - Typed tag `0x31`; validator in `helpers.rs` routes by first byte before CBOR decode
+  - DHT publish via `publish_community_member_record()` / `reannounce_community_member_records()` on `NodeHandle`
+  - Round-trip + signature + wrong-tag tests in `wire.rs`
 
-- [ ] **J-1B: Add community share announcement records**
-  - New keyspace: `community:share:<community_id>:<share_id>`
-  - Value: signed `CommunityShareRecord { community_id, share_id, share_pubkey, manifest_id, seq, visibility, updated_at, title, description, signature }`
-  - Validation rule: `share_id == hash(share_pubkey)`, signature by `share_pubkey`, and manifest linkage checks.
-  - Rationale: browse should not require querying every participant.
+- [x] **J-1B: Add community share announcement records**
+  - New keyspace: `community:share:<community_id>:<share_id>` — `community_share_key()` in `dht_keys.rs`
+  - Value: signed `CommunityShareRecord` — `wire.rs`; `new_signed()` / `verify()` / `encode_tagged()` / `decode_tagged()`
+  - Typed tag `0x32`; validates `share_id == SHA-256(share_pubkey)` and Ed25519 signature
+  - DHT publish via `publish_community_share_record()` on `NodeHandle`
+  - Round-trip + signature + wrong-tag tests in `wire.rs`
 
 - [ ] **J-1C: Add relay materialized indexes (derived, cache-like)**
   - Relay-maintained paged views:
@@ -243,34 +245,30 @@ Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community
 
 ### J.2 Wire/API extensions (required)
 
-- [ ] **J-2A: Paginated community browse APIs**
-  - Add request/response types for:
-    - `LIST_COMMUNITY_MEMBERS_PAGE { community_id, cursor, limit }`
-    - `COMMUNITY_MEMBERS_PAGE { entries, next_cursor }`
-    - `LIST_COMMUNITY_SHARES_PAGE { community_id, cursor, limit, since_unix? }`
-    - `COMMUNITY_SHARES_PAGE { entries, next_cursor }`
-  - Cursor must be opaque and stable for replay-safe pagination.
+- [x] **J-2A: Paginated community browse APIs — wire types defined** (`MsgType` 410–413, structs in `wire.rs`, roundtrip tests)
+  - `ListCommunityMembersPage` / `CommunityMembersPageResponse` / `ListCommunitySharesPage` / `CommunitySharesPageResponse`
+  - `WireDispatcher` trait methods added; handlers are no-ops pending relay index implementation (J-1C)
+  - ⬜ Relay-side handler implementation pending J-1C
 
-- [ ] **J-2B: Community search API (metadata search)**
-  - `SEARCH_COMMUNITY_SHARES { community_id, query, cursor, limit, filters }`
-  - `COMMUNITY_SEARCH_RESULTS { hits, next_cursor }`
-  - Server-side search indexes titles/descriptions/tags only (not full file content), with strict result caps and pagination.
+- [x] **J-2B: Community search API — wire types defined** (`MsgType` 414–415, structs in `wire.rs`, roundtrip tests)
+  - `SearchCommunitySharesReq` / `CommunitySearchResultsResp`
+  - Server-side handler implemented: delegates to `CommunityIndex::search_shares()` for substring matching with scoring
 
-- [ ] **J-2C: Delta sync API**
-  - `LIST_COMMUNITY_EVENTS { community_id, since_cursor, limit }`
-  - Event types: member join/leave, share upsert/delete.
-  - Used by desktop to avoid full re-browse.
+- [x] **J-2C: Delta sync API — wire types defined** (`MsgType` 416–417, structs inc. `CommunityEvent` tagged enum in `wire.rs`, roundtrip tests)
+  - `ListCommunityEventsReq` / `CommunityEventsResp` with `MemberJoined` / `MemberLeft` / `ShareUpserted` events
+  - Server-side event log implemented: monotonic u64 seq cursors, bounded to 10k events per community, binary-search pagination
 
 ### J.3 Relay load protection (required)
 
-- [ ] **J-3A: Per-community quotas and token buckets**
-  - Separate rate limits for member-page, share-page, and search queries.
-  - Hard caps: max `limit`, max pages per minute, max concurrent requests per peer/community.
+- [x] **J-3A: Per-community quotas and token buckets**
+  - Added `Community` variant to `RequestClass` enum; reclassified `ListCommunityMembersPage`, `ListCommunitySharesPage`, `SearchCommunityShares`, `ListCommunityEvents` from `Fetch` to `Community`.
+  - Added `community: u32` counter in `AbuseCounter` and `max_community_requests_per_window: u32` (default 120) in `AbuseLimits`.
+  - `enforce_request_limits` increments and checks community counter independently. Hard caps already enforced via `MAX_MEMBERS_PAGE_SIZE`, `MAX_SHARES_PAGE_SIZE`, `MAX_SEARCH_HITS`, `MAX_EVENTS_PAGE_SIZE`.
 
-- [ ] **J-3B: Bounded index windows**
-  - Keep hot window in memory (e.g., recent N share events/community), older pages from SQLite.
-  - TTL + compaction jobs for stale leave/join churn and superseded share records.
-  - Leave tombstones: expire source records after 7 days; drop from derived indexes immediately.
+- [x] **J-3B: Bounded index windows**
+  - `IndexedShare` gains `expires_at: u64` field, computed as `updated_at + MAX_SHARE_TTL_SECS` (7 days).
+  - Per-community caps: `MAX_MEMBERS_PER_COMMUNITY = 10,000`, `MAX_SHARES_PER_COMMUNITY = 10,000`. Eviction helpers (`evict_oldest_members`, `evict_oldest_shares`) trim oldest records on insert.
+  - `purge_expired` extended: purges shares by `expires_at`, removes empty community buckets, compacts stale event logs (two-pass orphan detection to avoid borrow conflicts). `MAX_EVENT_AGE_SECS = 7 days`.
 
 - [ ] **J-3C: Multi-relay deterministic partitioning** — *Deferred after initial rollout*
   - For first rollout, each relay keeps a full index copy (simpler operations and recovery).
@@ -278,37 +276,42 @@ Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community
 
 ### J.4 Client behavior changes (desktop/cli)
 
-- [ ] **J-4A: Stop per-peer full polling in browse flow**
-  - Browse uses paged relay/community indexes first.
-  - Peer-direct probing only as fallback/sample mode.
+- [x] **J-4A: Stop per-peer full polling in browse flow**
+  - Browse uses paged relay/community indexes first (`fetch_community_shares_page`), looping through all cursor pages (up to 50 pages).
+  - Falls back to legacy per-peer `ListCommunityPublicShares` only when paged index returns empty.
+  - Search merges results from all peers (dedup by share_id, sorted by score) instead of returning first success.
 
-- [ ] **J-4B: Incremental UI updates**
-  - Persist `last_cursor` per joined community.
-  - On open: fast-load cached page 1 + run delta sync in background.
+- [x] **J-4B: Incremental UI updates**
+  - `PersistedCommunity` gains `last_event_cursor: Option<String>` (serde default for backward compat)
+  - `CommunityMembership` runtime struct carries cursor; round-trips through `from_persisted` / `to_persisted`
+  - `update_community_event_cursor()` and `community_event_cursor()` on `NodeHandle`
+  - `community_events()` in `app_state.rs` auto-uses persisted cursor when no explicit cursor is passed; persists cursor after successful fetch
 
-- [ ] **J-4C: Community search integration**
-  - Add dedicated community search query path.
-  - Keep existing local subscription search unchanged for private/local scope.
+- [x] **J-4C: Community search integration**
+  - DTOs: `CommunitySearchHitView`, `CommunitySearchView`, `CommunityEventView` (tagged enum), `CommunityEventsView`
+  - Desktop commands: `search_community(share_id_hex, query)`, `community_events(share_id_hex, since_cursor)`
+  - Full Tauri IPC wiring: `commands.rs` → `lib.rs` → `commands.ts` + TypeScript types
 
 ### J.5 Migration and compatibility plan
 
-- [ ] **J-5A: Dual-write / dual-read rollout**
-  - Phase 1: write lightweight bootstrap hints (`community:info`) plus new keyspaces.
-  - Phase 2: read new first, fallback old.
-  - Phase 3: stop writing old monolithic membership blobs; keep lightweight bootstrap hints.
+- [x] **J-5A: Dual-write / dual-read rollout**
+  - Phase 1 (done): Desktop `join_community`/`create_community` emit both signed per-member `CommunityMemberRecord` (§15.4.1) AND legacy `CommunityMembers` blob. `leave_community` emits signed leave tombstone before removing local state.
+  - `publish_share` emits `CommunityShareRecord` for each community in `manifest.communities`.
+  - `dht_republish_once` calls `reannounce_community_member_records()` alongside legacy community membership refresh.
+  - `publish_community_member_record` and `publish_community_share_record` now ingest into `community_index` immediately (not just on `dht_store` path).
+  - Phase 2/3 (future): read new first with fallback, then stop writing legacy blobs.
 
-- [ ] **J-5B: Protocol version bump and capability flags**
-  - Add capability bits for paged community browse/search support.
-  - Guard new requests behind capability negotiation.
+- [x] **J-5B: Protocol version bump and capability flags**
+  - `Capabilities` gains `community_paged_browse`, `community_search`, `community_delta_sync` (all `#[serde(default)]` bool fields)
+  - All existing `Capabilities` initialisers updated to use `..Default::default()`
 
 - [ ] **J-5C: Explicit deprecation window**
   - Publish cutover dates and minimum-version requirements for desktop/relay.
 
 ### J.6 Verification matrix (must-have before release)
 
-- [ ] **J-6A: Property tests**
-  - Join/leave CRDT convergence (out-of-order, duplicates, replay).
-  - Share upsert convergence with concurrent publishers.
+- [x] **J-6A: Property tests**
+  - 11 new tests in `community_index::tests`: exhaustive permutation-based CRDT convergence (all orderings of 4 member records, 4 share records, 6 mixed ops), duplicate idempotency, replay-cannot-undo-leave, same-seq tiebreak by `updated_at`, share TTL purge, event compaction for orphaned logs, member/share eviction cap enforcement.
 
 - [ ] **J-6B: Large-scale simulation**
   - 10k/50k member synthetic communities with churn.
@@ -320,9 +323,25 @@ Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community
 
 ### J.7 Execution order (pragmatic)
 
-- [ ] **J-7A: Phase 1 (foundation)** — J-1A + J-1B + typed keyspace validation dispatch
-- [ ] **J-7B: Phase 2 (browse)** — J-2A + J-4A
-- [ ] **J-7C: Phase 3 (enhancements)** — J-2B + J-2C + J-4B/J-4C
+- [x] **J-7A: Phase 1 (foundation)** — J-1A + J-1B + typed keyspace validation dispatch + wire types + capability bits
+  - `community_tags` module (`0x31`/`0x32`/`0x33`), typed dispatch in `validate_dht_value_for_known_keyspaces`, bootstrap hint (`CommunityBootstrapHint`, tag `0x33`, `publish_community_bootstrap_hint()`)
+  - 224 total tests; all passing; `cargo clippy -D warnings` clean
+- [x] **J-7B: Phase 2 (browse)** — J-1C + J-2A handler impl + J-4A
+  - `CommunityIndex` in-memory secondary index (`community_index.rs`): BTreeMap-backed paginated member/share index with cursor-based pages, substring search, expiry purge, 6 unit tests
+  - DHT ingestion hook in `dht_store`: tagged `0x31`/`0x32` values decoded, key recomputed, then fed to `state.community_index`
+  - Server handlers for `ListCommunityMembersPage`, `ListCommunitySharesPage`, `SearchCommunityShares`, `ListCommunityEvents` (stub) in `handle_incoming_envelope`
+  - Client helpers `query_community_members_page` / `query_community_shares_page` + `NodeHandle::fetch_community_members_page` / `fetch_community_shares_page`
+  - `browse_community` tries `ListCommunitySharesPage` paged fetch first; falls back to legacy `ListCommunityPublicShares` if peer lacks index
+  - 230 total tests; all passing; `cargo clippy -D warnings` + `cargo fmt` clean; sccache configured
+- [x] **J-7C: Phase 3 (enhancements)** — J-2B handler impl + J-2C handler impl + J-4B/J-4C
+  - Event log in `CommunityIndex`: monotonic u64 seq cursors, bounded 10k events, binary-search pagination, 3 new tests
+  - `ListCommunityEvents` handler wired to `events_page()` (was stub)
+  - `SearchCommunityShares` handler delegates to `CommunityIndex::search_shares()` (was stub, now functional)
+  - Client query helpers: `query_community_search_shares`, `query_community_events`
+  - `NodeHandle` methods: `fetch_community_search_shares`, `fetch_community_events`, `update_community_event_cursor`, `community_event_cursor`
+  - Cursor persistence: `PersistedCommunity.last_event_cursor`, auto-consumed in `community_events()` desktop command
+  - DTOs + Tauri commands + TypeScript bindings for search and events
+  - 235 total tests; all passing; `cargo clippy -D warnings` + `cargo fmt` clean
 - [ ] **J-7D: Phase 4 (advanced scaling)** — J-3C (deterministic multi-relay partitioning)
 
 ---
@@ -331,5 +350,5 @@ Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community
 
 | Priority | Items | Notes |
 |----------|-------|-------|
-| **1 — Done** | A (all), B, C.§2.10, D.§4.14, E (all), F, G.1, G.2, G.3, H.1, H.2, H.3, **I.1, I.2, I.3**, **D.§4.9**, **C.§2.7, C.§2.8, C.§2.9**, **D.§4.8, D.§4.11** | + adaptive DHT replication (access_count, is_popular, 2×K factor); + configurable stall rounds + reputation-seeded policy; + QUIC keep_alive/idle_timeout/initial_rtt tuning; + peer reputation score (note_outcome, peers_by_reputation, seeded in downloads); + blocklist auto-sync loop. 207 total tests (195 core + 12 cli/desktop), all passing, clippy clean. |
+| **1 — Done** | A (all), B, C.§2.10, D.§4.14, E (all), F, G.1, G.2, G.3, H.1, H.2, H.3, **I.1, I.2, I.3**, **D.§4.9**, **C.§2.7, C.§2.8, C.§2.9**, **D.§4.8, D.§4.11**, **J-1A, J-1B, J-2A (wire), J-2B (wire+handler), J-2C (wire+handler), J-5B, J-7A**, **J-1C, J-2A (handlers), J-4A, J-7B**, **J-4B, J-4C, J-7C**, **J-3A, J-3B, J-5A, J-6A** | + Codex review fixes: §15 pipeline wired e2e (desktop join/leave/create emit signed records, publish_share emits per-community share records, republish loop calls reannounce), local index ingest on publish, event cursor always returns high-water mark, browse follows all pages, search merges all peers, prefix-first validator dispatch. 246 total tests, all passing, clippy clean. |
 | **2 — Deferred** | D.§4.10, D.§4.12 | Key rotation requires protocol version bump + new wire types. Mobile incentives require platform APIs outside library layer. |

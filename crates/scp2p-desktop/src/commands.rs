@@ -7,10 +7,10 @@
 use crate::{
     app_state::DesktopAppState,
     dto::{
-        CommunityBrowseView, CommunityView, CreateCommunityResult, DesktopClientConfig,
-        OwnedShareView, PeerView, PublicShareView, PublishResultView, PublishVisibility,
-        RuntimeStatus, SearchResultsView, ShareItemView, StartNodeRequest, SubscriptionView,
-        SyncResultView,
+        CommunityBrowseView, CommunityEventsView, CommunitySearchView, CommunityView,
+        CreateCommunityResult, DesktopClientConfig, OwnedShareView, PeerView, PublicShareView,
+        PublishResultView, PublishVisibility, RuntimeStatus, SearchResultsView, ShareItemView,
+        StartNodeRequest, SubscriptionView, SyncResultView,
     },
 };
 use scp2p_core::SubscriptionTrustLevel;
@@ -74,6 +74,24 @@ pub async fn browse_community(
     share_id_hex: String,
 ) -> anyhow::Result<CommunityBrowseView> {
     app_state.browse_community(&share_id_hex).await
+}
+
+pub async fn search_community(
+    app_state: &DesktopAppState,
+    share_id_hex: String,
+    query: String,
+) -> anyhow::Result<CommunitySearchView> {
+    app_state.search_community(&share_id_hex, &query).await
+}
+
+pub async fn community_events(
+    app_state: &DesktopAppState,
+    share_id_hex: String,
+    since_cursor: Option<String>,
+) -> anyhow::Result<CommunityEventsView> {
+    app_state
+        .community_events(&share_id_hex, since_cursor)
+        .await
 }
 
 pub async fn subscribe_share(

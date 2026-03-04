@@ -18,11 +18,13 @@ use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
 use crate::{
     capabilities::Capabilities,
     wire::{
-        ChunkData, CommunityPublicShareList, CommunityStatus, Envelope, FindNode, FindValue,
-        GetChunk, GetCommunityStatus, GetManifest, HaveContent, ListCommunityPublicShares,
-        ListPublicShares, MAX_ENVELOPE_BYTES, MAX_ENVELOPE_PAYLOAD_BYTES, ManifestData, PexOffer,
-        PexRequest, Providers, PublicShareList, RelayConnect, RelayRegister, RelayRegistered,
-        RelayStream, Store, WirePayload,
+        ChunkData, CommunityEventsResp, CommunityMembersPageResponse, CommunityPublicShareList,
+        CommunitySearchResultsResp, CommunitySharesPageResponse, CommunityStatus, Envelope,
+        FindNode, FindValue, GetChunk, GetCommunityStatus, GetManifest, HaveContent,
+        ListCommunityEventsReq, ListCommunityMembersPage, ListCommunityPublicShares,
+        ListCommunitySharesPage, ListPublicShares, MAX_ENVELOPE_BYTES, MAX_ENVELOPE_PAYLOAD_BYTES,
+        ManifestData, PexOffer, PexRequest, Providers, PublicShareList, RelayConnect,
+        RelayRegister, RelayRegistered, RelayStream, SearchCommunitySharesReq, Store, WirePayload,
     },
 };
 
@@ -518,6 +520,38 @@ pub trait WireDispatcher {
         &mut self,
         msg: crate::wire::ChunkHashList,
     ) -> anyhow::Result<DispatchResult>;
+    async fn on_list_community_members_page(
+        &mut self,
+        msg: ListCommunityMembersPage,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_community_members_page(
+        &mut self,
+        msg: CommunityMembersPageResponse,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_list_community_shares_page(
+        &mut self,
+        msg: ListCommunitySharesPage,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_community_shares_page(
+        &mut self,
+        msg: CommunitySharesPageResponse,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_search_community_shares(
+        &mut self,
+        msg: SearchCommunitySharesReq,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_community_search_results(
+        &mut self,
+        msg: CommunitySearchResultsResp,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_list_community_events(
+        &mut self,
+        msg: ListCommunityEventsReq,
+    ) -> anyhow::Result<DispatchResult>;
+    async fn on_community_events(
+        &mut self,
+        msg: CommunityEventsResp,
+    ) -> anyhow::Result<DispatchResult>;
 }
 
 pub async fn dispatch_envelope<D: WireDispatcher + Send>(
@@ -555,6 +589,22 @@ pub async fn dispatch_envelope<D: WireDispatcher + Send>(
         WirePayload::ChunkData(msg) => dispatcher.on_chunk_data(msg).await?,
         WirePayload::GetChunkHashes(msg) => dispatcher.on_get_chunk_hashes(msg).await?,
         WirePayload::ChunkHashList(msg) => dispatcher.on_chunk_hash_list(msg).await?,
+        WirePayload::ListCommunityMembersPage(msg) => {
+            dispatcher.on_list_community_members_page(msg).await?
+        }
+        WirePayload::CommunityMembersPage(msg) => dispatcher.on_community_members_page(msg).await?,
+        WirePayload::ListCommunitySharesPage(msg) => {
+            dispatcher.on_list_community_shares_page(msg).await?
+        }
+        WirePayload::CommunitySharesPage(msg) => dispatcher.on_community_shares_page(msg).await?,
+        WirePayload::SearchCommunityShares(msg) => {
+            dispatcher.on_search_community_shares(msg).await?
+        }
+        WirePayload::CommunitySearchResults(msg) => {
+            dispatcher.on_community_search_results(msg).await?
+        }
+        WirePayload::ListCommunityEvents(msg) => dispatcher.on_list_community_events(msg).await?,
+        WirePayload::CommunityEvents(msg) => dispatcher.on_community_events(msg).await?,
     };
     Ok(result.response)
 }
@@ -708,6 +758,62 @@ impl WireDispatcher for NoopDispatcher {
     ) -> anyhow::Result<DispatchResult> {
         Ok(DispatchResult::none())
     }
+
+    async fn on_list_community_members_page(
+        &mut self,
+        _msg: ListCommunityMembersPage,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_community_members_page(
+        &mut self,
+        _msg: CommunityMembersPageResponse,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_list_community_shares_page(
+        &mut self,
+        _msg: ListCommunitySharesPage,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_community_shares_page(
+        &mut self,
+        _msg: CommunitySharesPageResponse,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_search_community_shares(
+        &mut self,
+        _msg: SearchCommunitySharesReq,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_community_search_results(
+        &mut self,
+        _msg: CommunitySearchResultsResp,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_list_community_events(
+        &mut self,
+        _msg: ListCommunityEventsReq,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
+
+    async fn on_community_events(
+        &mut self,
+        _msg: CommunityEventsResp,
+    ) -> anyhow::Result<DispatchResult> {
+        Ok(DispatchResult::none())
+    }
 }
 
 pub fn now_unix_secs() -> anyhow::Result<u64> {
@@ -841,6 +947,54 @@ mod tests {
         ) -> anyhow::Result<DispatchResult> {
             Ok(DispatchResult::none())
         }
+        async fn on_list_community_members_page(
+            &mut self,
+            _msg: ListCommunityMembersPage,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_members_page(
+            &mut self,
+            _msg: CommunityMembersPageResponse,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_list_community_shares_page(
+            &mut self,
+            _msg: ListCommunitySharesPage,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_shares_page(
+            &mut self,
+            _msg: CommunitySharesPageResponse,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_search_community_shares(
+            &mut self,
+            _msg: SearchCommunitySharesReq,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_search_results(
+            &mut self,
+            _msg: CommunitySearchResultsResp,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_list_community_events(
+            &mut self,
+            _msg: ListCommunityEventsReq,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_events(
+            &mut self,
+            _msg: CommunityEventsResp,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
     }
 
     #[tokio::test]
@@ -856,6 +1010,7 @@ mod tests {
             relay: false,
             content_seed: true,
             mobile_light: false,
+            ..Default::default()
         };
         let server_caps = Capabilities {
             dht: true,
@@ -863,6 +1018,7 @@ mod tests {
             relay: true,
             content_seed: true,
             mobile_light: false,
+            ..Default::default()
         };
         let client_nonce = [1u8; 32];
         let server_nonce = [2u8; 32];

@@ -4,6 +4,7 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
+use ed25519_dalek::{Signer, Verifier};
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
 
@@ -236,6 +237,23 @@ pub enum MsgType {
     ListCommunityPublicShares = 406,
     /// Community-scoped public-share listing response.
     CommunityPublicShareList = 407,
+    // §15.6 — Large-scale community browse, search, and delta sync
+    /// Paginated community member list request (§15.6.1).
+    ListCommunityMembersPage = 410,
+    /// Paginated community member list response (§15.6.1).
+    CommunityMembersPage = 411,
+    /// Paginated community shares list request (§15.6.1).
+    ListCommunitySharesPage = 412,
+    /// Paginated community shares list response (§15.6.1).
+    CommunitySharesPage = 413,
+    /// Community metadata search request (§15.6.2).
+    SearchCommunityShares = 414,
+    /// Community metadata search response (§15.6.2).
+    CommunitySearchResults = 415,
+    /// Community delta/event sync request (§15.6.3).
+    ListCommunityEvents = 416,
+    /// Community delta/event sync response (§15.6.3).
+    CommunityEvents = 417,
     /// Relay registration request.
     RelayRegister = 450,
     /// Relay registration acknowledgement.
@@ -264,7 +282,7 @@ pub enum MsgType {
 
 impl MsgType {
     /// Stable `u16` registry for protocol envelope types.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 33] = [
         Self::PexOffer,
         Self::PexRequest,
         Self::FindNode,
@@ -278,6 +296,14 @@ impl MsgType {
         Self::CommunityStatus,
         Self::ListCommunityPublicShares,
         Self::CommunityPublicShareList,
+        Self::ListCommunityMembersPage,
+        Self::CommunityMembersPage,
+        Self::ListCommunitySharesPage,
+        Self::CommunitySharesPage,
+        Self::SearchCommunityShares,
+        Self::CommunitySearchResults,
+        Self::ListCommunityEvents,
+        Self::CommunityEvents,
         Self::RelayRegister,
         Self::RelayRegistered,
         Self::RelayConnect,
@@ -317,6 +343,14 @@ impl TryFrom<u16> for MsgType {
             405 => Ok(Self::CommunityStatus),
             406 => Ok(Self::ListCommunityPublicShares),
             407 => Ok(Self::CommunityPublicShareList),
+            410 => Ok(Self::ListCommunityMembersPage),
+            411 => Ok(Self::CommunityMembersPage),
+            412 => Ok(Self::ListCommunitySharesPage),
+            413 => Ok(Self::CommunitySharesPage),
+            414 => Ok(Self::SearchCommunityShares),
+            415 => Ok(Self::CommunitySearchResults),
+            416 => Ok(Self::ListCommunityEvents),
+            417 => Ok(Self::CommunityEvents),
             450 => Ok(Self::RelayRegister),
             451 => Ok(Self::RelayRegistered),
             452 => Ok(Self::RelayConnect),
@@ -554,6 +588,140 @@ pub struct CommunityPublicShareList {
     pub shares: Vec<PublicShareSummary>,
 }
 
+// ── §15.6 Paginated community browse / search / delta messages ──────
+
+/// Paginated member list request (§15.6.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListCommunityMembersPage {
+    pub community_id: [u8; 32],
+    /// Opaque cursor from a previous response.  Absent for the first page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub limit: u16,
+}
+
+/// Summary of a community member for paginated responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityMemberSummary {
+    pub member_node_pubkey: [u8; 32],
+    pub status: CommunityMemberStatus,
+    pub announce_seq: u64,
+    pub addr: Option<PeerAddr>,
+}
+
+/// Paginated member list response (§15.6.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityMembersPageResponse {
+    pub community_id: [u8; 32],
+    pub entries: Vec<CommunityMemberSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Paginated share list request (§15.6.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListCommunitySharesPage {
+    pub community_id: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub limit: u16,
+    /// Optional: only return entries updated after this UNIX timestamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_unix: Option<u64>,
+}
+
+/// Summary of a community share for paginated responses.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityShareSummary {
+    pub share_id: [u8; 32],
+    pub share_pubkey: [u8; 32],
+    pub latest_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub updated_at: u64,
+}
+
+/// Paginated share list response (§15.6.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunitySharesPageResponse {
+    pub community_id: [u8; 32],
+    pub entries: Vec<CommunityShareSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Community metadata search request (§15.6.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SearchCommunitySharesReq {
+    pub community_id: [u8; 32],
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    pub limit: u16,
+}
+
+/// Community metadata search hit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityShareHit {
+    pub share_id: [u8; 32],
+    pub share_pubkey: [u8; 32],
+    pub latest_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub score: u32,
+}
+
+/// Community metadata search response (§15.6.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunitySearchResultsResp {
+    pub community_id: [u8; 32],
+    pub hits: Vec<CommunityShareHit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Community delta/event sync request (§15.6.3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListCommunityEventsReq {
+    pub community_id: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_cursor: Option<String>,
+    pub limit: u16,
+}
+
+/// Community event types (§15.6.3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommunityEvent {
+    MemberJoined {
+        member_node_pubkey: [u8; 32],
+        announce_seq: u64,
+    },
+    MemberLeft {
+        member_node_pubkey: [u8; 32],
+        announce_seq: u64,
+    },
+    ShareUpserted {
+        share_id: [u8; 32],
+        latest_seq: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+    },
+}
+
+/// Community delta/event sync response (§15.6.3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityEventsResp {
+    pub community_id: [u8; 32],
+    pub events: Vec<CommunityEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RelayRegister {
     #[serde(default)]
@@ -617,6 +785,329 @@ pub struct CommunityMembers {
     pub community_share_id: [u8; 32],
     pub members: Vec<PeerAddr>,
     pub updated_at: u64,
+}
+
+// ── §15 Large-Scale Community Records ───────────────────────────────
+
+/// Typed value tag bytes for community keyspace dispatch (§15.4.0).
+///
+/// The first byte of the DHT value payload identifies the record type,
+/// allowing the validator to route to the correct deserializer without
+/// trial-parsing every known struct.
+pub mod community_tags {
+    /// Per-member community record (§15.4.1).
+    pub const MEMBER_RECORD: u8 = 0x31;
+    /// Per-share community announcement (§15.4.2).
+    pub const SHARE_RECORD: u8 = 0x32;
+    /// Lightweight community bootstrap hint (§15.4.1b).
+    pub const BOOTSTRAP_HINT: u8 = 0x33;
+}
+
+/// Per-member community record stored in the DHT (§15.4.1).
+///
+/// Signed by the member's own Ed25519 node key.  Replaces the
+/// monolithic `CommunityMembers` blob for scalable membership tracking.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityMemberRecord {
+    pub community_id: [u8; 32],
+    pub member_node_pubkey: [u8; 32],
+    pub announce_seq: u64,
+    pub status: CommunityMemberStatus,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+/// Member status for per-member community records.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CommunityMemberStatus {
+    Joined,
+    Left,
+}
+
+/// Signable portion of a `CommunityMemberRecord` (all fields except `signature`).
+#[derive(Serialize)]
+struct CommunityMemberRecordSignable(
+    [u8; 32], // community_id
+    [u8; 32], // member_node_pubkey
+    u64,      // announce_seq
+    bool,     // true = joined, false = left
+    u64,      // issued_at
+    u64,      // expires_at
+);
+
+impl CommunityMemberRecord {
+    /// Maximum TTL for leave tombstones (7 days per §15.4.1).
+    pub const LEAVE_TOMBSTONE_MAX_TTL_SECS: u64 = 7 * 24 * 3600;
+
+    /// Create and sign a new member record.
+    pub fn new_signed(
+        signing_key: &ed25519_dalek::SigningKey,
+        community_id: [u8; 32],
+        announce_seq: u64,
+        status: CommunityMemberStatus,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> anyhow::Result<Self> {
+        let member_node_pubkey = signing_key.verifying_key().to_bytes();
+        let is_joined = matches!(status, CommunityMemberStatus::Joined);
+        let signable = CommunityMemberRecordSignable(
+            community_id,
+            member_node_pubkey,
+            announce_seq,
+            is_joined,
+            issued_at,
+            expires_at,
+        );
+        let sig = signing_key.sign(&crate::cbor::to_vec(&signable)?);
+        Ok(Self {
+            community_id,
+            member_node_pubkey,
+            announce_seq,
+            status,
+            issued_at,
+            expires_at,
+            signature: sig.to_bytes().to_vec(),
+        })
+    }
+
+    /// Verify the Ed25519 signature against `member_node_pubkey`.
+    pub fn verify_signature(&self) -> anyhow::Result<()> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        if self.signature.len() != 64 {
+            anyhow::bail!("CommunityMemberRecord signature must be 64 bytes");
+        }
+        let vk = VerifyingKey::from_bytes(&self.member_node_pubkey)?;
+        let is_joined = matches!(self.status, CommunityMemberStatus::Joined);
+        let signable = CommunityMemberRecordSignable(
+            self.community_id,
+            self.member_node_pubkey,
+            self.announce_seq,
+            is_joined,
+            self.issued_at,
+            self.expires_at,
+        );
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&self.signature);
+        vk.verify(
+            &crate::cbor::to_vec(&signable)?,
+            &Signature::from_bytes(&sig_arr),
+        )?;
+        Ok(())
+    }
+
+    /// Encode with typed tag prefix for DHT storage (§15.4.0).
+    pub fn encode_tagged(&self) -> anyhow::Result<Vec<u8>> {
+        let cbor = crate::cbor::to_vec(self)?;
+        let mut out = Vec::with_capacity(1 + cbor.len());
+        out.push(community_tags::MEMBER_RECORD);
+        out.extend_from_slice(&cbor);
+        Ok(out)
+    }
+
+    /// Decode from a tagged value payload.
+    ///
+    /// Caller must have already verified the first byte is
+    /// `community_tags::MEMBER_RECORD`.
+    pub fn decode_tagged(data: &[u8]) -> anyhow::Result<Self> {
+        if data.is_empty() {
+            anyhow::bail!("empty tagged community member record");
+        }
+        if data[0] != community_tags::MEMBER_RECORD {
+            anyhow::bail!("wrong tag for community member record: 0x{:02x}", data[0]);
+        }
+        Ok(crate::cbor::from_slice(&data[1..])?)
+    }
+}
+
+/// Per-share community announcement stored in the DHT (§15.4.2).
+///
+/// Signed by the share's Ed25519 key.  Allows browsing community
+/// shares without querying every participant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityShareRecord {
+    pub community_id: [u8; 32],
+    pub share_id: [u8; 32],
+    pub share_pubkey: [u8; 32],
+    pub latest_manifest_id: [u8; 32],
+    pub latest_seq: u64,
+    pub visibility: ShareVisibilityTag,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+/// Visibility tag for community share records.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShareVisibilityTag {
+    Public,
+}
+
+/// Signable portion of a `CommunityShareRecord`.
+#[derive(Serialize)]
+struct CommunityShareRecordSignable(
+    [u8; 32], // community_id
+    [u8; 32], // share_id
+    [u8; 32], // share_pubkey
+    [u8; 32], // latest_manifest_id
+    u64,      // latest_seq
+    u64,      // updated_at
+);
+
+impl CommunityShareRecord {
+    /// Create and sign a new share announcement.
+    ///
+    /// `share_signing_key` is the Ed25519 key for the share.
+    pub fn new_signed(
+        share_signing_key: &ed25519_dalek::SigningKey,
+        community_id: [u8; 32],
+        latest_manifest_id: [u8; 32],
+        latest_seq: u64,
+        updated_at: u64,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let share_pubkey = share_signing_key.verifying_key().to_bytes();
+        let share_id = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(share_pubkey);
+            let d = h.finalize();
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&d);
+            out
+        };
+        let signable = CommunityShareRecordSignable(
+            community_id,
+            share_id,
+            share_pubkey,
+            latest_manifest_id,
+            latest_seq,
+            updated_at,
+        );
+        let sig = share_signing_key.sign(&crate::cbor::to_vec(&signable)?);
+        Ok(Self {
+            community_id,
+            share_id,
+            share_pubkey,
+            latest_manifest_id,
+            latest_seq,
+            visibility: ShareVisibilityTag::Public,
+            updated_at,
+            title,
+            description,
+            signature: sig.to_bytes().to_vec(),
+        })
+    }
+
+    /// Verify the signature and that `share_id == SHA-256(share_pubkey)`.
+    pub fn verify(&self) -> anyhow::Result<()> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        // Check share_id derivation rule.
+        let expected_id = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(self.share_pubkey);
+            let d = h.finalize();
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&d);
+            out
+        };
+        if expected_id != self.share_id {
+            anyhow::bail!("share_id does not match SHA-256(share_pubkey)");
+        }
+        // Verify signature.
+        if self.signature.len() != 64 {
+            anyhow::bail!("CommunityShareRecord signature must be 64 bytes");
+        }
+        let vk = VerifyingKey::from_bytes(&self.share_pubkey)?;
+        let signable = CommunityShareRecordSignable(
+            self.community_id,
+            self.share_id,
+            self.share_pubkey,
+            self.latest_manifest_id,
+            self.latest_seq,
+            self.updated_at,
+        );
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&self.signature);
+        vk.verify(
+            &crate::cbor::to_vec(&signable)?,
+            &Signature::from_bytes(&sig_arr),
+        )?;
+        Ok(())
+    }
+
+    /// Encode with typed tag prefix for DHT storage (§15.4.0).
+    pub fn encode_tagged(&self) -> anyhow::Result<Vec<u8>> {
+        let cbor = crate::cbor::to_vec(self)?;
+        let mut out = Vec::with_capacity(1 + cbor.len());
+        out.push(community_tags::SHARE_RECORD);
+        out.extend_from_slice(&cbor);
+        Ok(out)
+    }
+
+    /// Decode from a tagged value payload.
+    pub fn decode_tagged(data: &[u8]) -> anyhow::Result<Self> {
+        if data.is_empty() {
+            anyhow::bail!("empty tagged community share record");
+        }
+        if data[0] != community_tags::SHARE_RECORD {
+            anyhow::bail!("wrong tag for community share record: 0x{:02x}", data[0]);
+        }
+        Ok(crate::cbor::from_slice(&data[1..])?)
+    }
+}
+
+/// Lightweight community bootstrap hint for first-contact discovery (§15.4.1b).
+///
+/// Advisory only — not authoritative for membership.  Clients MUST
+/// verify discovered membership/share state using signed per-member/
+/// per-share records before trusting anything from the hint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityBootstrapHint {
+    pub community_id: [u8; 32],
+    pub member_count_estimate: u64,
+    /// Bounded sample of known member addresses (max 16).
+    pub sample_members: Vec<PeerAddr>,
+    /// Peers/relays known to serve paginated community indexes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub index_peers: Vec<PeerAddr>,
+    pub updated_at: u64,
+}
+
+impl CommunityBootstrapHint {
+    /// Max entries in `sample_members` to keep the hint bounded.
+    pub const MAX_SAMPLE_MEMBERS: usize = 16;
+    /// Max entries in `index_peers`.
+    pub const MAX_INDEX_PEERS: usize = 8;
+
+    /// Encode with typed tag prefix for DHT storage (§15.4.0).
+    pub fn encode_tagged(&self) -> anyhow::Result<Vec<u8>> {
+        let cbor = crate::cbor::to_vec(self)?;
+        let mut out = Vec::with_capacity(1 + cbor.len());
+        out.push(community_tags::BOOTSTRAP_HINT);
+        out.extend_from_slice(&cbor);
+        Ok(out)
+    }
+
+    /// Decode from a tagged value payload.
+    pub fn decode_tagged(data: &[u8]) -> anyhow::Result<Self> {
+        if data.is_empty() {
+            anyhow::bail!("empty tagged community bootstrap hint");
+        }
+        if data[0] != community_tags::BOOTSTRAP_HINT {
+            anyhow::bail!("wrong tag for community bootstrap hint: 0x{:02x}", data[0]);
+        }
+        Ok(crate::cbor::from_slice(&data[1..])?)
+    }
 }
 
 /// Chunk request.  Wire format: `{0: content_id, 1: chunk_index}`.
@@ -766,6 +1257,14 @@ pub enum WirePayload {
     CommunityStatus(CommunityStatus),
     ListCommunityPublicShares(ListCommunityPublicShares),
     CommunityPublicShareList(CommunityPublicShareList),
+    ListCommunityMembersPage(ListCommunityMembersPage),
+    CommunityMembersPage(CommunityMembersPageResponse),
+    ListCommunitySharesPage(ListCommunitySharesPage),
+    CommunitySharesPage(CommunitySharesPageResponse),
+    SearchCommunityShares(SearchCommunitySharesReq),
+    CommunitySearchResults(CommunitySearchResultsResp),
+    ListCommunityEvents(ListCommunityEventsReq),
+    CommunityEvents(CommunityEventsResp),
     RelayRegister(RelayRegister),
     RelayRegistered(RelayRegistered),
     RelayConnect(RelayConnect),
@@ -796,6 +1295,14 @@ impl WirePayload {
             Self::CommunityStatus(_) => MsgType::CommunityStatus,
             Self::ListCommunityPublicShares(_) => MsgType::ListCommunityPublicShares,
             Self::CommunityPublicShareList(_) => MsgType::CommunityPublicShareList,
+            Self::ListCommunityMembersPage(_) => MsgType::ListCommunityMembersPage,
+            Self::CommunityMembersPage(_) => MsgType::CommunityMembersPage,
+            Self::ListCommunitySharesPage(_) => MsgType::ListCommunitySharesPage,
+            Self::CommunitySharesPage(_) => MsgType::CommunitySharesPage,
+            Self::SearchCommunityShares(_) => MsgType::SearchCommunityShares,
+            Self::CommunitySearchResults(_) => MsgType::CommunitySearchResults,
+            Self::ListCommunityEvents(_) => MsgType::ListCommunityEvents,
+            Self::CommunityEvents(_) => MsgType::CommunityEvents,
             Self::RelayRegister(_) => MsgType::RelayRegister,
             Self::RelayRegistered(_) => MsgType::RelayRegistered,
             Self::RelayConnect(_) => MsgType::RelayConnect,
@@ -826,6 +1333,14 @@ impl WirePayload {
             Self::CommunityStatus(msg) => crate::cbor::to_vec(msg)?,
             Self::ListCommunityPublicShares(msg) => crate::cbor::to_vec(msg)?,
             Self::CommunityPublicShareList(msg) => crate::cbor::to_vec(msg)?,
+            Self::ListCommunityMembersPage(msg) => crate::cbor::to_vec(msg)?,
+            Self::CommunityMembersPage(msg) => crate::cbor::to_vec(msg)?,
+            Self::ListCommunitySharesPage(msg) => crate::cbor::to_vec(msg)?,
+            Self::CommunitySharesPage(msg) => crate::cbor::to_vec(msg)?,
+            Self::SearchCommunityShares(msg) => crate::cbor::to_vec(msg)?,
+            Self::CommunitySearchResults(msg) => crate::cbor::to_vec(msg)?,
+            Self::ListCommunityEvents(msg) => crate::cbor::to_vec(msg)?,
+            Self::CommunityEvents(msg) => crate::cbor::to_vec(msg)?,
             Self::RelayRegister(msg) => crate::cbor::to_vec(msg)?,
             Self::RelayRegistered(msg) => crate::cbor::to_vec(msg)?,
             Self::RelayConnect(msg) => crate::cbor::to_vec(msg)?,
@@ -863,6 +1378,28 @@ impl WirePayload {
             MsgType::CommunityPublicShareList => {
                 Self::CommunityPublicShareList(crate::cbor::from_slice(payload)?)
             }
+            MsgType::ListCommunityMembersPage => {
+                Self::ListCommunityMembersPage(crate::cbor::from_slice(payload)?)
+            }
+            MsgType::CommunityMembersPage => {
+                Self::CommunityMembersPage(crate::cbor::from_slice(payload)?)
+            }
+            MsgType::ListCommunitySharesPage => {
+                Self::ListCommunitySharesPage(crate::cbor::from_slice(payload)?)
+            }
+            MsgType::CommunitySharesPage => {
+                Self::CommunitySharesPage(crate::cbor::from_slice(payload)?)
+            }
+            MsgType::SearchCommunityShares => {
+                Self::SearchCommunityShares(crate::cbor::from_slice(payload)?)
+            }
+            MsgType::CommunitySearchResults => {
+                Self::CommunitySearchResults(crate::cbor::from_slice(payload)?)
+            }
+            MsgType::ListCommunityEvents => {
+                Self::ListCommunityEvents(crate::cbor::from_slice(payload)?)
+            }
+            MsgType::CommunityEvents => Self::CommunityEvents(crate::cbor::from_slice(payload)?),
             MsgType::RelayRegister => Self::RelayRegister(crate::cbor::from_slice(payload)?),
             MsgType::RelayRegistered => Self::RelayRegistered(crate::cbor::from_slice(payload)?),
             MsgType::RelayConnect => Self::RelayConnect(crate::cbor::from_slice(payload)?),
@@ -1394,6 +1931,78 @@ mod tests {
                 content_id: [14u8; 32],
                 hashes: vec![[1u8; 32], [2u8; 32]],
             }),
+            // §15 community browse/search/delta messages
+            WirePayload::ListCommunityMembersPage(ListCommunityMembersPage {
+                community_id: [30u8; 32],
+                cursor: None,
+                limit: 50,
+            }),
+            WirePayload::CommunityMembersPage(CommunityMembersPageResponse {
+                community_id: [30u8; 32],
+                entries: vec![CommunityMemberSummary {
+                    member_node_pubkey: [31u8; 32],
+                    status: CommunityMemberStatus::Joined,
+                    announce_seq: 1,
+                    addr: None,
+                }],
+                next_cursor: Some("abc".into()),
+            }),
+            WirePayload::ListCommunitySharesPage(ListCommunitySharesPage {
+                community_id: [32u8; 32],
+                cursor: None,
+                limit: 20,
+                since_unix: Some(1000),
+            }),
+            WirePayload::CommunitySharesPage(CommunitySharesPageResponse {
+                community_id: [32u8; 32],
+                entries: vec![CommunityShareSummary {
+                    share_id: [33u8; 32],
+                    share_pubkey: [34u8; 32],
+                    latest_seq: 7,
+                    title: Some("test share".into()),
+                    description: None,
+                    updated_at: 2000,
+                }],
+                next_cursor: None,
+            }),
+            WirePayload::SearchCommunityShares(SearchCommunitySharesReq {
+                community_id: [35u8; 32],
+                query: "hello".into(),
+                cursor: None,
+                limit: 10,
+            }),
+            WirePayload::CommunitySearchResults(CommunitySearchResultsResp {
+                community_id: [35u8; 32],
+                hits: vec![CommunityShareHit {
+                    share_id: [36u8; 32],
+                    share_pubkey: [37u8; 32],
+                    latest_seq: 2,
+                    title: Some("found".into()),
+                    description: None,
+                    score: 100,
+                }],
+                next_cursor: None,
+            }),
+            WirePayload::ListCommunityEvents(ListCommunityEventsReq {
+                community_id: [38u8; 32],
+                since_cursor: None,
+                limit: 25,
+            }),
+            WirePayload::CommunityEvents(CommunityEventsResp {
+                community_id: [38u8; 32],
+                events: vec![
+                    CommunityEvent::MemberJoined {
+                        member_node_pubkey: [39u8; 32],
+                        announce_seq: 1,
+                    },
+                    CommunityEvent::ShareUpserted {
+                        share_id: [40u8; 32],
+                        latest_seq: 3,
+                        title: Some("new share".into()),
+                    },
+                ],
+                next_cursor: Some("xyz".into()),
+            }),
         ];
 
         for (idx, message) in cases.iter().enumerate() {
@@ -1401,5 +2010,201 @@ mod tests {
             let decoded = envelope.decode_typed().expect("decode typed payload");
             assert_eq!(&decoded, message);
         }
+    }
+
+    // ── §15 Signed record tests ──────────────────────────────────────
+
+    #[test]
+    fn community_member_record_sign_verify_roundtrip() {
+        use ed25519_dalek::SigningKey;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let key = SigningKey::generate(&mut rng);
+        let community_id = [0xAA; 32];
+        let now = 1_700_000_000u64;
+        let expires = now + 3600;
+
+        let rec = CommunityMemberRecord::new_signed(
+            &key,
+            community_id,
+            1,
+            CommunityMemberStatus::Joined,
+            now,
+            expires,
+        )
+        .expect("create member record");
+
+        assert_eq!(rec.community_id, community_id);
+        assert_eq!(rec.member_node_pubkey, key.verifying_key().to_bytes());
+        assert_eq!(rec.announce_seq, 1);
+        rec.verify_signature().expect("signature should verify");
+
+        // Encode/decode tagged roundtrip.
+        let tagged = rec.encode_tagged().expect("encode tagged");
+        assert_eq!(tagged[0], community_tags::MEMBER_RECORD);
+        let decoded = CommunityMemberRecord::decode_tagged(&tagged).expect("decode tagged");
+        assert_eq!(decoded, rec);
+        decoded.verify_signature().expect("decoded sig ok");
+    }
+
+    #[test]
+    fn community_member_record_rejects_bad_signature() {
+        use ed25519_dalek::SigningKey;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(99);
+        let key = SigningKey::generate(&mut rng);
+        let mut rec = CommunityMemberRecord::new_signed(
+            &key,
+            [0xBB; 32],
+            1,
+            CommunityMemberStatus::Joined,
+            1_700_000_000,
+            1_700_003_600,
+        )
+        .expect("create");
+        // Corrupt the signature.
+        rec.signature[0] ^= 0xFF;
+        assert!(rec.verify_signature().is_err());
+    }
+
+    #[test]
+    fn community_member_record_leave_tombstone() {
+        use ed25519_dalek::SigningKey;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(77);
+        let key = SigningKey::generate(&mut rng);
+        let now = 1_700_000_000u64;
+        let rec = CommunityMemberRecord::new_signed(
+            &key,
+            [0xCC; 32],
+            2,
+            CommunityMemberStatus::Left,
+            now,
+            now + CommunityMemberRecord::LEAVE_TOMBSTONE_MAX_TTL_SECS,
+        )
+        .expect("create leave tombstone");
+
+        assert_eq!(rec.status, CommunityMemberStatus::Left);
+        rec.verify_signature().expect("leave sig verifies");
+    }
+
+    #[test]
+    fn community_share_record_sign_verify_roundtrip() {
+        use ed25519_dalek::SigningKey;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(55);
+        let share_key = SigningKey::generate(&mut rng);
+        let community_id = [0xDD; 32];
+        let manifest_id = [0xEE; 32];
+        let now = 1_700_000_000u64;
+
+        let rec = CommunityShareRecord::new_signed(
+            &share_key,
+            community_id,
+            manifest_id,
+            1,
+            now,
+            Some("My Share".into()),
+            Some("A test share".into()),
+        )
+        .expect("create share record");
+
+        assert_eq!(rec.community_id, community_id);
+        assert_eq!(rec.latest_manifest_id, manifest_id);
+        assert_eq!(rec.share_pubkey, share_key.verifying_key().to_bytes());
+        assert_eq!(rec.visibility, ShareVisibilityTag::Public);
+        rec.verify().expect("share sig verifies");
+
+        // Tagged roundtrip.
+        let tagged = rec.encode_tagged().expect("encode tagged");
+        assert_eq!(tagged[0], community_tags::SHARE_RECORD);
+        let decoded = CommunityShareRecord::decode_tagged(&tagged).expect("decode tagged");
+        assert_eq!(decoded, rec);
+        decoded.verify().expect("decoded share sig ok");
+    }
+
+    #[test]
+    fn community_share_record_rejects_bad_signature() {
+        use ed25519_dalek::SigningKey;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(66);
+        let key = SigningKey::generate(&mut rng);
+        let mut rec = CommunityShareRecord::new_signed(
+            &key,
+            [0xAA; 32],
+            [0xBB; 32],
+            1,
+            1_700_000_000,
+            None,
+            None,
+        )
+        .expect("create");
+        rec.signature[0] ^= 0xFF;
+        assert!(rec.verify().is_err());
+    }
+
+    #[test]
+    fn community_bootstrap_hint_encode_decode_roundtrip() {
+        use crate::peer::TransportProtocol;
+
+        let hint = CommunityBootstrapHint {
+            community_id: [0xFF; 32],
+            member_count_estimate: 42,
+            sample_members: vec![PeerAddr {
+                ip: "10.0.0.1".parse().expect("valid ip"),
+                port: 7000,
+                transport: TransportProtocol::Quic,
+                pubkey_hint: Some([1u8; 32]),
+                relay_via: None,
+            }],
+            index_peers: vec![],
+            updated_at: 1_700_000_000,
+        };
+
+        let tagged = hint.encode_tagged().expect("encode");
+        assert_eq!(tagged[0], community_tags::BOOTSTRAP_HINT);
+        let decoded = CommunityBootstrapHint::decode_tagged(&tagged).expect("decode");
+        assert_eq!(decoded, hint);
+    }
+
+    #[test]
+    fn community_bootstrap_hint_wrong_tag_rejected() {
+        // Construct data with wrong tag byte.
+        let hint = CommunityBootstrapHint {
+            community_id: [0x11; 32],
+            member_count_estimate: 5,
+            sample_members: vec![],
+            index_peers: vec![],
+            updated_at: 100,
+        };
+        let mut tagged = hint.encode_tagged().expect("encode");
+        tagged[0] = 0x99; // wrong tag
+        assert!(CommunityBootstrapHint::decode_tagged(&tagged).is_err());
+    }
+
+    #[test]
+    fn community_member_record_wrong_tag_rejected() {
+        use ed25519_dalek::SigningKey;
+        use rand::{SeedableRng, rngs::StdRng};
+
+        let mut rng = StdRng::seed_from_u64(11);
+        let key = SigningKey::generate(&mut rng);
+        let rec = CommunityMemberRecord::new_signed(
+            &key,
+            [0xAA; 32],
+            1,
+            CommunityMemberStatus::Joined,
+            100,
+            200,
+        )
+        .expect("create");
+        let mut tagged = rec.encode_tagged().expect("encode");
+        tagged[0] = community_tags::SHARE_RECORD; // wrong tag
+        assert!(CommunityMemberRecord::decode_tagged(&tagged).is_err());
     }
 }

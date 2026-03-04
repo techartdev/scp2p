@@ -57,6 +57,12 @@ impl NodeHandle {
             publisher,
         )?;
 
+        // Capture community list before the manifest is moved into the cache.
+        let communities = manifest.communities.clone();
+        let seq = manifest.seq;
+        let title = manifest.title.clone();
+        let description = manifest.description.clone();
+
         let manifest_id = {
             let mut state = self.state.write().await;
             let now = now_unix_secs()?;
@@ -83,6 +89,29 @@ impl NodeHandle {
             manifest_id
         };
         persist_state(self).await?;
+
+        // Emit per-community share records (§15.4.2) for each community
+        // this share belongs to, so the paged community index picks up
+        // the share immediately.
+        for community_id in &communities {
+            if let Err(e) = self
+                .publish_community_share_record(
+                    *community_id,
+                    &publisher.signing_key,
+                    manifest_id,
+                    seq,
+                    title.clone(),
+                    description.clone(),
+                )
+                .await
+            {
+                debug!(
+                    community = %hex::encode(&community_id[..8]),
+                    error = %e,
+                    "publish_share: failed to emit community share record"
+                );
+            }
+        }
 
         info!(
             share_id = hex::encode(share_id.0),

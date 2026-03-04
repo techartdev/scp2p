@@ -95,6 +95,11 @@ pub struct PersistedCommunity {
     /// Local human-readable label set at creation or join time.
     #[serde(default)]
     pub name: Option<String>,
+    /// Last event cursor received from the community event log (§15.6.3).
+    /// Used for incremental delta sync so subsequent polls only fetch
+    /// new events.
+    #[serde(default)]
+    pub last_event_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -6,10 +6,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 use scp2p_core::SubscriptionTrustLevel;
 use scp2p_desktop::{
-    CommunityBrowseView, CommunityView, CreateCommunityResult, DesktopAppState,
-    DesktopClientConfig, OwnedShareView, PeerView, PublicShareView, PublishResultView,
-    PublishVisibility, RuntimeStatus, SearchResultsView, ShareItemView, StartNodeRequest,
-    SubscriptionView, SyncResultView, commands,
+    CommunityBrowseView, CommunityEventsView, CommunitySearchView, CommunityView,
+    CreateCommunityResult, DesktopAppState, DesktopClientConfig, OwnedShareView, PeerView,
+    PublicShareView, PublishResultView, PublishVisibility, RuntimeStatus, SearchResultsView,
+    ShareItemView, StartNodeRequest, SubscriptionView, SyncResultView, commands,
 };
 use serde::Serialize;
 use tauri::Emitter;
@@ -180,6 +180,28 @@ async fn browse_community(
     share_id_hex: String,
 ) -> Result<CommunityBrowseView, String> {
     commands::browse_community(&state.0, share_id_hex)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn search_community(
+    state: tauri::State<'_, AppState>,
+    share_id_hex: String,
+    query: String,
+) -> Result<CommunitySearchView, String> {
+    commands::search_community(&state.0, share_id_hex, query)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+async fn community_events(
+    state: tauri::State<'_, AppState>,
+    share_id_hex: String,
+    since_cursor: Option<String>,
+) -> Result<CommunityEventsView, String> {
+    commands::community_events(&state.0, share_id_hex, since_cursor)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -425,6 +447,8 @@ pub fn run() {
             join_community,
             leave_community,
             browse_community,
+            search_community,
+            community_events,
             create_community,
             search_catalogs,
             browse_public_shares,

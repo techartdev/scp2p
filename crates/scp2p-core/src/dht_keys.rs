@@ -24,6 +24,34 @@ pub fn community_info_key(share_id: &ShareId) -> [u8; 32] {
     prefixed_hash(b"community:info:", &share_id.0)
 }
 
+/// Per-member community record key (§15.4.1).
+///
+/// `SHA-256("community:member:" || community_id || member_node_pubkey)`
+pub fn community_member_key(community_id: &[u8; 32], member_node_pubkey: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"community:member:");
+    hasher.update(community_id);
+    hasher.update(member_node_pubkey);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Per-share community announcement key (§15.4.2).
+///
+/// `SHA-256("community:share:" || community_id || share_id)`
+pub fn community_share_key(community_id: &[u8; 32], share_id: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(b"community:share:");
+    hasher.update(community_id);
+    hasher.update(share_id);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 fn prefixed_hash(prefix: &[u8], id: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(prefix);
@@ -57,5 +85,45 @@ mod tests {
         let cid = [3u8; 32];
         let sid = ShareId(cid);
         assert_ne!(content_provider_key(&cid), share_head_key(&sid));
+    }
+
+    #[test]
+    fn community_member_key_is_deterministic() {
+        let cid = [5u8; 32];
+        let pubkey = [6u8; 32];
+        assert_eq!(
+            community_member_key(&cid, &pubkey),
+            community_member_key(&cid, &pubkey)
+        );
+    }
+
+    #[test]
+    fn community_member_key_distinct_from_info_key() {
+        let cid = [5u8; 32];
+        let pubkey = [6u8; 32];
+        assert_ne!(
+            community_member_key(&cid, &pubkey),
+            community_info_key(&ShareId(cid))
+        );
+    }
+
+    #[test]
+    fn community_share_key_is_deterministic() {
+        let cid = [5u8; 32];
+        let sid = [7u8; 32];
+        assert_eq!(
+            community_share_key(&cid, &sid),
+            community_share_key(&cid, &sid)
+        );
+    }
+
+    #[test]
+    fn community_share_key_distinct_from_member_key() {
+        let cid = [5u8; 32];
+        let id = [6u8; 32];
+        assert_ne!(
+            community_share_key(&cid, &id),
+            community_member_key(&cid, &id)
+        );
     }
 }
