@@ -4979,7 +4979,11 @@ async fn community_members_dht_merge_on_store() {
     let found = handle.dht_find_value(key).await.expect("find").unwrap();
     let merged: crate::wire::CommunityMembers =
         crate::cbor::from_slice(&found.value).expect("decode");
-    assert_eq!(merged.members.len(), 2, "should have both members after merge");
+    assert_eq!(
+        merged.members.len(),
+        2,
+        "should have both members after merge"
+    );
     assert!(merged.members.contains(&addr_a));
     assert!(merged.members.contains(&addr_b));
     assert_eq!(merged.updated_at, 200, "updated_at should be max of both");
@@ -5007,8 +5011,7 @@ async fn upsert_community_member_roundtrip() {
 
     let key = crate::dht_keys::community_info_key(&community_share_id);
     let found = handle.dht_find_value(key).await.expect("find").unwrap();
-    let cm: crate::wire::CommunityMembers =
-        crate::cbor::from_slice(&found.value).expect("decode");
+    let cm: crate::wire::CommunityMembers = crate::cbor::from_slice(&found.value).expect("decode");
     assert_eq!(cm.members.len(), 1);
     assert_eq!(cm.members[0], addr);
 

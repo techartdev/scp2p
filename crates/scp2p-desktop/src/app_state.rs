@@ -675,15 +675,25 @@ impl DesktopAppState {
         // announced themselves as community members.  This is essential
         // because the bootstrap relay typically has NOT joined the
         // community, so without DHT discovery we'd return 0 participants.
+        //
+        // Use `dht_find_value_from_network` (not `_iterative`) because
+        // the local DHT copy only contains *this* node; the relay's
+        // copy is the merged superset of all members.
         let community_key =
             scp2p_core::community_info_key(&scp2p_core::ShareId(community.share_id));
+        let self_addr = self.resolve_self_addr(&node).await.ok();
         if let Ok(Some(dht_value)) = node
-            .dht_find_value_iterative(&transport, community_key, &peers)
+            .dht_find_value_from_network(&transport, community_key, &peers)
             .await
             && let Ok(cm) =
                 scp2p_core::cbor::from_slice::<scp2p_core::wire::CommunityMembers>(&dht_value.value)
         {
             for member in cm.members {
+                // Skip our own address — we already handle local shares
+                // separately below.
+                if self_addr.as_ref().is_some_and(|sa| member == *sa) {
+                    continue;
+                }
                 if !peers.iter().any(|p| p == &member) {
                     peers.push(member);
                 }
@@ -719,21 +729,17 @@ impl DesktopAppState {
                 )
                 .await
                 .unwrap_or_default();
+            let local_label = "this node".to_string();
             if !local_shares.is_empty() {
-                let self_addr_label = if let Ok(sa) = self.resolve_self_addr(&node).await {
-                    format!("{}:{}", sa.ip, sa.port)
-                } else {
-                    "local".to_string()
-                };
                 participants.push(CommunityParticipantView {
                     community_share_id_hex: hex::encode(community.share_id),
-                    peer_addr: self_addr_label.clone(),
+                    peer_addr: local_label.clone(),
                     transport: "local".to_string(),
                 });
                 for share in local_shares {
                     if seen_shares.insert(share.share_id) {
                         public_shares.push(PublicShareView {
-                            source_peer_addr: self_addr_label.clone(),
+                            source_peer_addr: local_label.clone(),
                             share_id_hex: hex::encode(share.share_id),
                             share_pubkey_hex: hex::encode(share.share_pubkey),
                             latest_seq: share.latest_seq,
@@ -746,6 +752,11 @@ impl DesktopAppState {
         }
 
         for peer in peers {
+            // Skip querying ourselves — local shares are already
+            // included above.
+            if self_addr.as_ref().is_some_and(|sa| peer == *sa) {
+                continue;
+            }
             match node
                 .fetch_community_status_from_peer(
                     &transport,

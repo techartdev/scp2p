@@ -225,6 +225,25 @@ impl NodeHandle {
             return Ok(Some(value));
         }
 
+        self.dht_find_value_from_network(transport, key, seed_peers)
+            .await
+    }
+
+    /// Like [`Self::dht_find_value_iterative`], but always queries the
+    /// network even when a local copy exists.  The remote result is
+    /// stored locally before being returned.
+    ///
+    /// Use this for values where the relay's copy is the authoritative
+    /// merged superset (e.g. `CommunityMembers`).
+    pub async fn dht_find_value_from_network<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        key: [u8; 32],
+        seed_peers: &[PeerAddr],
+    ) -> anyhow::Result<Option<DhtValue>> {
+        let key_hex = hex::encode(&key[..8]);
+        debug!(key = %key_hex, "dht_find_value_from_network: starting");
+
         let mut target = [0u8; 20];
         target.copy_from_slice(&key[..20]);
         let mut peers = self
@@ -264,7 +283,7 @@ impl NodeHandle {
                         remote.ttl_secs.max(DEFAULT_TTL_SECS),
                         now,
                     )?;
-                    debug!(key = %key_hex, "dht_find_value_iterative: found remotely");
+                    debug!(key = %key_hex, "dht_find_value_from_network: found remotely");
                     return Ok(state.dht.find_value(key, now));
                 }
                 discovered |= merge_peer_list(&mut peers, result.closer_peers);
@@ -274,7 +293,7 @@ impl NodeHandle {
             }
         }
 
-        debug!(key = %key_hex, queried = queried.len(), "dht_find_value_iterative: not found");
+        debug!(key = %key_hex, queried = queried.len(), "dht_find_value_from_network: not found");
         Ok(None)
     }
 
