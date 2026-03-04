@@ -93,7 +93,7 @@ SCP2P isn't just secure; it's architected to protect your digital footprint:
 
 ---
 
-We are currently in **v0.1 Prototype** phase. We are building the foundations of a global communication standard.
+Current stable release line is **v0.3.x**, with active development continuing toward broader platform coverage and protocol hardening.
 
 ### ✅ What's Working (Existing)
 - **Core Protocol:** Ed25519 identities, BLAKE3 content addressing, and CBOR-framed messaging.
@@ -131,7 +131,7 @@ The project is structured as a Rust workspace:
 - `crates/scp2p-core`: The heart of the protocol.
 - `crates/scp2p-cli`: Interactive command-line client.
 - `crates/scp2p-relay`: Headless relay / DHT node binary.
-- `app/`: The Tauri + React desktop application.
+- `crates/scp2p-desktop`: Desktop application shell and runtime integration.
 
 ### Interactive CLI
 
@@ -158,17 +158,10 @@ See [DOCS.md](DOCS.md#3-cli-usage) for the full reference.
 
 ### Desktop Application
 
-The desktop app is built with Tauri and React. To run it in development mode:
+Run the desktop application from the workspace:
 
 ```bash
-# Navigate to the app directory
-cd app
-
-# Install dependencies
-npm install
-
-# Start the app in development mode
-npm run tauri dev
+cargo run -p scp2p-desktop
 ```
 
 ### Standalone Relay

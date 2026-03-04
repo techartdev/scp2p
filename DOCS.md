@@ -6,6 +6,8 @@ This document explains how to run and use the current SCP2P prototype, what APIs
 
 - `crates/scp2p-core`: protocol and runtime primitives
 - `crates/scp2p-cli`: reference CLI executable
+- `crates/scp2p-desktop`: desktop shell/runtime integration
+- `crates/scp2p-relay`: standalone relay binary
 - `SPECIFICATION.md`: protocol specification source of truth
 - `AGENTS.md`: contribution instructions for coding agents
 - `PLAN.md`: future roadmap and extension ideas
@@ -38,7 +40,7 @@ Windows desktop shell notes:
   - runtime config: state DB path, QUIC bind, TCP bind, bootstrap peer list
   - lifecycle: load/save config, start/stop, refresh
   - subscriptions: add/remove by share id
-  - communities: join by `share_id` + `share_pubkey`, browse joined participants and community public shares across reachable peers
+  - communities: join by `share_id` + `share_pubkey`, browse joined participants and community public shares via DHT-assisted discovery + peer status checks
   - public shares: browse reachable-peer public shares and subscribe without manually entering `share_id`
   - sync: manual sync over configured bootstrap TCP peers plus LAN-discovered peers
   - search: local subscription-scoped search
@@ -56,7 +58,7 @@ Windows desktop shell notes:
   - published content is advertised over the local TCP listener; if `Bind TCP` is `0.0.0.0`, the app derives an address from a known peer when possible
 - Community notes:
   - community join is explicit and local; there is no community autodiscovery
-  - community browse currently probes the peers you can already reach, lists the ones that report joined membership for the selected community, and then fetches community-bound public shares from those peers
+  - community browse uses DHT-backed community member discovery (`community:info`) and then fetches membership status and public-share listings from discovered peers
 
 ## 3. CLI usage
 
@@ -65,11 +67,11 @@ The `scp2p` CLI is an **interactive shell**. There are no subcommands to memoris
 ### Starting the CLI
 
 ```bash
-# Defaults: database = scp2p.db in cwd, TCP port = 7001
+# Defaults: database = scp2p.db in cwd, TCP port = 7001, QUIC port = 7000
 scp2p
 
 # Explicit options
-scp2p --db ~/mydata.db --port 7002 --bootstrap 10.0.0.1:7001,10.0.0.2:7001
+scp2p --db ~/mydata.db --port 7002 --quic-port 7001 --bootstrap 10.0.0.1:7001,10.0.0.2:7001
 
 # Development via Cargo
 cargo run -p scp2p-cli -- --bootstrap 10.0.0.1:7001
@@ -81,6 +83,7 @@ All flags have environment variable equivalents:
 |---|---|---|
 | `--db <PATH>` | `SCP2P_DB` | `scp2p.db` |
 | `--port <PORT>` | `SCP2P_PORT` | `7001` |
+| `--quic-port <PORT>` | `SCP2P_QUIC_PORT` | `--port - 1` (set `0` to disable) |
 | `--bootstrap <IP:PORT>` | `SCP2P_BOOTSTRAP` (comma-separated) | (empty) |
 
 ### Startup sequence
@@ -89,8 +92,11 @@ On launch the CLI:
 1. Opens (or creates) the SQLite database.
 2. Restores persisted node identity.
 3. Starts a background TCP listener on `0.0.0.0:<port>`.
-4. Prints a welcome banner with your **Node ID** and **Share ID**.
-5. Enters the main menu loop.
+4. Starts a background QUIC listener on `0.0.0.0:<quic-port>` unless QUIC is disabled.
+5. Starts background DHT republish + subscription sync loops.
+6. Attempts persistent relay tunnel registration using configured bootstrap peers.
+7. Prints a welcome banner with your **Node ID** and **Share ID**.
+8. Enters the main menu loop.
 
 ### Main menu
 
@@ -107,6 +113,7 @@ On launch the CLI:
   📁  Publish folder
   📚  Browse / inspect a share
   🔔  Subscriptions
+  🏘  Communities
   🔍  Search
   ⬇   Download by content ID
   ⬇   Download share
@@ -339,7 +346,7 @@ secrecy.  Frame lengths use a 4-byte **big-endian** (network byte order) prefix.
 
 ## 6. Current limitations
 
-This is an in-memory prototype baseline.
+State is persisted via SQLite (`SqliteStore`) and includes subscriptions, manifests, search snapshot, peers, communities, publisher identities, and partial download metadata.
 
 Not yet implemented as production-ready behavior:
 - End-to-end relay tunnel transport integration
@@ -347,7 +354,7 @@ Not yet implemented as production-ready behavior:
 - Robust peer reputation, abuse controls, quotas
 - Full mobile/desktop profile split behavior
 
-## 7. Message type registry (frozen for v0.1)
+## 7. Message type registry (current)
 
 `type: u16` values currently reserved/implemented:
 
@@ -358,6 +365,14 @@ Not yet implemented as production-ready behavior:
 - `202`: `STORE`
 - `400`: `GET_MANIFEST`
 - `401`: `MANIFEST_DATA`
+- `402`: `LIST_PUBLIC_SHARES`
+- `403`: `PUBLIC_SHARE_LIST`
+- `404`: `GET_COMMUNITY_STATUS`
+- `405`: `COMMUNITY_STATUS`
+- `406`: `LIST_COMMUNITY_PUBLIC_SHARES`
+- `407`: `COMMUNITY_PUBLIC_SHARE_LIST`
+- `460`: `RELAY_LIST_REQUEST`
+- `461`: `RELAY_LIST_RESPONSE`
 - `450`: `RELAY_REGISTER`
 - `451`: `RELAY_REGISTERED`
 - `452`: `RELAY_CONNECT`
@@ -368,15 +383,6 @@ Not yet implemented as production-ready behavior:
 - `501`: `CHUNK_DATA`
 - `502`: `GET_CHUNK_HASHES`
 - `503`: `CHUNK_HASH_LIST`
-- `600`: `LIST_PUBLIC_SHARES`
-- `601`: `PUBLIC_SHARE_LIST`
-- `602`: `GET_COMMUNITY_STATUS`
-- `603`: `COMMUNITY_STATUS`
-- `604`: `LIST_COMMUNITY_PUBLIC_SHARES`
-- `605`: `COMMUNITY_PUBLIC_SHARE_LIST`
-- `700`: `RELAY_LIST_REQUEST`
-- `701`: `RELAY_LIST_RESPONSE`
-
 Compatibility policy for this registry:
 
 - Existing numeric assignments are stable and must not be changed.

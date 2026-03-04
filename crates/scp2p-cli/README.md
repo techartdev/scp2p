@@ -9,13 +9,13 @@
 ### One-line install (Linux / macOS)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/your-org/scp2p/main/install.sh | sh -s -- --tool cli
+curl -fsSL https://raw.githubusercontent.com/techartdev/scp2p/main/install.sh | sh -s -- --tool cli
 ```
 
 ### One-line install (Windows PowerShell)
 
 ```powershell
-$env:SCP2P_TOOL="cli"; irm https://raw.githubusercontent.com/your-org/scp2p/main/install.ps1 | iex
+$env:SCP2P_TOOL="cli"; irm https://raw.githubusercontent.com/techartdev/scp2p/main/install.ps1 | iex
 ```
 
 ### From crates.io
@@ -35,11 +35,11 @@ cargo install --path crates/scp2p-cli
 ## Quick start
 
 ```bash
-# Start with defaults (database = scp2p.db, port = 7001)
+# Start with defaults (database = scp2p.db, TCP = 7001, QUIC = 7000)
 scp2p
 
-# Explicit database, port, and bootstrap peer
-scp2p --db ~/mynode.db --port 7002 --bootstrap 10.0.0.1:7001
+# Explicit database, TCP/QUIC ports, and bootstrap peer
+scp2p --db ~/mynode.db --port 7002 --quic-port 7001 --bootstrap 10.0.0.1:7001
 
 # Multiple bootstrap peers
 scp2p --bootstrap 10.0.0.1:7001,10.0.0.2:7001
@@ -53,6 +53,7 @@ scp2p --bootstrap 10.0.0.1:7001,10.0.0.2:7001
 |---|---|---|---|
 | `--db <PATH>` | `SCP2P_DB` | `scp2p.db` | SQLite state database path |
 | `--port <PORT>` | `SCP2P_PORT` | `7001` | TCP port for incoming peer connections |
+| `--quic-port <PORT>` | `SCP2P_QUIC_PORT` | `--port - 1` | QUIC port (set `0` to disable QUIC) |
 | `--bootstrap <IP:PORT>` | `SCP2P_BOOTSTRAP` | (empty) | Comma-separated bootstrap peer addresses |
 
 All flags can also be supplied as environment variables — useful in scripts or containers.
@@ -61,7 +62,7 @@ All flags can also be supplied as environment variables — useful in scripts or
 
 ## Interactive shell
 
-On launch the node opens (or creates) the database, restores its identity, starts a background TCP listener, and presents the main menu:
+On launch the node opens (or creates) the database, restores its identity, starts background TCP/QUIC listeners (if enabled), and presents the main menu:
 
 ```
   ╔══════════════════════════════════════════╗
@@ -79,6 +80,7 @@ On launch the node opens (or creates) the database, restores its identity, start
   📁  Publish folder
   📚  Browse / inspect a share
   🔔  Subscriptions
+  🏘  Communities
   🔍  Search
   ⬇   Download by content ID
   ⬇   Download share
@@ -119,6 +121,13 @@ Sub-menu with three options:
 | Subscribe to a new share | Enter a share ID (hex) and optional public key |
 | Sync subscriptions now | Trigger an immediate network sync (same as **Sync now**) |
 
+### 🏘 Communities
+Sub-menu for:
+- Create a new community
+- Join a community
+- Leave a community
+- Browse a community (participants and public shares)
+
 ### 🔍 Search
 Prompts for a text query, runs it against the local subscription-scoped search index, and shows ranked results with score, share ID, content ID, and item name.
 
@@ -149,5 +158,5 @@ Generates a fresh Ed25519 keypair and prints:
 
 - **Offline use:** search and browsing work without any network connection as long as you have locally synced manifests.
 - **Persistent identity:** the node key is stored in the database; the same Node ID and Share ID appear on every launch against the same `--db`.
-- **Scripting:** set `SCP2P_DB`, `SCP2P_PORT`, and `SCP2P_BOOTSTRAP` environment variables to avoid repeating flags in scripts.
+- **Scripting:** set `SCP2P_DB`, `SCP2P_PORT`, `SCP2P_QUIC_PORT`, and `SCP2P_BOOTSTRAP` environment variables to avoid repeating flags in scripts.
 - **Multiple nodes:** point different instances at different `--db` paths to run multiple independent identities on the same machine.
