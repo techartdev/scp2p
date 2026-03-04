@@ -29,9 +29,10 @@ use crate::{
     store::{PersistedPartialDownload, decrypt_secret, encrypt_secret},
     transport::{read_envelope, write_envelope},
     wire::{
-        ChunkData, CommunityPublicShareList, CommunityStatus, Envelope, FLAG_RESPONSE, FindNode,
-        FindNodeResult, FindValueResult, MsgType, PexOffer, Providers, PublicShareList,
-        RelayListResponse, RelayRegister, Store as WireStore, WirePayload,
+        ChunkData, CommunityEventsResp, CommunityMembersPageResponse, CommunityPublicShareList,
+        CommunitySearchResultsResp, CommunitySharesPageResponse, CommunityStatus, Envelope,
+        FLAG_RESPONSE, FindNode, FindNodeResult, FindValueResult, MsgType, PexOffer, Providers,
+        PublicShareList, RelayListResponse, RelayRegister, Store as WireStore, WirePayload,
     },
 };
 
@@ -1289,6 +1290,97 @@ impl NodeHandle {
                         flags: FLAG_RESPONSE,
                         payload,
                     })
+            }
+            // ── §15.6 Paged community browse / search / events ──────
+            WirePayload::ListCommunityMembersPage(msg) => {
+                let state = self.state.read().await;
+                let limit = msg.limit;
+                let (entries, next_cursor) = state.community_index.members_page(
+                    msg.community_id,
+                    msg.cursor.as_deref(),
+                    limit,
+                );
+                drop(state);
+                crate::cbor::to_vec(&CommunityMembersPageResponse {
+                    community_id: msg.community_id,
+                    entries,
+                    next_cursor,
+                })
+                .map_err(Into::into)
+                .map(|payload| Envelope {
+                    r#type: MsgType::CommunityMembersPage as u16,
+                    req_id,
+                    flags: FLAG_RESPONSE,
+                    payload,
+                })
+            }
+            WirePayload::ListCommunitySharesPage(msg) => {
+                let state = self.state.read().await;
+                let limit = msg.limit;
+                let (entries, next_cursor) = state.community_index.shares_page(
+                    msg.community_id,
+                    msg.cursor.as_deref(),
+                    limit,
+                    msg.since_unix,
+                );
+                drop(state);
+                crate::cbor::to_vec(&CommunitySharesPageResponse {
+                    community_id: msg.community_id,
+                    entries,
+                    next_cursor,
+                })
+                .map_err(Into::into)
+                .map(|payload| Envelope {
+                    r#type: MsgType::CommunitySharesPage as u16,
+                    req_id,
+                    flags: FLAG_RESPONSE,
+                    payload,
+                })
+            }
+            WirePayload::SearchCommunityShares(msg) => {
+                let state = self.state.read().await;
+                let limit = msg.limit;
+                let (hits, next_cursor) = state.community_index.search_shares(
+                    msg.community_id,
+                    &msg.query,
+                    msg.cursor.as_deref(),
+                    limit,
+                );
+                drop(state);
+                crate::cbor::to_vec(&CommunitySearchResultsResp {
+                    community_id: msg.community_id,
+                    hits,
+                    next_cursor,
+                })
+                .map_err(Into::into)
+                .map(|payload| Envelope {
+                    r#type: MsgType::CommunitySearchResults as u16,
+                    req_id,
+                    flags: FLAG_RESPONSE,
+                    payload,
+                })
+            }
+            WirePayload::ListCommunityEvents(msg) => {
+                let state = self.state.read().await;
+                let limit = msg.limit;
+                let (events, next_cursor) = state.community_index.events_page(
+                    msg.community_id,
+                    msg.since_cursor.as_deref(),
+                    limit,
+                );
+                drop(state);
+                crate::cbor::to_vec(&CommunityEventsResp {
+                    community_id: msg.community_id,
+                    events,
+                    next_cursor,
+                })
+                .map_err(Into::into)
+                .map(|payload| Envelope {
+                    r#type: MsgType::CommunityEvents as u16,
+                    req_id,
+                    flags: FLAG_RESPONSE,
+                    payload,
+                })
             }
             _ => Err(anyhow::anyhow!("unsupported message type")),
         };

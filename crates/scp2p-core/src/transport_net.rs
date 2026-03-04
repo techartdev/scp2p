@@ -615,6 +615,54 @@ mod tests {
         ) -> anyhow::Result<DispatchResult> {
             Ok(DispatchResult::none())
         }
+        async fn on_list_community_members_page(
+            &mut self,
+            _msg: crate::wire::ListCommunityMembersPage,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_members_page(
+            &mut self,
+            _msg: crate::wire::CommunityMembersPageResponse,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_list_community_shares_page(
+            &mut self,
+            _msg: crate::wire::ListCommunitySharesPage,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_shares_page(
+            &mut self,
+            _msg: crate::wire::CommunitySharesPageResponse,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_search_community_shares(
+            &mut self,
+            _msg: crate::wire::SearchCommunitySharesReq,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_search_results(
+            &mut self,
+            _msg: crate::wire::CommunitySearchResultsResp,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_list_community_events(
+            &mut self,
+            _msg: crate::wire::ListCommunityEventsReq,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
+        async fn on_community_events(
+            &mut self,
+            _msg: crate::wire::CommunityEventsResp,
+        ) -> anyhow::Result<DispatchResult> {
+            Ok(DispatchResult::none())
+        }
     }
 
     #[tokio::test]

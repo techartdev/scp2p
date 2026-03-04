@@ -192,6 +192,54 @@ pub struct ShareItemView {
     pub mime: Option<String>,
 }
 
+// ── Community search / events DTOs ──
+
+/// A single hit from a community metadata search (§15.6.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunitySearchHitView {
+    pub share_id_hex: String,
+    pub share_pubkey_hex: String,
+    pub latest_seq: u64,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub score: u32,
+}
+
+/// Paged result from a community share search.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunitySearchView {
+    pub community_share_id_hex: String,
+    pub results: Vec<CommunitySearchHitView>,
+    pub next_cursor: Option<String>,
+}
+
+/// A single event from the community delta/event log (§15.6.3).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CommunityEventView {
+    MemberJoined {
+        member_node_pubkey_hex: String,
+        announce_seq: u64,
+    },
+    MemberLeft {
+        member_node_pubkey_hex: String,
+        announce_seq: u64,
+    },
+    ShareUpserted {
+        share_id_hex: String,
+        latest_seq: u64,
+        title: Option<String>,
+    },
+}
+
+/// Paged result from the community event log.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityEventsView {
+    pub community_share_id_hex: String,
+    pub events: Vec<CommunityEventView>,
+    pub next_cursor: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +358,51 @@ mod tests {
         };
         let bytes = scp2p_core::cbor::to_vec(&view).expect("encode");
         let decoded: ShareItemView = scp2p_core::cbor::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, view);
+    }
+
+    #[test]
+    fn community_search_view_serde_roundtrip() {
+        let view = CommunitySearchView {
+            community_share_id_hex: "10".repeat(32),
+            results: vec![CommunitySearchHitView {
+                share_id_hex: "11".repeat(32),
+                share_pubkey_hex: "12".repeat(32),
+                latest_seq: 5,
+                title: Some("found".into()),
+                description: None,
+                score: 42,
+            }],
+            next_cursor: Some("abc".into()),
+        };
+        let bytes = scp2p_core::cbor::to_vec(&view).expect("encode");
+        let decoded: CommunitySearchView = scp2p_core::cbor::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, view);
+    }
+
+    #[test]
+    fn community_events_view_serde_roundtrip() {
+        let view = CommunityEventsView {
+            community_share_id_hex: "20".repeat(32),
+            events: vec![
+                CommunityEventView::MemberJoined {
+                    member_node_pubkey_hex: "21".repeat(32),
+                    announce_seq: 1,
+                },
+                CommunityEventView::ShareUpserted {
+                    share_id_hex: "22".repeat(32),
+                    latest_seq: 3,
+                    title: Some("my-share".into()),
+                },
+                CommunityEventView::MemberLeft {
+                    member_node_pubkey_hex: "21".repeat(32),
+                    announce_seq: 4,
+                },
+            ],
+            next_cursor: None,
+        };
+        let bytes = scp2p_core::cbor::to_vec(&view).expect("encode");
+        let decoded: CommunityEventsView = scp2p_core::cbor::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, view);
     }
 }

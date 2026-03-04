@@ -8,6 +8,7 @@ pub mod api;
 pub mod blob_store;
 pub mod capabilities;
 pub mod cbor;
+pub mod community_index;
 pub mod config;
 pub mod content;
 pub mod dht;
@@ -40,7 +41,10 @@ pub use dht::{
     ALPHA, DEFAULT_TTL_SECS, Dht, DhtInsertResult, DhtNodeRecord, DhtValue, K, MAX_TTL_SECS,
     MAX_VALUE_SIZE,
 };
-pub use dht_keys::{community_info_key, content_provider_key, manifest_loc_key, share_head_key};
+pub use dht_keys::{
+    community_info_key, community_member_key, community_share_key, content_provider_key,
+    manifest_loc_key, share_head_key,
+};
 pub use ids::{ContentId, ManifestId, NodeId, ShareId};
 pub use manifest::{
     ItemV1, ManifestV1, PublicShareSummary, ShareHead, ShareKeypair, ShareVisibility,

@@ -2390,6 +2390,7 @@ async fn incoming_request_rate_limits_are_enforced() {
             max_fetch_requests_per_window: 10,
             max_relay_requests_per_window: 10,
             max_chunk_requests_per_window: 10,
+            max_community_requests_per_window: 10,
         })
         .await
         .expect("set abuse limits");
@@ -3958,6 +3959,7 @@ async fn chunk_request_rate_limits_are_enforced() {
             max_fetch_requests_per_window: 1000,
             max_relay_requests_per_window: 1000,
             max_chunk_requests_per_window: 2,
+            max_community_requests_per_window: 1000,
         })
         .await
         .expect("set abuse limits");

@@ -14,7 +14,10 @@ use std::{
 };
 
 use crate::{
-    dht_keys::{community_info_key, content_provider_key, manifest_loc_key, share_head_key},
+    dht_keys::{
+        community_info_key, community_member_key, community_share_key, content_provider_key,
+        manifest_loc_key, share_head_key,
+    },
     ids::{NodeId, ShareId},
     manifest::{ManifestV1, PublicShareSummary, ShareHead},
     net_fetch::RequestTransport,
@@ -25,11 +28,14 @@ use crate::{
     },
     search::IndexedItem,
     wire::{
-        CommunityMembers, CommunityPublicShareList, CommunityStatus, Envelope, FLAG_RESPONSE,
-        FindNode, FindNodeResult, FindValue, FindValueResult, GetCommunityStatus,
-        ListCommunityPublicShares, ListPublicShares, MsgType, Providers, PublicShareList,
-        RelayListRequest, RelayListResponse, RelayPayloadKind as WireRelayPayloadKind,
-        Store as WireStore, WirePayload,
+        CommunityEventsResp, CommunityMembers, CommunityMembersPageResponse,
+        CommunityPublicShareList, CommunitySearchResultsResp, CommunitySharesPageResponse,
+        CommunityStatus, Envelope, FLAG_RESPONSE, FindNode, FindNodeResult, FindValue,
+        FindValueResult, GetCommunityStatus, ListCommunityEventsReq, ListCommunityMembersPage,
+        ListCommunityPublicShares, ListCommunitySharesPage, ListPublicShares, MsgType, Providers,
+        PublicShareList, RelayListRequest, RelayListResponse,
+        RelayPayloadKind as WireRelayPayloadKind, SearchCommunitySharesReq, Store as WireStore,
+        WirePayload,
     },
 };
 
@@ -89,6 +95,13 @@ pub(super) fn request_class(payload: &WirePayload) -> RequestClass {
         | WirePayload::GetCommunityStatus(_)
         | WirePayload::ListCommunityPublicShares(_)
         | WirePayload::GetChunkHashes(_) => RequestClass::Fetch,
+        // Community index queries have their own rate-limit bucket so
+        // that community browse/search cannot starve manifest/chunk
+        // fetches sharing the generic Fetch counter.
+        WirePayload::ListCommunityMembersPage(_)
+        | WirePayload::ListCommunitySharesPage(_)
+        | WirePayload::SearchCommunityShares(_)
+        | WirePayload::ListCommunityEvents(_) => RequestClass::Community,
         // Chunk data requests are rate-limited by per-peer chunk request
         // count.  Each chunk is up to CHUNK_SIZE (256 KiB), so the
         // `max_chunk_requests_per_window` field in `AbuseLimits`
@@ -147,6 +160,26 @@ pub(super) fn validate_dht_value_for_known_keyspaces(
     key: [u8; 32],
     value: &[u8],
 ) -> anyhow::Result<()> {
+    // ── Prefix-first dispatch ──────────────────────────────────────
+    // Check well-known tag bytes before any trial CBOR deserialization.
+    // Community records (§15) use explicit tag prefixes; all other
+    // types are plain CBOR and start with map/array markers (0x80+).
+    if let Some(&tag) = value.first() {
+        match tag {
+            crate::wire::community_tags::MEMBER_RECORD => {
+                return validate_community_member_record(key, value);
+            }
+            crate::wire::community_tags::SHARE_RECORD => {
+                return validate_community_share_record(key, value);
+            }
+            crate::wire::community_tags::BOOTSTRAP_HINT => {
+                return validate_community_bootstrap_hint(key, value);
+            }
+            _ => {}
+        }
+    }
+
+    // ── Trial CBOR deserialization for untagged keyspaces ───────────
     if let Ok(head) = crate::cbor::from_slice::<ShareHead>(value) {
         let expected = share_head_key(&ShareId(head.share_id));
         if expected != key {
@@ -182,7 +215,8 @@ pub(super) fn validate_dht_value_for_known_keyspaces(
         }
         anyhow::bail!("relay announcement key does not match any valid rendezvous slot");
     }
-    // Community member lists are stored at community_info_key(share_id).
+
+    // Legacy community member lists stored at community_info_key(share_id).
     if let Ok(cm) = crate::cbor::from_slice::<CommunityMembers>(value) {
         let expected = community_info_key(&ShareId(cm.community_share_id));
         if expected != key {
@@ -193,6 +227,53 @@ pub(super) fn validate_dht_value_for_known_keyspaces(
     // Reject values that do not match any recognized keyspace to prevent
     // arbitrary data storage and potential abuse (§4.5).
     anyhow::bail!("DHT value does not match any recognized keyspace")
+}
+
+/// Validate a tagged `CommunityMemberRecord` (§15.4.1).
+fn validate_community_member_record(key: [u8; 32], value: &[u8]) -> anyhow::Result<()> {
+    use crate::wire::CommunityMemberRecord;
+    let record = CommunityMemberRecord::decode_tagged(value)?;
+    // Key must match (community_id, member_node_pubkey).
+    let expected = community_member_key(&record.community_id, &record.member_node_pubkey);
+    if expected != key {
+        anyhow::bail!("community member record key mismatch");
+    }
+    // Cryptographic signature verification.
+    record.verify_signature()?;
+    Ok(())
+}
+
+/// Validate a tagged `CommunityShareRecord` (§15.4.2).
+fn validate_community_share_record(key: [u8; 32], value: &[u8]) -> anyhow::Result<()> {
+    use crate::wire::CommunityShareRecord;
+    let record = CommunityShareRecord::decode_tagged(value)?;
+    // Key must match (community_id, share_id).
+    let expected = community_share_key(&record.community_id, &record.share_id);
+    if expected != key {
+        anyhow::bail!("community share record key mismatch");
+    }
+    // Signature + share_id derivation verification.
+    record.verify()?;
+    Ok(())
+}
+
+/// Validate a tagged `CommunityBootstrapHint` (§15.4.1b).
+fn validate_community_bootstrap_hint(key: [u8; 32], value: &[u8]) -> anyhow::Result<()> {
+    use crate::wire::CommunityBootstrapHint;
+    let hint = CommunityBootstrapHint::decode_tagged(value)?;
+    // Key must match community_info_key(community_id).
+    let expected = community_info_key(&ShareId(hint.community_id));
+    if expected != key {
+        anyhow::bail!("community bootstrap hint key mismatch");
+    }
+    // Bounds enforcement.
+    if hint.sample_members.len() > CommunityBootstrapHint::MAX_SAMPLE_MEMBERS {
+        anyhow::bail!("bootstrap hint sample_members exceeds max");
+    }
+    if hint.index_peers.len() > CommunityBootstrapHint::MAX_INDEX_PEERS {
+        anyhow::bail!("bootstrap hint index_peers exceeds max");
+    }
+    Ok(())
 }
 
 /// Check whether `key` is a valid relay rendezvous key for the relay pubkey
@@ -372,6 +453,158 @@ pub(super) async fn query_community_public_shares<T: RequestTransport + ?Sized>(
         anyhow::bail!("community public share list response share_id mismatch");
     }
     Ok(payload.shares)
+}
+
+/// Ask a peer for a paged member list for a community (§15.6.1).
+pub(super) async fn query_community_members_page<T: RequestTransport + ?Sized>(
+    transport: &T,
+    peer: &PeerAddr,
+    community_id: [u8; 32],
+    cursor: Option<String>,
+    limit: u16,
+) -> anyhow::Result<CommunityMembersPageResponse> {
+    let req_id = next_req_id();
+    let request = Envelope::from_typed(
+        req_id,
+        0,
+        &WirePayload::ListCommunityMembersPage(ListCommunityMembersPage {
+            community_id,
+            cursor,
+            limit,
+        }),
+    )?;
+    let response = transport
+        .request(peer, request, Duration::from_secs(5))
+        .await?;
+    if response.r#type != MsgType::CommunityMembersPage as u16 {
+        anyhow::bail!("unexpected community members page response type");
+    }
+    if response.req_id != req_id {
+        anyhow::bail!("community members page response req_id mismatch");
+    }
+    if response.flags & FLAG_RESPONSE == 0 {
+        anyhow::bail!("community members page response missing response flag");
+    }
+    let payload: CommunityMembersPageResponse = crate::cbor::from_slice(&response.payload)?;
+    if payload.community_id != community_id {
+        anyhow::bail!("community members page response community_id mismatch");
+    }
+    Ok(payload)
+}
+
+/// Ask a peer for a paged share list for a community (§15.6.1).
+pub(super) async fn query_community_shares_page<T: RequestTransport + ?Sized>(
+    transport: &T,
+    peer: &PeerAddr,
+    community_id: [u8; 32],
+    cursor: Option<String>,
+    limit: u16,
+    since_unix: Option<u64>,
+) -> anyhow::Result<CommunitySharesPageResponse> {
+    let req_id = next_req_id();
+    let request = Envelope::from_typed(
+        req_id,
+        0,
+        &WirePayload::ListCommunitySharesPage(ListCommunitySharesPage {
+            community_id,
+            cursor,
+            limit,
+            since_unix,
+        }),
+    )?;
+    let response = transport
+        .request(peer, request, Duration::from_secs(5))
+        .await?;
+    if response.r#type != MsgType::CommunitySharesPage as u16 {
+        anyhow::bail!("unexpected community shares page response type");
+    }
+    if response.req_id != req_id {
+        anyhow::bail!("community shares page response req_id mismatch");
+    }
+    if response.flags & FLAG_RESPONSE == 0 {
+        anyhow::bail!("community shares page response missing response flag");
+    }
+    let payload: CommunitySharesPageResponse = crate::cbor::from_slice(&response.payload)?;
+    if payload.community_id != community_id {
+        anyhow::bail!("community shares page response community_id mismatch");
+    }
+    Ok(payload)
+}
+
+/// Ask a peer for community search results (§15.6.2).
+pub(super) async fn query_community_search_shares<T: RequestTransport + ?Sized>(
+    transport: &T,
+    peer: &PeerAddr,
+    community_id: [u8; 32],
+    query: String,
+    cursor: Option<String>,
+    limit: u16,
+) -> anyhow::Result<CommunitySearchResultsResp> {
+    let req_id = next_req_id();
+    let request = Envelope::from_typed(
+        req_id,
+        0,
+        &WirePayload::SearchCommunityShares(SearchCommunitySharesReq {
+            community_id,
+            query,
+            cursor,
+            limit,
+        }),
+    )?;
+    let response = transport
+        .request(peer, request, Duration::from_secs(5))
+        .await?;
+    if response.r#type != MsgType::CommunitySearchResults as u16 {
+        anyhow::bail!("unexpected community search results response type");
+    }
+    if response.req_id != req_id {
+        anyhow::bail!("community search results response req_id mismatch");
+    }
+    if response.flags & FLAG_RESPONSE == 0 {
+        anyhow::bail!("community search results response missing response flag");
+    }
+    let payload: CommunitySearchResultsResp = crate::cbor::from_slice(&response.payload)?;
+    if payload.community_id != community_id {
+        anyhow::bail!("community search results response community_id mismatch");
+    }
+    Ok(payload)
+}
+
+/// Ask a peer for community delta events (§15.6.3).
+pub(super) async fn query_community_events<T: RequestTransport + ?Sized>(
+    transport: &T,
+    peer: &PeerAddr,
+    community_id: [u8; 32],
+    since_cursor: Option<String>,
+    limit: u16,
+) -> anyhow::Result<CommunityEventsResp> {
+    let req_id = next_req_id();
+    let request = Envelope::from_typed(
+        req_id,
+        0,
+        &WirePayload::ListCommunityEvents(ListCommunityEventsReq {
+            community_id,
+            since_cursor,
+            limit,
+        }),
+    )?;
+    let response = transport
+        .request(peer, request, Duration::from_secs(5))
+        .await?;
+    if response.r#type != MsgType::CommunityEvents as u16 {
+        anyhow::bail!("unexpected community events response type");
+    }
+    if response.req_id != req_id {
+        anyhow::bail!("community events response req_id mismatch");
+    }
+    if response.flags & FLAG_RESPONSE == 0 {
+        anyhow::bail!("community events response missing response flag");
+    }
+    let payload: CommunityEventsResp = crate::cbor::from_slice(&response.payload)?;
+    if payload.community_id != community_id {
+        anyhow::bail!("community events response community_id mismatch");
+    }
+    Ok(payload)
 }
 
 /// Ask a single peer for its known relay announcements (Relay-PEX, §4.9).

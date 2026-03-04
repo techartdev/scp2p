@@ -45,6 +45,7 @@ impl Default for NodeConfig {
                 relay: false,
                 content_seed: true,
                 mobile_light: false,
+                ..Default::default()
             },
             bootstrap_peers: vec![],
             max_subscriptions: 200,

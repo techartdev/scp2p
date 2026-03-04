@@ -1,7 +1,6 @@
 # Spec: Subscribed Catalog P2P Network (SCP2P)
 
-> **Implementation status (2026-02-27):** All Milestone 1–7 items are implemented in `crates/scp2p-core`.
-> 125 tests passing (115 core + 10 desktop). See `PLAN.md` for full progress detail.
+> **Implementation note (2026-03):** This specification combines currently implemented protocol behavior with planned extensions. For implementation priorities and rollout sequence, see `PLAN.md` and `REMAINING_WORK_TRACKER.md`.
 
 ## 0. Goals
 
@@ -341,55 +340,108 @@ Phones should implement:
 
 ## 13. API surface for Rust core (current)
 
-The `NodeHandle` type exposes the following stable API:
+The current `Node` / `NodeHandle` API is broader than the early milestone list.
+Major groups implemented in `crates/scp2p-core/src/api`:
 
-**Identity / lifecycle**
-- `Node::start(config) -> NodeHandle`
-- `NodeHandle::runtime_config() -> RuntimeConfig`
+**Lifecycle and config**
+- `Node::start(config)`
+- `Node::start_with_store(config, persisted, store)`
+- `NodeHandle::runtime_config()`
+- `NodeHandle::configured_bootstrap_peers()`
 
-**Peers**
-- `NodeHandle::connect(peer_addr)`
-- `NodeHandle::peer_records() -> Vec<PeerRecord>`
+**Identity and key management**
+- `NodeHandle::ensure_node_identity()`
+- `NodeHandle::ensure_publisher_identity(label)`
+- `NodeHandle::auto_protect_publisher_identities()`
+- bootstrap TOFU pinning:
+  - `pin_bootstrap_key(...)`
+  - `pinned_bootstrap_key(...)`
 
-**Subscriptions**
-- `NodeHandle::subscribe(share_id)`
-- `NodeHandle::unsubscribe(share_id)`
-- `NodeHandle::sync_subscriptions()`
-- `NodeHandle::list_subscriptions() -> Vec<SubscriptionView>`
+**Peers and PEX**
+- `connect(...)`
+- `peer_records()`
+- `record_peer_seen(...)`
+- `record_peer_seen_with_capabilities(...)`
+- `apply_pex_offer(...)`
+- `build_pex_offer(...)`
+- `note_peer_outcome(...)`
 
-**Publishing**
-- `NodeHandle::publish_text(text, ...) -> ShareId`
-- `NodeHandle::publish_files(paths, ...) -> ShareId`
-- `NodeHandle::publish_folder(dir, ...) -> ShareId`
-- `NodeHandle::list_own_shares() -> Vec<PublicShareView>`
+**DHT**
+- local ops: `dht_find_node`, `dht_find_value`, `dht_store`, `dht_upsert_peer`
+- iterative ops: `dht_find_node_iterative`, `dht_find_value_iterative`, `dht_find_share_head_iterative`
+- replication/maintenance:
+  - `dht_store_replicated`
+  - `dht_republish_once`
+  - `start_dht_republish_loop`
+  - `start_subscription_sync_loop`
 
-**Browse**
-- `NodeHandle::list_public_shares_from_peers() -> Vec<PublicShareView>`
-- `NodeHandle::list_share_items(share_id) -> Vec<ShareItemView>`
-- `NodeHandle::browse_community_shares(community_id) -> Vec<PublicShareView>`
+**Publishing and share management**
+- `publish_share(...)`
+- `publish_files(...)`
+- `publish_folder(...)`
+- `list_owned_shares()`
+- `delete_published_share(...)`
+- `update_share_visibility(...)`
+- `list_share_items(...)`
 
-**Download**
-- `NodeHandle::download_from_peers(content_id, chunks, peers, self_addr: Option<PeerAddr>) -> Vec<u8>`
-  - `self_addr`: when `Some`, node self-seeds after completing a verified download.
-- `NodeHandle::download_items(share_id, content_ids, target_dir) -> Result`
+**Subscriptions and sync**
+- `subscribe(...)`, `unsubscribe(...)`
+- `subscribe_with_pubkey(...)`, `subscribe_with_trust(...)`
+- `set_subscription_trust_level(...)`
+- `sync_subscriptions()`
+- `sync_subscriptions_over_dht(...)`
 
-**Seeding**
-- `NodeHandle::reannounce_seeded_content(self_addr: PeerAddr) -> anyhow::Result<usize>`
-  - Refreshes DHT `Providers` entries for all locally held blobs. Returns count. Schedule every ~10 min.
+**Public/community browse**
+- `list_local_public_shares(...)`
+- `fetch_public_shares_from_peer(...)`
+- community membership:
+  - `communities()`
+  - `join_community(...)`
+  - `join_community_with_token(...)`
+  - `leave_community(...)`
+- community browse helpers:
+  - `fetch_community_status_from_peer(...)`
+  - `fetch_community_public_shares_from_peer(...)`
+  - `list_local_community_public_shares(...)`
+
+**Section 15 community record APIs (new path)**
+- `publish_community_member_record(...)`
+- `reannounce_community_member_records(...)`
+- `publish_community_share_record(...)`
+- `publish_community_bootstrap_hint(...)`
 
 **Search**
-- `NodeHandle::search(query, filters) -> Vec<SearchResult>`
+- `search(...)`
+- `search_with_trust_filter(...)`
+- `search_page(...)`
+- `search_page_with_trust_filter(...)`
+- `set_share_weight(...)`
 
-**Communities**
-- `NodeHandle::join_community(share_id, share_pubkey)`
-- `NodeHandle::list_communities() -> Vec<CommunityView>`
-- `NodeHandle::list_community_participants(community_id) -> Vec<PeerAddr>`
+**Content download and seeding**
+- `fetch_manifest_from_peers(...)`
+- `download_from_peers(...)`
+- `reannounce_seeded_content(...)`
+- `reannounce_content_providers(...)`
 
-**Event stream (planned)**
-- `PeerConnected`, `PeerDisconnected`
-- `ManifestUpdated(share_id, seq)`
-- `DownloadProgress(content_id, percent)`
-- `SearchIndexUpdated`
+**Relay**
+- relay runtime:
+  - `relay_register(...)`, `relay_register_with_slot(...)`
+  - `relay_connect(...)`, `relay_stream(...)`
+  - `register_relay_tunnel(...)`
+  - `active_relay_slot(...)`, `active_relay_slots(...)`
+  - `relayed_self_addr(...)`, `all_relayed_self_addrs(...)`
+- relay discovery:
+  - `fetch_relay_list_from_peer(...)`
+  - `discover_relays_via_peers(...)`
+  - `publish_relay_announcement(...)`
+  - `publish_relay_announcement_to_dht(...)`
+  - `discover_relays_from_dht(...)`
+- relay policy/scoring:
+  - `set_relay_limits(...)`
+  - `set_abuse_limits(...)`
+  - `note_relay_result(...)`
+  - `select_relay_peer(...)`
+  - `select_relay_peers(...)`
 
 ---
 
@@ -405,7 +457,11 @@ Publish a test suite with:
 4) **Protocol handshake transcript**
    - capture of message exchange for connect + PEX + GET_MANIFEST.
 5) **DHT behavior tests**
-   - STORE/FIND_VALUE for ShareHead keys.
+   - STORE/FIND_VALUE for ShareHead and provider keys.
+6) **Community record vectors (Section 15)**
+   - tagged value decode/encode for member/share/bootstrap records
+   - signature verification and keyspace-match validation
+   - tombstone TTL bounds and compatibility behavior
 
 ---
 
@@ -661,46 +717,60 @@ Recommended delivery sequence:
 
 # Implementation milestones (agent-friendly)
 
-### Milestone 1: Identity + transport ✅
+### Milestone 1: Identity + transport [done]
 - Ed25519 identity
 - QUIC + TCP fallback
-- CBOR message envelope
-- Capabilities exchange
+- CBOR envelope and capability exchange
 
-### Milestone 2: PEX + peer DB ✅
-- store last-seen peers
+### Milestone 2: PEX + peer DB [done]
+- seen-peer persistence
 - PEX offer/request
-- bootstrap from invite + seed list
+- bootstrap parsing and connection setup
 
-### Milestone 3: DHT (Kademlia-lite) ✅
-- routing table, ping, find_node, store/find_value (iterative, alpha=3)
-- key/value store with TTL + replication
-- keyspace validation rules
+### Milestone 3: DHT foundation [done]
+- Kademlia routing and iterative lookup
+- TTL value storage and replication
+- keyspace validation baseline
 
-### Milestone 4: Share manifests ✅
-- manifest model + canonical CBOR signing
-- `visibility: public | private` field
-- publish ShareHead to DHT
-- fetch+verify manifest
-- subscription sync loop
+### Milestone 4: Manifests + subscriptions [done]
+- signed manifest and share-head lifecycle
+- subscription sync pipeline
+- public/private visibility support
 
-### Milestone 5: Local search ✅
-- SQLite FTS5 index
-- index updates on manifest changes
-- trust-tier filtering, Unicode normalization, pagination
+### Milestone 5: Local search [done]
+- local indexed search over subscribed catalogs
+- trust filtering and pagination
+- persisted search state
 
-### Milestone 6: Content transfer ✅
-- chunk protocol + chunk hash verification
-- provider hints (DHT content-provider key)
-- download manager + verification
-- multi-file/folder sharing (`ItemV1.path`)
-- `ContentBlobStore` (file-backed on-disk blob serving)
-- parallel swarmed download (`FuturesUnordered`, `parallel_chunks=8`)
-- self-seed after download + DHT provider lookup before download
-- periodic re-announcement (`reannounce_seeded_content`)
+### Milestone 6: Content transfer [done]
+- chunk protocol and verification
+- swarm downloader with concurrency and retry policy
+- provider hints + self-seeding + periodic reannounce
+- file/folder publishing and share-item browsing
 
-### Milestone 7: Optional relays ✅ (foundational)
-- relay register/connect
-- relay stream multiplexing (control first; optional limited content)
-- keepalive renewal + slot expiry baseline
-- relay quota/rate-gate baseline
+### Milestone 7: Relay foundation [done]
+- relay register/connect/stream
+- tunnel registration and relay-aware addressing
+- relay limits and abuse controls baseline
+- relay discovery via peer relay-list and DHT rendezvous announcements
+
+### Milestone 8: Desktop application flow [done]
+- Tauri command layer and DTOs
+- runtime lifecycle/config flows
+- discover/search/my-shares/community UI flows
+- global download queue and progress events
+
+### Milestone 9: Community scaling architecture (Section 15) [in progress]
+- per-member signed records (done)
+- per-share signed records (done)
+- typed value-tag validator dispatch (done)
+- bootstrap hints for cold-start discovery (done)
+- paginated browse/search/event wire messages (done)
+- capability bits: paged-browse, search, delta-sync (done)
+- API methods: publish member/share records, bootstrap hints (done)
+- paginated browse/search/event handler integration (pending)
+
+### Milestone 10: Community browse/search v2 rollout [planned]
+- capability-gated wire rollout
+- desktop switch to paged index-first browse
+- delta sync and metadata search integration

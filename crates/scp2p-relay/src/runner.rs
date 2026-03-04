@@ -93,6 +93,7 @@ pub async fn run(config: RelayConfig) -> anyhow::Result<()> {
             store: false,
             content_seed: false,
             mobile_light: false,
+            ..Default::default()
         },
         bootstrap_peers: config.bootstrap_peers.clone(),
         ..NodeConfig::default()
@@ -117,6 +118,7 @@ pub async fn run(config: RelayConfig) -> anyhow::Result<()> {
         store: false,
         content_seed: false,
         mobile_light: false,
+        ..Default::default()
     };
 
     // ── 3. Listeners ──────────────────────────────────────────────

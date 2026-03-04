@@ -25,7 +25,8 @@ use tokio::time::{self, Duration};
 use tracing::{info, warn};
 
 use crate::dto::{
-    CommunityBrowseView, CommunityParticipantView, CommunityView, CreateCommunityResult,
+    CommunityBrowseView, CommunityEventView, CommunityEventsView, CommunityParticipantView,
+    CommunitySearchHitView, CommunitySearchView, CommunityView, CreateCommunityResult,
     DesktopClientConfig, OwnedShareView, PeerView, PublicShareView, PublishResultView,
     PublishVisibility, RuntimeStatus, SearchResultView, SearchResultsView, ShareItemView,
     StartNodeRequest, SubscriptionView, SyncResultView,
@@ -423,8 +424,15 @@ impl DesktopAppState {
         let share_pubkey = parse_hex_32(share_pubkey_hex, "community share_pubkey")?;
         node.join_community(scp2p_core::ShareId(share_id), share_pubkey)
             .await?;
-        // Announce ourselves as a community member in the DHT so other
-        // peers can discover us when browsing this community.
+        // Publish a signed per-member record (§15.4.1) so the paged
+        // community index on relays/peers picks up this membership.
+        let _ = node
+            .publish_community_member_record(
+                share_id,
+                scp2p_core::wire::CommunityMemberStatus::Joined,
+            )
+            .await;
+        // Also publish legacy CommunityMembers blob for backward compat.
         if let Ok(self_addr) = self.resolve_self_addr(&node).await {
             let _ = node
                 .upsert_community_member(scp2p_core::ShareId(share_id), self_addr)
@@ -436,6 +444,14 @@ impl DesktopAppState {
     pub async fn leave_community(&self, share_id_hex: &str) -> anyhow::Result<Vec<CommunityView>> {
         let node = self.node_handle().await?;
         let share_id = parse_hex_32(share_id_hex, "share_id")?;
+        // Publish a signed leave tombstone (§15.4.1) before removing
+        // local state so the record propagates to peers.
+        let _ = node
+            .publish_community_member_record(
+                share_id,
+                scp2p_core::wire::CommunityMemberStatus::Left,
+            )
+            .await;
         node.leave_community(scp2p_core::ShareId(share_id)).await?;
         self.community_views().await
     }
@@ -457,7 +473,14 @@ impl DesktopAppState {
         let share_pubkey = keypair.verifying_key();
         node.join_community_named(share_id, share_pubkey.to_bytes(), name.trim())
             .await?;
-        // Announce ourselves as a community member in the DHT.
+        // Publish signed per-member record (§15.4.1).
+        let _ = node
+            .publish_community_member_record(
+                share_id.0,
+                scp2p_core::wire::CommunityMemberStatus::Joined,
+            )
+            .await;
+        // Also publish legacy CommunityMembers blob for backward compat.
         if let Ok(self_addr) = self.resolve_self_addr(&node).await {
             let _ = node.upsert_community_member(share_id, self_addr).await;
         }
@@ -683,11 +706,7 @@ impl DesktopAppState {
         let self_addr = self.resolve_self_addr(&node).await.ok();
         {
             let cm = node
-                .find_community_members(
-                    &transport,
-                    scp2p_core::ShareId(community.share_id),
-                    &peers,
-                )
+                .find_community_members(&transport, scp2p_core::ShareId(community.share_id), &peers)
                 .await;
             for member in cm.members {
                 // Skip our own address — we already handle local shares
@@ -781,25 +800,99 @@ impl DesktopAppState {
                         transport: format!("{:?}", peer.transport),
                     });
                     match node
-                        .fetch_community_public_shares_from_peer(
+                        .fetch_community_shares_page(
                             &transport,
                             &peer,
-                            scp2p_core::ShareId(community.share_id),
-                            community.share_pubkey,
-                            64,
+                            community.share_id,
+                            None,
+                            100,
+                            None,
                         )
                         .await
                     {
-                        Ok(shares) => {
-                            for share in shares {
+                        Ok(resp) if !resp.entries.is_empty() => {
+                            // Peer supports §15.6 paged browse — drain all pages.
+                            for share in resp.entries {
                                 if seen_shares.insert(share.share_id) {
-                                    public_shares.push(public_share_view(&peer, share));
+                                    public_shares.push(PublicShareView {
+                                        source_peer_addr: "community index".to_string(),
+                                        share_id_hex: hex::encode(share.share_id),
+                                        share_pubkey_hex: hex::encode(share.share_pubkey),
+                                        latest_seq: share.latest_seq,
+                                        title: share.title.clone(),
+                                        description: share.description.clone(),
+                                    });
+                                }
+                            }
+                            // Follow pagination cursors (up to 50 pages to avoid runaways).
+                            let mut cursor = resp.next_cursor;
+                            let mut pages = 1u32;
+                            const MAX_BROWSE_PAGES: u32 = 50;
+                            while let Some(ref cur) = cursor {
+                                if pages >= MAX_BROWSE_PAGES {
+                                    break;
+                                }
+                                match node
+                                    .fetch_community_shares_page(
+                                        &transport,
+                                        &peer,
+                                        community.share_id,
+                                        Some(cur.clone()),
+                                        100,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    Ok(next_resp) => {
+                                        if next_resp.entries.is_empty() {
+                                            break;
+                                        }
+                                        for share in next_resp.entries {
+                                            if seen_shares.insert(share.share_id) {
+                                                public_shares.push(PublicShareView {
+                                                    source_peer_addr: "community index".to_string(),
+                                                    share_id_hex: hex::encode(share.share_id),
+                                                    share_pubkey_hex: hex::encode(
+                                                        share.share_pubkey,
+                                                    ),
+                                                    latest_seq: share.latest_seq,
+                                                    title: share.title.clone(),
+                                                    description: share.description.clone(),
+                                                });
+                                            }
+                                        }
+                                        cursor = next_resp.next_cursor;
+                                        pages += 1;
+                                    }
+                                    Err(_) => break,
                                 }
                             }
                         }
-                        Err(err) => {
-                            if first_err.is_none() {
-                                first_err = Some(err);
+                        _ => {
+                            // Peer does not have paged index — fall back to
+                            // per-peer ListCommunityPublicShares (§15.2).
+                            match node
+                                .fetch_community_public_shares_from_peer(
+                                    &transport,
+                                    &peer,
+                                    scp2p_core::ShareId(community.share_id),
+                                    community.share_pubkey,
+                                    64,
+                                )
+                                .await
+                            {
+                                Ok(shares) => {
+                                    for share in shares {
+                                        if seen_shares.insert(share.share_id) {
+                                            public_shares.push(public_share_view(&peer, share));
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    if first_err.is_none() {
+                                        first_err = Some(err);
+                                    }
+                                }
                             }
                         }
                     }
@@ -837,6 +930,196 @@ impl DesktopAppState {
             participants,
             public_shares,
         })
+    }
+
+    /// Search the share metadata index of a community (§15.6.2).
+    ///
+    /// Queries all known peers/relays that are members of the community
+    /// and merges results from multiple peers, deduplicating by share_id.
+    pub async fn search_community(
+        &self,
+        share_id_hex: &str,
+        query: &str,
+    ) -> anyhow::Result<CommunitySearchView> {
+        let node = self.node_handle().await?;
+        let share_id = parse_hex_32(share_id_hex, "community share_id")?;
+        let community = node
+            .communities()
+            .await
+            .into_iter()
+            .find(|c| c.share_id == share_id)
+            .ok_or_else(|| anyhow::anyhow!("community is not joined"))?;
+        let peers = self.sync_peer_targets(&node).await?;
+        if peers.is_empty() {
+            return Ok(CommunitySearchView {
+                community_share_id_hex: hex::encode(community.share_id),
+                results: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        let connector = self.build_connector().await;
+        let transport = RelayAwareTransport::new(&connector);
+
+        let mut seen_ids = std::collections::HashSet::<[u8; 32]>::new();
+        let mut merged_results: Vec<CommunitySearchHitView> = Vec::new();
+        let mut first_err = None;
+        for peer in &peers {
+            match node
+                .fetch_community_search_shares(
+                    &transport,
+                    peer,
+                    community.share_id,
+                    query.to_string(),
+                    None,
+                    100,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    for h in resp.hits {
+                        if seen_ids.insert(h.share_id) {
+                            merged_results.push(CommunitySearchHitView {
+                                share_id_hex: hex::encode(h.share_id),
+                                share_pubkey_hex: hex::encode(h.share_pubkey),
+                                latest_seq: h.latest_seq,
+                                title: h.title,
+                                description: h.description,
+                                score: h.score,
+                            });
+                        }
+                    }
+                }
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        if merged_results.is_empty()
+            && let Some(err) = first_err
+        {
+            return Err(err);
+        }
+        // Sort merged results by score descending.
+        merged_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Ok(CommunitySearchView {
+            community_share_id_hex: hex::encode(community.share_id),
+            results: merged_results,
+            next_cursor: None,
+        })
+    }
+
+    /// Fetch the event log (delta stream) for a community (§15.6.3).
+    ///
+    /// When `since_cursor` is `None`, the last persisted cursor is used
+    /// automatically for incremental delta sync.  When a cursor is
+    /// supplied explicitly, it takes precedence.  After a successful
+    /// fetch the cursor is persisted for subsequent calls.
+    pub async fn community_events(
+        &self,
+        share_id_hex: &str,
+        since_cursor: Option<String>,
+    ) -> anyhow::Result<CommunityEventsView> {
+        let node = self.node_handle().await?;
+        let share_id = parse_hex_32(share_id_hex, "community share_id")?;
+        let community = node
+            .communities()
+            .await
+            .into_iter()
+            .find(|c| c.share_id == share_id)
+            .ok_or_else(|| anyhow::anyhow!("community is not joined"))?;
+
+        // Use the explicitly provided cursor, or fall back to the
+        // last persisted one for automatic incremental sync.
+        let effective_cursor = since_cursor.or(community.last_event_cursor);
+
+        let peers = self.sync_peer_targets(&node).await?;
+        if peers.is_empty() {
+            return Ok(CommunityEventsView {
+                community_share_id_hex: hex::encode(community.share_id),
+                events: Vec::new(),
+                next_cursor: None,
+            });
+        }
+
+        let connector = self.build_connector().await;
+        let transport = RelayAwareTransport::new(&connector);
+
+        let mut first_err = None;
+        for peer in &peers {
+            match node
+                .fetch_community_events(
+                    &transport,
+                    peer,
+                    community.share_id,
+                    effective_cursor.clone(),
+                    200,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    // Persist the high-water cursor so the next poll
+                    // starts after these events.  The server always
+                    // returns a cursor when events are non-empty (even
+                    // on the last page), so we simply persist it.
+                    if let Some(ref cursor) = resp.next_cursor {
+                        let _ = node
+                            .update_community_event_cursor(
+                                scp2p_core::ShareId(community.share_id),
+                                cursor,
+                            )
+                            .await;
+                    }
+
+                    let events = resp
+                        .events
+                        .into_iter()
+                        .map(|e| match e {
+                            scp2p_core::wire::CommunityEvent::MemberJoined {
+                                member_node_pubkey,
+                                announce_seq,
+                            } => CommunityEventView::MemberJoined {
+                                member_node_pubkey_hex: hex::encode(member_node_pubkey),
+                                announce_seq,
+                            },
+                            scp2p_core::wire::CommunityEvent::MemberLeft {
+                                member_node_pubkey,
+                                announce_seq,
+                            } => CommunityEventView::MemberLeft {
+                                member_node_pubkey_hex: hex::encode(member_node_pubkey),
+                                announce_seq,
+                            },
+                            scp2p_core::wire::CommunityEvent::ShareUpserted {
+                                share_id,
+                                latest_seq,
+                                title,
+                            } => CommunityEventView::ShareUpserted {
+                                share_id_hex: hex::encode(share_id),
+                                latest_seq,
+                                title,
+                            },
+                        })
+                        .collect();
+                    return Ok(CommunityEventsView {
+                        community_share_id_hex: hex::encode(community.share_id),
+                        events,
+                        next_cursor: resp.next_cursor,
+                    });
+                }
+                Err(err) => {
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
+        }
+        Err(first_err.unwrap_or_else(|| anyhow::anyhow!("no peers available")))
     }
 
     pub async fn subscribe_public_share(

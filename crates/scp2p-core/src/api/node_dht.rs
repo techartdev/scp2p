@@ -18,13 +18,19 @@ use crate::transport_net::{
 };
 use crate::{
     capabilities::Capabilities,
-    dht::{ALPHA, DEFAULT_TTL_SECS, DhtInsertResult, DhtNodeRecord, DhtValue, K, MAX_VALUE_SIZE},
-    dht_keys::{community_info_key, share_head_key},
+    dht::{
+        ALPHA, DEFAULT_TTL_SECS, DhtInsertResult, DhtNodeRecord, DhtValue, K, MAX_TTL_SECS,
+        MAX_VALUE_SIZE,
+    },
+    dht_keys::{community_info_key, community_member_key, community_share_key, share_head_key},
     ids::{NodeId, ShareId},
     manifest::ShareHead,
     net_fetch::RequestTransport,
     peer::PeerAddr,
-    wire::{CommunityMembers, FindNode, Store as WireStore},
+    wire::{
+        CommunityMemberRecord, CommunityMembers, CommunityShareRecord, FindNode,
+        Store as WireStore, community_tags,
+    },
 };
 
 use super::{
@@ -103,6 +109,7 @@ impl NodeHandle {
         validate_dht_value_for_known_keyspaces(req.key, &req.value)?;
         let now = now_unix_secs()?;
         let value = merge_community_members_if_applicable(req.key, req.value, self, now).await;
+        ingest_into_community_index_if_applicable(req.key, &value, self).await;
         let mut state = self.state.write().await;
         state
             .dht
@@ -435,17 +442,16 @@ impl NodeHandle {
                         };
                         if let Ok(encoded) = crate::cbor::to_vec(&cm) {
                             let mut state = self.state.write().await;
-                            let _ = state.dht.store(
-                                key,
-                                encoded,
-                                DEFAULT_TTL_SECS,
-                                now,
-                            );
+                            let _ = state.dht.store(key, encoded, DEFAULT_TTL_SECS, now);
                         }
                     }
                 }
             }
         }
+
+        // §15 per-member records: keep signed per-member records fresh
+        // alongside the legacy CommunityMembers blobs above.
+        let _ = self.reannounce_community_member_records().await;
 
         let now = now_unix_secs()?;
         let values = {
@@ -709,8 +715,7 @@ impl NodeHandle {
             if let Some(remote) = result.value
                 && remote.key == key
                 && remote.value.len() <= MAX_VALUE_SIZE
-                && let Ok(cm) =
-                    crate::cbor::from_slice::<CommunityMembers>(&remote.value)
+                && let Ok(cm) = crate::cbor::from_slice::<CommunityMembers>(&remote.value)
                 && cm.community_share_id == community_share_id.0
             {
                 for member in cm.members {
@@ -800,11 +805,235 @@ impl NodeHandle {
         }
         Ok(count)
     }
+
+    // ── §15 per-member record APIs ──────────────────────────────────
+
+    /// Publish a signed per-member community record to the local DHT (§15.4.1).
+    ///
+    /// The record is signed by the node's own Ed25519 key and stored at
+    /// `community_member_key(community_id, member_node_pubkey)`.
+    pub async fn publish_community_member_record(
+        &self,
+        community_id: [u8; 32],
+        status: crate::wire::CommunityMemberStatus,
+    ) -> anyhow::Result<()> {
+        use crate::dht_keys::community_member_key;
+        use crate::wire::{CommunityMemberRecord, CommunityMemberStatus};
+
+        let now = now_unix_secs()?;
+        let signing_key = {
+            let state = self.state.read().await;
+            let node_key_bytes = state
+                .node_key
+                .ok_or_else(|| anyhow::anyhow!("no node identity key available"))?;
+            SigningKey::from_bytes(&node_key_bytes)
+        };
+        let member_pubkey = signing_key.verifying_key().to_bytes();
+
+        // Determine announce_seq: bump by 1 from any existing record.
+        let key = community_member_key(&community_id, &member_pubkey);
+        let prev_seq = {
+            let mut state = self.state.write().await;
+            state
+                .dht
+                .find_value(key, now)
+                .and_then(|v| CommunityMemberRecord::decode_tagged(&v.value).ok())
+                .map(|r| r.announce_seq)
+                .unwrap_or(0)
+        };
+
+        let ttl = match status {
+            CommunityMemberStatus::Joined => DEFAULT_TTL_SECS,
+            CommunityMemberStatus::Left => {
+                CommunityMemberRecord::LEAVE_TOMBSTONE_MAX_TTL_SECS.min(MAX_TTL_SECS)
+            }
+        };
+        let expires_at = now + ttl;
+
+        let record = CommunityMemberRecord::new_signed(
+            &signing_key,
+            community_id,
+            prev_seq + 1,
+            status,
+            now,
+            expires_at,
+        )?;
+        let encoded = record.encode_tagged()?;
+
+        let mut state = self.state.write().await;
+        state.dht.store(key, encoded, ttl, now)?;
+        // Ingest into the local community index so this node's own
+        // paged-browse / search / events endpoints reflect the change
+        // immediately (issue: publish path was not wired to index).
+        state.community_index.ingest_member_record(&record);
+        debug!(
+            community = %hex::encode(&community_id[..8]),
+            seq = prev_seq + 1,
+            status = ?status,
+            "publish_community_member_record: stored locally"
+        );
+        Ok(())
+    }
+
+    /// Publish signed per-member records for all joined communities.
+    ///
+    /// Called during republish to keep per-member records fresh.
+    pub async fn reannounce_community_member_records(&self) -> anyhow::Result<usize> {
+        let community_ids: Vec<[u8; 32]> = {
+            let state = self.state.read().await;
+            state.communities.keys().copied().collect()
+        };
+        let mut count = 0usize;
+        for cid in community_ids {
+            if let Err(e) = self
+                .publish_community_member_record(cid, crate::wire::CommunityMemberStatus::Joined)
+                .await
+            {
+                debug!(
+                    community = %hex::encode(&cid[..8]),
+                    error = %e,
+                    "reannounce_community_member_records: failed"
+                );
+            } else {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            debug!(count, "reannounce_community_member_records: updated");
+        }
+        Ok(count)
+    }
+
+    // ── §15 per-share record APIs ───────────────────────────────────
+
+    /// Publish a signed per-share community announcement to the local DHT (§15.4.2).
+    pub async fn publish_community_share_record(
+        &self,
+        community_id: [u8; 32],
+        share_signing_key: &ed25519_dalek::SigningKey,
+        latest_manifest_id: [u8; 32],
+        latest_seq: u64,
+        title: Option<String>,
+        description: Option<String>,
+    ) -> anyhow::Result<()> {
+        use crate::dht_keys::community_share_key;
+        use crate::wire::CommunityShareRecord;
+
+        let now = now_unix_secs()?;
+        let share_pubkey = share_signing_key.verifying_key().to_bytes();
+        let share_id = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(share_pubkey);
+            let d = h.finalize();
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&d);
+            out
+        };
+
+        let key = community_share_key(&community_id, &share_id);
+        let record = CommunityShareRecord::new_signed(
+            share_signing_key,
+            community_id,
+            latest_manifest_id,
+            latest_seq,
+            now,
+            title,
+            description,
+        )?;
+        let encoded = record.encode_tagged()?;
+
+        let mut state = self.state.write().await;
+        state.dht.store(key, encoded, DEFAULT_TTL_SECS, now)?;
+        // Ingest into the local community index so this node's own
+        // paged-browse / search / events endpoints reflect the change
+        // immediately (issue: publish path was not wired to index).
+        state.community_index.ingest_share_record(&record);
+        debug!(
+            community = %hex::encode(&community_id[..8]),
+            share = %hex::encode(&share_id[..8]),
+            seq = latest_seq,
+            "publish_community_share_record: stored locally"
+        );
+        Ok(())
+    }
+
+    // ── §15 bootstrap hint APIs ─────────────────────────────────────
+
+    /// Publish or update a community bootstrap hint in the local DHT (§15.4.1b).
+    pub async fn publish_community_bootstrap_hint(
+        &self,
+        community_id: [u8; 32],
+        member_count_estimate: u64,
+        sample_members: Vec<PeerAddr>,
+        index_peers: Vec<PeerAddr>,
+    ) -> anyhow::Result<()> {
+        use crate::wire::CommunityBootstrapHint;
+
+        let now = now_unix_secs()?;
+        let key = community_info_key(&ShareId(community_id));
+
+        let hint = CommunityBootstrapHint {
+            community_id,
+            member_count_estimate,
+            sample_members: sample_members
+                .into_iter()
+                .take(CommunityBootstrapHint::MAX_SAMPLE_MEMBERS)
+                .collect(),
+            index_peers: index_peers
+                .into_iter()
+                .take(CommunityBootstrapHint::MAX_INDEX_PEERS)
+                .collect(),
+            updated_at: now,
+        };
+        let encoded = hint.encode_tagged()?;
+
+        let mut state = self.state.write().await;
+        state.dht.store(key, encoded, DEFAULT_TTL_SECS, now)?;
+        debug!(
+            community = %hex::encode(&community_id[..8]),
+            members_est = member_count_estimate,
+            "publish_community_bootstrap_hint: stored locally"
+        );
+        Ok(())
+    }
 }
 
 /// If `value` deserializes as [`CommunityMembers`], merge its member list
 /// with any existing entry already stored in the local DHT at `key`.
 /// Otherwise return `value` unchanged.
+/// Attempt to ingest a raw DHT value into the community index.
+///
+/// Checks the tag byte and decodes the record only for the two typed
+/// community key-spaces (§15.3 member records and §15.4 share records).
+/// Skips silently if the value is not one of those types, if decoding
+/// fails, or if the computed DHT key does not match the stored key
+/// (prevents spoofing by a misbehaving peer).
+async fn ingest_into_community_index_if_applicable(key: [u8; 32], value: &[u8], node: &NodeHandle) {
+    let Some(&tag) = value.first() else { return };
+    match tag {
+        community_tags::MEMBER_RECORD => {
+            if let Ok(rec) = CommunityMemberRecord::decode_tagged(value) {
+                let expected = community_member_key(&rec.community_id, &rec.member_node_pubkey);
+                if expected == key {
+                    let mut state = node.state.write().await;
+                    state.community_index.ingest_member_record(&rec);
+                }
+            }
+        }
+        community_tags::SHARE_RECORD => {
+            if let Ok(rec) = CommunityShareRecord::decode_tagged(value) {
+                let expected = community_share_key(&rec.community_id, &rec.share_id);
+                if expected == key {
+                    let mut state = node.state.write().await;
+                    state.community_index.ingest_share_record(&rec);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn merge_community_members_if_applicable(
     key: [u8; 32],
     value: Vec<u8>,
