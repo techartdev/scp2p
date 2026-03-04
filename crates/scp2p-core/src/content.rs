@@ -69,11 +69,7 @@ pub async fn describe_content_file(path: &Path) -> anyhow::Result<(ChunkedConten
     let file = tokio::fs::File::open(path)
         .await
         .with_context(|| format!("open {}", path.display()))?;
-    let file_len = file
-        .metadata()
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let file_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
     let mut reader = tokio::io::BufReader::with_capacity(CHUNK_SIZE, file);
     let mut content_hasher = blake3::Hasher::new();

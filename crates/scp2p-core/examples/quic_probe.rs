@@ -2,10 +2,10 @@
 //! Usage: cargo run --example quic_probe -- 178.104.13.182:7000
 use std::net::SocketAddr;
 
-use scp2p_core::transport_net::{quic_connect_bi_session_insecure, tls_connect_session_insecure};
-use scp2p_core::capabilities::Capabilities;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+use scp2p_core::capabilities::Capabilities;
+use scp2p_core::transport_net::{quic_connect_bi_session_insecure, tls_connect_session_insecure};
 
 #[tokio::main]
 async fn main() {
@@ -21,7 +21,10 @@ async fn main() {
     match quic_connect_bi_session_insecure(addr, &key, Capabilities::default(), None).await {
         Ok(session) => {
             println!("QUIC SUCCESS — connected");
-            println!("  remote pubkey: {}", hex::encode(session.session.remote_node_pubkey));
+            println!(
+                "  remote pubkey: {}",
+                hex::encode(session.session.remote_node_pubkey)
+            );
         }
         Err(e) => {
             println!("QUIC FAILED — {e:#}");
@@ -35,7 +38,10 @@ async fn main() {
     match tls_connect_session_insecure(tcp_addr, &key2, Capabilities::default(), None).await {
         Ok((_stream, session)) => {
             println!("TCP SUCCESS — connected");
-            println!("  remote pubkey: {}", hex::encode(session.remote_node_pubkey));
+            println!(
+                "  remote pubkey: {}",
+                hex::encode(session.remote_node_pubkey)
+            );
         }
         Err(e) => {
             println!("TCP FAILED — {e:#}");

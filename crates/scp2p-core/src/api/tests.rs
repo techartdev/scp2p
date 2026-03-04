@@ -4857,3 +4857,168 @@ async fn peer_reputation_initial_reputations_seeded_in_policy() {
     let key = format!("10.0.0.2:7001:{:?}", TransportProtocol::Tcp);
     assert_eq!(map[&key], 2, "reputation should be 2 after two successes");
 }
+
+// ── Community DHT discovery ───────────────────────────────────────────────
+
+/// Community member DHT entries pass validation and can be stored/retrieved.
+#[tokio::test]
+async fn community_members_dht_store_and_find() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let community_share_id = [42u8; 32];
+    let key = crate::dht_keys::community_info_key(&ShareId(community_share_id));
+    let addr = PeerAddr {
+        ip: "10.0.0.5".parse().unwrap(),
+        port: 9000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+    let cm = crate::wire::CommunityMembers {
+        community_share_id,
+        members: vec![addr.clone()],
+        updated_at: 100,
+    };
+    let encoded = crate::cbor::to_vec(&cm).expect("encode");
+    handle
+        .dht_store(WireStore {
+            key,
+            value: encoded,
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("valid community members entry must be accepted");
+
+    let found = handle.dht_find_value(key).await.expect("find_value");
+    assert!(found.is_some(), "should find stored community members");
+    let found_cm: crate::wire::CommunityMembers =
+        crate::cbor::from_slice(&found.unwrap().value).expect("decode");
+    assert_eq!(found_cm.members.len(), 1);
+    assert_eq!(found_cm.members[0], addr);
+}
+
+/// Storing a CommunityMembers value at a mismatched key is rejected.
+#[tokio::test]
+async fn community_members_dht_rejects_wrong_key() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let cm = crate::wire::CommunityMembers {
+        community_share_id: [42u8; 32],
+        members: vec![],
+        updated_at: 100,
+    };
+    let encoded = crate::cbor::to_vec(&cm).expect("encode");
+    handle
+        .dht_store(WireStore {
+            key: [0u8; 32], // wrong key
+            value: encoded,
+            ttl_secs: 3600,
+        })
+        .await
+        .expect_err("community members at wrong key must be rejected");
+}
+
+/// dht_store merges incoming CommunityMembers with existing member list.
+#[tokio::test]
+async fn community_members_dht_merge_on_store() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let community_share_id = [99u8; 32];
+    let key = crate::dht_keys::community_info_key(&ShareId(community_share_id));
+    let addr_a = PeerAddr {
+        ip: "10.0.0.1".parse().unwrap(),
+        port: 9001,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+    let addr_b = PeerAddr {
+        ip: "10.0.0.2".parse().unwrap(),
+        port: 9002,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+
+    // Store first entry with member A.
+    let cm1 = crate::wire::CommunityMembers {
+        community_share_id,
+        members: vec![addr_a.clone()],
+        updated_at: 100,
+    };
+    handle
+        .dht_store(WireStore {
+            key,
+            value: crate::cbor::to_vec(&cm1).unwrap(),
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("store first");
+
+    // Store second entry with member B — should merge.
+    let cm2 = crate::wire::CommunityMembers {
+        community_share_id,
+        members: vec![addr_b.clone()],
+        updated_at: 200,
+    };
+    handle
+        .dht_store(WireStore {
+            key,
+            value: crate::cbor::to_vec(&cm2).unwrap(),
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("store second");
+
+    let found = handle.dht_find_value(key).await.expect("find").unwrap();
+    let merged: crate::wire::CommunityMembers =
+        crate::cbor::from_slice(&found.value).expect("decode");
+    assert_eq!(merged.members.len(), 2, "should have both members after merge");
+    assert!(merged.members.contains(&addr_a));
+    assert!(merged.members.contains(&addr_b));
+    assert_eq!(merged.updated_at, 200, "updated_at should be max of both");
+}
+
+/// upsert_community_member adds the node to the community DHT entry.
+#[tokio::test]
+async fn upsert_community_member_roundtrip() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let community_share_id = ShareId([77u8; 32]);
+    let addr = PeerAddr {
+        ip: "10.0.0.3".parse().unwrap(),
+        port: 7777,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+    handle
+        .upsert_community_member(community_share_id, addr.clone())
+        .await
+        .expect("upsert");
+
+    let key = crate::dht_keys::community_info_key(&community_share_id);
+    let found = handle.dht_find_value(key).await.expect("find").unwrap();
+    let cm: crate::wire::CommunityMembers =
+        crate::cbor::from_slice(&found.value).expect("decode");
+    assert_eq!(cm.members.len(), 1);
+    assert_eq!(cm.members[0], addr);
+
+    // Upserting the same address again should not duplicate.
+    handle
+        .upsert_community_member(community_share_id, addr.clone())
+        .await
+        .expect("upsert again");
+    let found2 = handle.dht_find_value(key).await.expect("find").unwrap();
+    let cm2: crate::wire::CommunityMembers =
+        crate::cbor::from_slice(&found2.value).expect("decode");
+    assert_eq!(cm2.members.len(), 1, "should not duplicate");
+}

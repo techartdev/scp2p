@@ -1023,28 +1023,29 @@ impl NodeHandle {
                     payload,
                 }),
             WirePayload::GetCommunityStatus(msg) => {
-                let (joined, proof, name) = match VerifyingKey::from_bytes(&msg.community_share_pubkey) {
-                    Ok(pubkey) if ShareId::from_pubkey(&pubkey).0 == msg.community_share_id => {
-                        let state = self.state.read().await;
-                        match state.communities.get(&msg.community_share_id) {
-                            Some(membership) => {
-                                let proof = membership
-                                    .token
-                                    .as_ref()
-                                    .and_then(|t| crate::cbor::to_vec(t).ok());
-                                (true, proof, membership.name.clone())
+                let (joined, proof, name) =
+                    match VerifyingKey::from_bytes(&msg.community_share_pubkey) {
+                        Ok(pubkey) if ShareId::from_pubkey(&pubkey).0 == msg.community_share_id => {
+                            let state = self.state.read().await;
+                            match state.communities.get(&msg.community_share_id) {
+                                Some(membership) => {
+                                    let proof = membership
+                                        .token
+                                        .as_ref()
+                                        .and_then(|t| crate::cbor::to_vec(t).ok());
+                                    (true, proof, membership.name.clone())
+                                }
+                                None => (false, None, None),
                             }
-                            None => (false, None, None),
                         }
-                    }
-                    _ => {
-                        return Some(error_envelope(
-                            req_type,
-                            req_id,
-                            "community share_id does not match share_pubkey",
-                        ));
-                    }
-                };
+                        _ => {
+                            return Some(error_envelope(
+                                req_type,
+                                req_id,
+                                "community share_id does not match share_pubkey",
+                            ));
+                        }
+                    };
                 crate::cbor::to_vec(&CommunityStatus {
                     community_share_id: msg.community_share_id,
                     joined,
@@ -1523,7 +1524,10 @@ impl NodeHandle {
         }
 
         if refreshed > 0 {
-            debug!(refreshed, "reannounce_published_share_data: DHT entries restored");
+            debug!(
+                refreshed,
+                "reannounce_published_share_data: DHT entries restored"
+            );
         }
 
         Ok(refreshed)

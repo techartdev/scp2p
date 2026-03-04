@@ -55,6 +55,8 @@ async fn main() -> anyhow::Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
     fmt().with_env_filter(filter).with_target(false).init();
 
-    let quic_port = args.quic_port.unwrap_or_else(|| args.port.saturating_sub(1));
+    let quic_port = args
+        .quic_port
+        .unwrap_or_else(|| args.port.saturating_sub(1));
     shell::run(args.db, args.bootstrap, args.port, quic_port).await
 }

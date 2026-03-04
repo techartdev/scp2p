@@ -240,12 +240,8 @@ impl NodeHandle {
                 chunk_list_hash: desc.chunk_list_hash,
             });
             // Register using the already-computed descriptor — no re-read.
-            self.register_content_precomputed(
-                provider.clone(),
-                desc,
-                file_path.to_path_buf(),
-            )
-            .await?;
+            self.register_content_precomputed(provider.clone(), desc, file_path.to_path_buf())
+                .await?;
 
             if total > 50 && (idx + 1) % 500 == 0 {
                 info!(
@@ -349,10 +345,7 @@ impl NodeHandle {
     ///
     /// Called after relay tunnel registration so that provider entries
     /// contain the relayed address, enabling NAT-traversed downloads.
-    pub async fn reannounce_content_providers(
-        &self,
-        self_addr: PeerAddr,
-    ) -> anyhow::Result<usize> {
+    pub async fn reannounce_content_providers(&self, self_addr: PeerAddr) -> anyhow::Result<usize> {
         let now = now_unix_secs()?;
         let mut state = self.state.write().await;
 

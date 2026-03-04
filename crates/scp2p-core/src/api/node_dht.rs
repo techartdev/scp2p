@@ -19,12 +19,12 @@ use crate::transport_net::{
 use crate::{
     capabilities::Capabilities,
     dht::{ALPHA, DEFAULT_TTL_SECS, DhtInsertResult, DhtNodeRecord, DhtValue, K, MAX_VALUE_SIZE},
-    dht_keys::share_head_key,
+    dht_keys::{community_info_key, share_head_key},
     ids::{NodeId, ShareId},
     manifest::ShareHead,
     net_fetch::RequestTransport,
     peer::PeerAddr,
-    wire::{FindNode, Store as WireStore},
+    wire::{CommunityMembers, FindNode, Store as WireStore},
 };
 
 use super::{
@@ -101,13 +101,12 @@ impl NodeHandle {
 
     pub async fn dht_store(&self, req: WireStore) -> anyhow::Result<()> {
         validate_dht_value_for_known_keyspaces(req.key, &req.value)?;
+        let now = now_unix_secs()?;
+        let value = merge_community_members_if_applicable(req.key, req.value, self, now).await;
         let mut state = self.state.write().await;
-        state.dht.store(
-            req.key,
-            req.value,
-            req.ttl_secs.max(DEFAULT_TTL_SECS),
-            now_unix_secs()?,
-        )
+        state
+            .dht
+            .store(req.key, value, req.ttl_secs.max(DEFAULT_TTL_SECS), now)
     }
 
     pub async fn dht_find_value(&self, key: [u8; 32]) -> anyhow::Result<Option<DhtValue>> {
@@ -610,4 +609,102 @@ impl NodeHandle {
         merge_peer_list(&mut peers, known);
         peers
     }
+
+    /// Insert or update the local DHT entry for a community the node has
+    /// joined so that other peers can discover this node as a community
+    /// member via `community_info_key(share_id)`.
+    pub async fn upsert_community_member(
+        &self,
+        community_share_id: ShareId,
+        self_addr: PeerAddr,
+    ) -> anyhow::Result<()> {
+        let key = community_info_key(&community_share_id);
+        let now = now_unix_secs()?;
+        let mut state = self.state.write().await;
+        let mut cm: CommunityMembers = state
+            .dht
+            .find_value(key, now)
+            .and_then(|v| crate::cbor::from_slice(&v.value).ok())
+            .unwrap_or(CommunityMembers {
+                community_share_id: community_share_id.0,
+                members: vec![],
+                updated_at: now,
+            });
+        if !cm.members.contains(&self_addr) {
+            cm.members.push(self_addr);
+        }
+        cm.updated_at = now;
+        state
+            .dht
+            .store(key, crate::cbor::to_vec(&cm)?, DEFAULT_TTL_SECS, now)?;
+        Ok(())
+    }
+
+    /// Re-announce DHT community member entries for all joined communities.
+    ///
+    /// Called during `dht_republish_once` to keep community member
+    /// announcements fresh and ensure they survive app restarts.
+    pub async fn reannounce_community_memberships(
+        &self,
+        self_addr: PeerAddr,
+    ) -> anyhow::Result<usize> {
+        let community_ids: Vec<[u8; 32]> = {
+            let state = self.state.read().await;
+            state.communities.keys().copied().collect()
+        };
+        let mut count = 0usize;
+        for cid in community_ids {
+            if let Err(e) = self
+                .upsert_community_member(ShareId(cid), self_addr.clone())
+                .await
+            {
+                debug!(
+                    community = %hex::encode(&cid[..8]),
+                    error = %e,
+                    "reannounce_community_memberships: failed"
+                );
+            } else {
+                count += 1;
+            }
+        }
+        if count > 0 {
+            debug!(count, "reannounce_community_memberships: updated");
+        }
+        Ok(count)
+    }
+}
+
+/// If `value` deserializes as [`CommunityMembers`], merge its member list
+/// with any existing entry already stored in the local DHT at `key`.
+/// Otherwise return `value` unchanged.
+async fn merge_community_members_if_applicable(
+    key: [u8; 32],
+    value: Vec<u8>,
+    node: &NodeHandle,
+    now: u64,
+) -> Vec<u8> {
+    let Ok(incoming) = crate::cbor::from_slice::<CommunityMembers>(&value) else {
+        return value;
+    };
+    let expected = community_info_key(&ShareId(incoming.community_share_id));
+    if expected != key {
+        return value;
+    }
+    let existing = {
+        let mut state = node.state.write().await;
+        state
+            .dht
+            .find_value(key, now)
+            .and_then(|v| crate::cbor::from_slice::<CommunityMembers>(&v.value).ok())
+    };
+    let Some(mut merged) = existing else {
+        return value;
+    };
+    for member in incoming.members {
+        if !merged.members.contains(&member) {
+            merged.members.push(member);
+        }
+    }
+    merged.updated_at = merged.updated_at.max(incoming.updated_at);
+    crate::cbor::to_vec(&merged).unwrap_or(value)
 }

@@ -246,8 +246,7 @@ impl DesktopAppState {
                                     // downloaders can reach us via the
                                     // relay tunnel.
                                     if let Some(bind) = bind_tcp {
-                                        let peer_records =
-                                            tunnel_handle.peer_records().await;
+                                        let peer_records = tunnel_handle.peer_records().await;
                                         if let Ok(adv_ip) =
                                             resolve_advertise_ip(bind, &peer_records)
                                         {
@@ -261,7 +260,10 @@ impl DesktopAppState {
                                                 })
                                                 .await;
                                             let _ = tunnel_handle
-                                                .reannounce_content_providers(self_addr)
+                                                .reannounce_content_providers(self_addr.clone())
+                                                .await;
+                                            let _ = tunnel_handle
+                                                .reannounce_community_memberships(self_addr)
                                                 .await;
                                         }
                                     }
@@ -421,6 +423,13 @@ impl DesktopAppState {
         let share_pubkey = parse_hex_32(share_pubkey_hex, "community share_pubkey")?;
         node.join_community(scp2p_core::ShareId(share_id), share_pubkey)
             .await?;
+        // Announce ourselves as a community member in the DHT so other
+        // peers can discover us when browsing this community.
+        if let Ok(self_addr) = self.resolve_self_addr(&node).await {
+            let _ = node
+                .upsert_community_member(scp2p_core::ShareId(share_id), self_addr)
+                .await;
+        }
         self.community_views().await
     }
 
@@ -448,6 +457,10 @@ impl DesktopAppState {
         let share_pubkey = keypair.verifying_key();
         node.join_community_named(share_id, share_pubkey.to_bytes(), name.trim())
             .await?;
+        // Announce ourselves as a community member in the DHT.
+        if let Ok(self_addr) = self.resolve_self_addr(&node).await {
+            let _ = node.upsert_community_member(share_id, self_addr).await;
+        }
         Ok(CreateCommunityResult {
             share_id_hex: hex::encode(share_id.0),
             share_pubkey_hex: hex::encode(share_pubkey.to_bytes()),
@@ -652,7 +665,31 @@ impl DesktopAppState {
             .into_iter()
             .find(|community| community.share_id == share_id)
             .ok_or_else(|| anyhow::anyhow!("community is not joined"))?;
-        let peers = self.sync_peer_targets(&node).await?;
+        let mut peers = self.sync_peer_targets(&node).await?;
+
+        let connector = self.build_connector().await;
+        let transport = RelayAwareTransport::new(&connector);
+
+        // ── DHT-based community member discovery ──
+        // Look up community_info_key in the DHT to find peers that have
+        // announced themselves as community members.  This is essential
+        // because the bootstrap relay typically has NOT joined the
+        // community, so without DHT discovery we'd return 0 participants.
+        let community_key =
+            scp2p_core::community_info_key(&scp2p_core::ShareId(community.share_id));
+        if let Ok(Some(dht_value)) = node
+            .dht_find_value_iterative(&transport, community_key, &peers)
+            .await
+            && let Ok(cm) =
+                scp2p_core::cbor::from_slice::<scp2p_core::wire::CommunityMembers>(&dht_value.value)
+        {
+            for member in cm.members {
+                if !peers.iter().any(|p| p == &member) {
+                    peers.push(member);
+                }
+            }
+        }
+
         if peers.is_empty() {
             return Ok(CommunityBrowseView {
                 community_share_id_hex: hex::encode(community.share_id),
@@ -661,13 +698,53 @@ impl DesktopAppState {
             });
         }
 
-        let connector = self.build_connector().await;
-        let transport = RelayAwareTransport::new(&connector);
         let mut participants = Vec::new();
         let mut public_shares = Vec::new();
         let mut seen_shares = std::collections::HashSet::new();
         let mut first_err = None;
         let mut discovered_name: Option<String> = None;
+
+        // ── Include local node's own community shares ──
+        // The local node is itself a participant.  Fetch its own
+        // published shares for this community so they appear in the
+        // browse view without requiring a remote round-trip.
+        {
+            let local_shares = node
+                .list_local_community_public_shares(
+                    scp2p_core::ShareId(community.share_id),
+                    community.share_pubkey,
+                    64,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_or_default();
+            if !local_shares.is_empty() {
+                let self_addr_label = if let Ok(sa) = self.resolve_self_addr(&node).await {
+                    format!("{}:{}", sa.ip, sa.port)
+                } else {
+                    "local".to_string()
+                };
+                participants.push(CommunityParticipantView {
+                    community_share_id_hex: hex::encode(community.share_id),
+                    peer_addr: self_addr_label.clone(),
+                    transport: "local".to_string(),
+                });
+                for share in local_shares {
+                    if seen_shares.insert(share.share_id) {
+                        public_shares.push(PublicShareView {
+                            source_peer_addr: self_addr_label.clone(),
+                            share_id_hex: hex::encode(share.share_id),
+                            share_pubkey_hex: hex::encode(share.share_pubkey),
+                            latest_seq: share.latest_seq,
+                            title: share.title,
+                            description: share.description,
+                        });
+                    }
+                }
+            }
+        }
+
         for peer in peers {
             match node
                 .fetch_community_status_from_peer(
@@ -841,9 +918,7 @@ impl DesktopAppState {
         let (node, transport, peers) = {
             let state = self.inner.read().await;
             match (&state.node, &state.dht_transport) {
-                (Some(n), Some(t)) => {
-                    (n.clone(), t.clone(), state.dht_bootstrap_peers.clone())
-                }
+                (Some(n), Some(t)) => (n.clone(), t.clone(), state.dht_bootstrap_peers.clone()),
                 _ => return,
             }
         };

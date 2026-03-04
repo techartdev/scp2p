@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::{
-    dht_keys::{content_provider_key, manifest_loc_key, share_head_key},
+    dht_keys::{community_info_key, content_provider_key, manifest_loc_key, share_head_key},
     ids::{NodeId, ShareId},
     manifest::{ManifestV1, PublicShareSummary, ShareHead},
     net_fetch::RequestTransport,
@@ -25,10 +25,11 @@ use crate::{
     },
     search::IndexedItem,
     wire::{
-        CommunityPublicShareList, CommunityStatus, Envelope, FLAG_RESPONSE, FindNode,
-        FindNodeResult, FindValue, FindValueResult, GetCommunityStatus, ListCommunityPublicShares,
-        ListPublicShares, MsgType, Providers, PublicShareList, RelayListRequest, RelayListResponse,
-        RelayPayloadKind as WireRelayPayloadKind, Store as WireStore, WirePayload,
+        CommunityMembers, CommunityPublicShareList, CommunityStatus, Envelope, FLAG_RESPONSE,
+        FindNode, FindNodeResult, FindValue, FindValueResult, GetCommunityStatus,
+        ListCommunityPublicShares, ListPublicShares, MsgType, Providers, PublicShareList,
+        RelayListRequest, RelayListResponse, RelayPayloadKind as WireRelayPayloadKind,
+        Store as WireStore, WirePayload,
     },
 };
 
@@ -180,6 +181,14 @@ pub(super) fn validate_dht_value_for_known_keyspaces(
             return Ok(());
         }
         anyhow::bail!("relay announcement key does not match any valid rendezvous slot");
+    }
+    // Community member lists are stored at community_info_key(share_id).
+    if let Ok(cm) = crate::cbor::from_slice::<CommunityMembers>(value) {
+        let expected = community_info_key(&ShareId(cm.community_share_id));
+        if expected != key {
+            anyhow::bail!("community members value does not match community info key");
+        }
+        return Ok(());
     }
     // Reject values that do not match any recognized keyspace to prevent
     // arbitrary data storage and potential abuse (§4.5).

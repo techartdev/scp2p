@@ -54,8 +54,7 @@ pub fn install_service(original_args: &[String]) -> anyhow::Result<()> {
 fn current_exe_path() -> anyhow::Result<PathBuf> {
     let exe = env::current_exe().context("cannot determine current binary path")?;
     // Canonicalize resolves symlinks so the service always points to the real file.
-    exe.canonicalize()
-        .or(Ok(exe)) // ignore errors on platforms where canonicalize is fragile
+    exe.canonicalize().or(Ok(exe)) // ignore errors on platforms where canonicalize is fragile
 }
 
 fn run_cmd(program: &str, args: &[&str]) -> anyhow::Result<ExitStatus> {
@@ -141,7 +140,10 @@ fn install_launchd(bin: &Path, relay_args: &[&str]) -> anyhow::Result<()> {
     let mut prog_args = format!("        <string>{bin_str}</string>\n");
     for arg in relay_args {
         // Escape XML special chars minimally.
-        let escaped = arg.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let escaped = arg
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
         prog_args.push_str(&format!("        <string>{escaped}</string>\n"));
     }
 
@@ -227,7 +229,14 @@ fn install_windows_service(bin: &Path, relay_args: &[&str]) -> anyhow::Result<()
         ],
     )?;
 
-    check_cmd("sc.exe", &["description", "scp2p-relay", "SCP2P relay node — bridges peers behind NAT"])?;
+    check_cmd(
+        "sc.exe",
+        &[
+            "description",
+            "scp2p-relay",
+            "SCP2P relay node — bridges peers behind NAT",
+        ],
+    )?;
     check_cmd("sc.exe", &["start", "scp2p-relay"])?;
 
     println!("Windows service 'scp2p-relay' installed and started.");

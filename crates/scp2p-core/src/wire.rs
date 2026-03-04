@@ -607,6 +607,18 @@ pub struct Providers {
     pub updated_at: u64,
 }
 
+/// DHT value listing peer addresses of nodes that have joined a community.
+///
+/// Stored under `community_info_key(share_id)`.  When a remote peer
+/// receives a STORE for this key, it merges the incoming member list
+/// with the existing one so the relay accumulates all members.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommunityMembers {
+    pub community_share_id: [u8; 32],
+    pub members: Vec<PeerAddr>,
+    pub updated_at: u64,
+}
+
 /// Chunk request.  Wire format: `{0: content_id, 1: chunk_index}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetChunk {

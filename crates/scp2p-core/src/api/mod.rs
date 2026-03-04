@@ -1455,11 +1455,7 @@ impl NodeHandle {
     /// Update the locally stored name for a community.
     ///
     /// Called when a remote peer reports the community name during browse.
-    pub async fn update_community_name(
-        &self,
-        share_id: ShareId,
-        name: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn update_community_name(&self, share_id: ShareId, name: &str) -> anyhow::Result<()> {
         let mut state = self.state.write().await;
         if let Some(membership) = state.communities.get_mut(&share_id.0)
             && membership.name.is_none()

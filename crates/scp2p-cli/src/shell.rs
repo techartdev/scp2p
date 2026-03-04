@@ -14,10 +14,10 @@ use inquire::{InquireError, Select, Text};
 use rand::rngs::OsRng;
 use scp2p_core::{
     BoxedStream, Capabilities, FetchPolicy, Node, NodeConfig, NodeId, OwnedRelayAwareTransport,
-    PeerAddr, PeerConnector, PeerRecord, PersistedCommunity, RelayAwareTransport,
-    RequestTransport, SearchQuery, ShareId, ShareVisibility, SqliteStore, Store,
-    TransportProtocol, build_tls_server_handle, quic_connect_bi_session_insecure,
-    start_quic_server, tls_connect_session_insecure,
+    PeerAddr, PeerConnector, PeerRecord, PersistedCommunity, RelayAwareTransport, RequestTransport,
+    SearchQuery, ShareId, ShareVisibility, SqliteStore, Store, TransportProtocol,
+    build_tls_server_handle, quic_connect_bi_session_insecure, start_quic_server,
+    tls_connect_session_insecure,
 };
 use tracing::{info, warn};
 
@@ -107,7 +107,12 @@ impl Ctx {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub async fn run(db: String, bootstrap_raw: Vec<String>, port: u16, quic_port: u16) -> anyhow::Result<()> {
+pub async fn run(
+    db: String,
+    bootstrap_raw: Vec<String>,
+    port: u16,
+    quic_port: u16,
+) -> anyhow::Result<()> {
     let pb = spinner("Opening database…");
     let store = SqliteStore::open(&db)?;
     let config = NodeConfig {
@@ -205,16 +210,11 @@ pub async fn run(db: String, bootstrap_raw: Vec<String>, port: u16, quic_port: u
                                         relay_via: None,
                                     })
                                     .await;
-                                let _ = tunnel_handle
-                                    .reannounce_content_providers(self_addr)
-                                    .await;
+                                let _ = tunnel_handle.reannounce_content_providers(self_addr).await;
                             }
                             // Push to relay immediately.
                             let _ = tunnel_handle
-                                .dht_republish_once(
-                                    tunnel_transport.as_ref(),
-                                    &tunnel_bootstrap,
-                                )
+                                .dht_republish_once(tunnel_transport.as_ref(), &tunnel_bootstrap)
                                 .await;
                             break;
                         }
@@ -317,7 +317,11 @@ async fn cmd_status(ctx: &Ctx) -> anyhow::Result<()> {
     println!("  TCP port : {}", ctx.port);
     println!(
         "  QUIC port: {}",
-        if ctx.quic_port > 0 { ctx.quic_port.to_string() } else { "disabled".to_owned() }
+        if ctx.quic_port > 0 {
+            ctx.quic_port.to_string()
+        } else {
+            "disabled".to_owned()
+        }
     );
     println!("  Subscriptions  : {}", s.subscriptions.len());
     println!("  Manifests      : {}", s.manifests.len());
@@ -1125,7 +1129,11 @@ fn print_banner(ctx: &Ctx) {
     println!("  TCP port : {}", ctx.port);
     println!(
         "  QUIC port: {}",
-        if ctx.quic_port > 0 { ctx.quic_port.to_string() } else { "disabled".to_owned() }
+        if ctx.quic_port > 0 {
+            ctx.quic_port.to_string()
+        } else {
+            "disabled".to_owned()
+        }
     );
     println!(
         "  Network  : {}",
