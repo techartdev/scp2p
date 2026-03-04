@@ -1,4 +1,4 @@
-# SCP2P v0.1 — Technical & Security Advisory
+# SCP2P — Technical & Security Advisory
 
 > **Date:** 2026-02-28
 > **Scope:** Full review of `SPECIFICATION.md`, `PLAN.md`, `DOCS.md`, and all source code in `crates/scp2p-core`, `crates/scp2p-cli`, `crates/scp2p-desktop`.
@@ -303,7 +303,7 @@ tx.execute(&format!("DELETE FROM {table} WHERE {pk_col} = ?1"), params![key])?;
 - `search()` allocates a new `HashSet` of candidate keys per query.
 
 **Solution:**
-1. For v0.2, migrate the search index to SQLite FTS5 (already mentioned in the spec but not implemented).
+1. For a future release, migrate the search index to SQLite FTS5 (already mentioned in the spec but not implemented).
 2. In the interim, avoid full clones during snapshotting by using `Arc`-wrapped immutable snapshots or copy-on-write structures.
 3. Add pagination early (partially done) and cap result sets server-side.
 
@@ -513,7 +513,7 @@ let to_peer = if from_peer == slot.owner_peer {
 **Solution:**
 1. Require community membership tokens signed by the community publisher key.
 2. Or use the community's `ManifestV1` as a membership roster (signed list of authorized `NodeId`s).
-3. At minimum, document that community membership is self-asserted and untrusted in v0.1.
+3. At minimum, document that community membership is self-asserted and untrusted in the current release.
 
 ---
 
@@ -687,7 +687,7 @@ let to_peer = if from_peer == slot.owner_peer {
 | **P2** | ✅ Reject DHT stores for unknown keyspaces | 0.5 day | §4.5 |
 | **P2** | ✅ ShareHead sequence rollback prevention | 0.5 day | §1.10 |
 
-### v0.2 Roadmap
+### Future Roadmap
 
 | Priority | Item | Effort | Section |
 |----------|------|--------|---------|
@@ -711,4 +711,4 @@ All P0, P1, P2, and P3 items have been addressed. Remaining work is primarily in
 2. **Operational hardening** (key rotation, automated blocklist updates, relay discovery improvements).
 3. **Documentation and spec alignment** (specification drift).
 
-All critical (P0), high-priority (P1), post-release (P2), and v0.2 roadmap (P3) items have been resolved, bringing the total fix count to **37 items** across security, performance, correctness, and architecture categories.
+All critical (P0), high-priority (P1), post-release (P2), and roadmap (P3) items have been resolved, bringing the total fix count to **37 items** across security, performance, correctness, and architecture categories.

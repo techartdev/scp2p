@@ -304,7 +304,7 @@ Current search is local and simple. Extend to:
 - deeper benchmarking and profile-guided optimization for large catalogs
 
 Notes:
-- keep search strictly subscription-scoped in v0.1
+- keep search strictly subscription-scoped
 - do not add network-wide/global search
 - public-share browsing should happen via LAN peers or joined communities, not via search
 
@@ -364,9 +364,9 @@ Add integration and end-to-end tests:
 - Community membership UX + participant browse surfaces
 - Multi-transport support: prefer QUIC, fallback TCP; allow policy-based selection per platform
 
-## 11. Definition of "v0.1 usable"
+## 11. Definition of "usable"
 
-A practical v0.1 should include:
+A practical release should include:
 - real transport (QUIC + TCP fallback)
 - authenticated sessions with peer identity binding
 - stable message type registry + canonical encoding for signatures

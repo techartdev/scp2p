@@ -24,8 +24,10 @@ export default function App() {
 
   // Resizable download queue panel
   const [queueHeight, setQueueHeight] = useState(180);
+  const [queueCollapsed, setQueueCollapsed] = useState(false);
   const resizingRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
+  const collapsedQueueHeight = 34;
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -148,17 +150,27 @@ export default function App() {
         {/* Global download queue — visible from any page */}
         {hasQueueJobs && (
           <>
+            {!queueCollapsed && (
+              <div
+                className="h-1.5 shrink-0 cursor-row-resize bg-border/40 hover:bg-accent/30 active:bg-accent/50 transition-colors flex items-center justify-center group"
+                onMouseDown={handleResizeMouseDown}
+              >
+                <GripHorizontal className="h-3 w-6 text-text-muted/40 group-hover:text-accent/60 transition-colors" />
+              </div>
+            )}
             <div
-              className="h-1.5 shrink-0 cursor-row-resize bg-border/40 hover:bg-accent/30 active:bg-accent/50 transition-colors flex items-center justify-center group"
-              onMouseDown={handleResizeMouseDown}
+              style={{
+                height: queueCollapsed ? collapsedQueueHeight : queueHeight,
+                minHeight: queueCollapsed ? collapsedQueueHeight : 80,
+              }}
+              className="shrink-0"
             >
-              <GripHorizontal className="h-3 w-6 text-text-muted/40 group-hover:text-accent/60 transition-colors" />
-            </div>
-            <div style={{ height: queueHeight, minHeight: 80 }} className="shrink-0">
               <DownloadQueue
                 jobs={downloadQueue.jobs}
                 onRemoveJob={downloadQueue.removeJob}
                 onClearCompleted={downloadQueue.clearCompleted}
+                collapsed={queueCollapsed}
+                onToggleCollapsed={() => setQueueCollapsed((prev) => !prev)}
               />
             </div>
           </>

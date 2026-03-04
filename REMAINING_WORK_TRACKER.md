@@ -203,6 +203,130 @@ Triggered by analysis of the scenario: one peer sharing a folder with 100k items
 
 ---
 
+## J. Community Discovery/Search at Large Scale (proposed 2026-03-04)
+
+Problem statement: current community browse uses one `CommunityMembers` value under `community:info` plus per-peer polling. This does not scale to large communities (single-value size cap, O(N peers) active probing, and limited per-peer share listing windows).
+
+Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community Discovery & Search Plan**.
+
+### J.0 Spec mapping and gaps
+
+- Spec sections impacted:
+  - `SPECIFICATION.md` §6 (DHT keyspaces and replication)
+  - `SPECIFICATION.md` §8 (search model)
+  - `SPECIFICATION.md` communities API surface (currently too high-level for large-scale discovery)
+- Gaps:
+  - no sharded/indexed community membership representation
+  - no community-wide share index with pagination/cursors
+  - no relay-safe query model for large fanout browse/search
+
+### J.1 Data model redesign (required)
+
+- [ ] **J-1A: Replace monolithic `community:info` member list with per-member records**
+  - New DHT keyspace: `community:member:<community_id>:<member_node_pubkey>`
+  - Value: signed `CommunityMemberRecord { community_id, member_node_pubkey, announce_seq, status(join|leave), issued_at, expires_at, signature }`
+  - Validation rule: key must match `(community_id, member_node_pubkey)` and signature must verify against `member_node_pubkey`.
+  - Rationale: removes 64 KiB single-value bottleneck; enables safe leave tombstones.
+
+- [ ] **J-1B: Add community share announcement records**
+  - New keyspace: `community:share:<community_id>:<share_id>`
+  - Value: signed `CommunityShareRecord { community_id, share_id, share_pubkey, manifest_id, seq, visibility, updated_at, title, description, signature }`
+  - Validation rule: `share_id == hash(share_pubkey)`, signature by `share_pubkey`, and manifest linkage checks.
+  - Rationale: browse should not require querying every participant.
+
+- [ ] **J-1C: Add relay materialized indexes (derived, cache-like)**
+  - Relay-maintained paged views:
+    - `community:members:page:<community_id>:<bucket>:<page_no>`
+    - `community:shares:page:<community_id>:<time_bucket>:<page_no>`
+  - Derived from validated per-record keys above; never accepted as authoritative source without source-record references.
+  - Rationale: keeps client queries bounded while preserving verifiable source of truth.
+
+### J.2 Wire/API extensions (required)
+
+- [ ] **J-2A: Paginated community browse APIs**
+  - Add request/response types for:
+    - `LIST_COMMUNITY_MEMBERS_PAGE { community_id, cursor, limit }`
+    - `COMMUNITY_MEMBERS_PAGE { entries, next_cursor }`
+    - `LIST_COMMUNITY_SHARES_PAGE { community_id, cursor, limit, since_unix? }`
+    - `COMMUNITY_SHARES_PAGE { entries, next_cursor }`
+  - Cursor must be opaque and stable for replay-safe pagination.
+
+- [ ] **J-2B: Community search API (metadata search)**
+  - `SEARCH_COMMUNITY_SHARES { community_id, query, cursor, limit, filters }`
+  - `COMMUNITY_SEARCH_RESULTS { hits, next_cursor }`
+  - Server-side search indexes titles/descriptions/tags only (not full file content), with strict result caps and pagination.
+
+- [ ] **J-2C: Delta sync API**
+  - `LIST_COMMUNITY_EVENTS { community_id, since_cursor, limit }`
+  - Event types: member join/leave, share upsert/delete.
+  - Used by desktop to avoid full re-browse.
+
+### J.3 Relay load protection (required)
+
+- [ ] **J-3A: Per-community quotas and token buckets**
+  - Separate rate limits for member-page, share-page, and search queries.
+  - Hard caps: max `limit`, max pages per minute, max concurrent requests per peer/community.
+
+- [ ] **J-3B: Bounded index windows**
+  - Keep hot window in memory (e.g., recent N share events/community), older pages from SQLite.
+  - TTL + compaction jobs for stale leave/join churn and superseded share records.
+  - Leave tombstones: expire source records after 7 days; drop from derived indexes immediately.
+
+- [ ] **J-3C: Multi-relay deterministic partitioning** — *Deferred after initial rollout*
+  - For first rollout, each relay keeps a full index copy (simpler operations and recovery).
+  - Deterministic hash partitioning is postponed to a later phase after baseline paging/search stability.
+
+### J.4 Client behavior changes (desktop/cli)
+
+- [ ] **J-4A: Stop per-peer full polling in browse flow**
+  - Browse uses paged relay/community indexes first.
+  - Peer-direct probing only as fallback/sample mode.
+
+- [ ] **J-4B: Incremental UI updates**
+  - Persist `last_cursor` per joined community.
+  - On open: fast-load cached page 1 + run delta sync in background.
+
+- [ ] **J-4C: Community search integration**
+  - Add dedicated community search query path.
+  - Keep existing local subscription search unchanged for private/local scope.
+
+### J.5 Migration and compatibility plan
+
+- [ ] **J-5A: Dual-write / dual-read rollout**
+  - Phase 1: write lightweight bootstrap hints (`community:info`) plus new keyspaces.
+  - Phase 2: read new first, fallback old.
+  - Phase 3: stop writing old monolithic membership blobs; keep lightweight bootstrap hints.
+
+- [ ] **J-5B: Protocol version bump and capability flags**
+  - Add capability bits for paged community browse/search support.
+  - Guard new requests behind capability negotiation.
+
+- [ ] **J-5C: Explicit deprecation window**
+  - Publish cutover dates and minimum-version requirements for desktop/relay.
+
+### J.6 Verification matrix (must-have before release)
+
+- [ ] **J-6A: Property tests**
+  - Join/leave CRDT convergence (out-of-order, duplicates, replay).
+  - Share upsert convergence with concurrent publishers.
+
+- [ ] **J-6B: Large-scale simulation**
+  - 10k/50k member synthetic communities with churn.
+  - Measure p95 browse page latency, query error rate, relay CPU/RAM.
+
+- [ ] **J-6C: Interop and abuse tests**
+  - Mixed-version peers during migration.
+  - Adversarial flood tests for page/search endpoints and tombstone spam.
+
+### J.7 Execution order (pragmatic)
+
+- [ ] **J-7A: Phase 1 (foundation)** — J-1A + J-1B + typed keyspace validation dispatch
+- [ ] **J-7B: Phase 2 (browse)** — J-2A + J-4A
+- [ ] **J-7C: Phase 3 (enhancements)** — J-2B + J-2C + J-4B/J-4C
+- [ ] **J-7D: Phase 4 (advanced scaling)** — J-3C (deterministic multi-relay partitioning)
+
+---
+
 ## Priority Order
 
 | Priority | Items | Notes |

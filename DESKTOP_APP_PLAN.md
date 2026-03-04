@@ -47,7 +47,7 @@ Deliver a working desktop app that supports regular user operations end-to-end:
 - download verified content
 - publish basic shares with explicit visibility
 
-## MVP Features
+## Core Features
 
 1. Identity
 - generate/load node identity

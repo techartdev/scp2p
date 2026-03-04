@@ -671,23 +671,24 @@ impl DesktopAppState {
         let transport = RelayAwareTransport::new(&connector);
 
         // ── DHT-based community member discovery ──
-        // Look up community_info_key in the DHT to find peers that have
-        // announced themselves as community members.  This is essential
-        // because the bootstrap relay typically has NOT joined the
-        // community, so without DHT discovery we'd return 0 participants.
-        //
-        // Use `dht_find_value_from_network` (not `_iterative`) because
-        // the local DHT copy only contains *this* node; the relay's
-        // copy is the merged superset of all members.
-        let community_key =
-            scp2p_core::community_info_key(&scp2p_core::ShareId(community.share_id));
+        // Look up community_info_key in the DHT via ALL known seed peers
+        // and merge every response.  The old approach used an iterative
+        // Kademlia lookup (`dht_find_value_from_network`) which returns
+        // on the FIRST peer that has any value.  Every node that has
+        // joined the community stores a partial `CommunityMembers`
+        // entry (containing only its own address) in its local DHT, so
+        // the iterative lookup could hit a non-relay node first and
+        // return an incomplete member list.  By querying ALL seed peers
+        // and merging, we always include the relay's merged superset.
         let self_addr = self.resolve_self_addr(&node).await.ok();
-        if let Ok(Some(dht_value)) = node
-            .dht_find_value_from_network(&transport, community_key, &peers)
-            .await
-            && let Ok(cm) =
-                scp2p_core::cbor::from_slice::<scp2p_core::wire::CommunityMembers>(&dht_value.value)
         {
+            let cm = node
+                .find_community_members(
+                    &transport,
+                    scp2p_core::ShareId(community.share_id),
+                    &peers,
+                )
+                .await;
             for member in cm.members {
                 // Skip our own address — we already handle local shares
                 // separately below.
@@ -714,10 +715,10 @@ impl DesktopAppState {
         let mut first_err = None;
         let mut discovered_name: Option<String> = None;
 
-        // ── Include local node's own community shares ──
-        // The local node is itself a participant.  Fetch its own
-        // published shares for this community so they appear in the
-        // browse view without requiring a remote round-trip.
+        // ── Include local node as a participant ──
+        // The local node has joined the community so it should always
+        // appear in the participant list.  Also fetch its own published
+        // shares so they appear without requiring a remote round-trip.
         {
             let local_shares = node
                 .list_local_community_public_shares(
@@ -730,23 +731,23 @@ impl DesktopAppState {
                 .await
                 .unwrap_or_default();
             let local_label = "this node".to_string();
-            if !local_shares.is_empty() {
-                participants.push(CommunityParticipantView {
-                    community_share_id_hex: hex::encode(community.share_id),
-                    peer_addr: local_label.clone(),
-                    transport: "local".to_string(),
-                });
-                for share in local_shares {
-                    if seen_shares.insert(share.share_id) {
-                        public_shares.push(PublicShareView {
-                            source_peer_addr: local_label.clone(),
-                            share_id_hex: hex::encode(share.share_id),
-                            share_pubkey_hex: hex::encode(share.share_pubkey),
-                            latest_seq: share.latest_seq,
-                            title: share.title,
-                            description: share.description,
-                        });
-                    }
+            // Always show the local node as a participant since it has
+            // joined the community, regardless of whether it has shares.
+            participants.push(CommunityParticipantView {
+                community_share_id_hex: hex::encode(community.share_id),
+                peer_addr: local_label.clone(),
+                transport: "local".to_string(),
+            });
+            for share in local_shares {
+                if seen_shares.insert(share.share_id) {
+                    public_shares.push(PublicShareView {
+                        source_peer_addr: local_label.clone(),
+                        share_id_hex: hex::encode(share.share_id),
+                        share_pubkey_hex: hex::encode(share.share_pubkey),
+                        latest_seq: share.latest_seq,
+                        title: share.title,
+                        description: share.description,
+                    });
                 }
             }
         }

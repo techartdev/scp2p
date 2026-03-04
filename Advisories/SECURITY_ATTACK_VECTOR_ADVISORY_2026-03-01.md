@@ -1,4 +1,4 @@
-# SCP2P v0.1 — Attack-Vector Security Advisory (Post-Remediation)
+# SCP2P — Attack-Vector Security Advisory (Post-Remediation)
 
 > **Date:** 2026-03-01  
 > **Audience:** Core maintainers, desktop/CLI maintainers, release gatekeepers, future auditors  
@@ -200,7 +200,7 @@ Any per-peer limit keyed by pubkey can be bypassed via cheap key rotation (“id
 
 **What enables it**
 
-- Membership token explicitly optional in v0.1:  
+- Membership token explicitly optional in current release:  
   @crates/scp2p-core/src/api/mod.rs#114-117
 - Join path permits no-token membership:  
   @crates/scp2p-core/src/api/mod.rs#1067-1090

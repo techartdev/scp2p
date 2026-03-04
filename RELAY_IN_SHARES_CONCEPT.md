@@ -410,7 +410,7 @@ When publishing provider records, include multiple relay routes. Downloaders try
 
 ## 7. Open Questions
 
-1. **Relay incentives:** Why run a public relay? For v0.1, assume altruism + community operators. Future: reputation scoring, reciprocal relaying.
+1. **Relay incentives:** Why run a public relay? Currently, assume altruism + community operators. Future: reputation scoring, reciprocal relaying.
 
 2. **Desktop UX:** Should users explicitly toggle "I want to be a relay" in Settings, or infer from network conditions (public IP detected, sufficient bandwidth)?
 

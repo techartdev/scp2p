@@ -187,14 +187,17 @@ interface DownloadQueueProps {
   jobs: DownloadJob[];
   onRemoveJob: (id: string) => void;
   onClearCompleted: () => void;
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
 }
 
 export function DownloadQueue({
   jobs,
   onRemoveJob,
   onClearCompleted,
+  collapsed,
+  onToggleCollapsed,
 }: DownloadQueueProps) {
-  const [collapsed, setCollapsed] = useState(false);
   const [now, setNow] = useState(Date.now());
 
   // Tick every second for speed/elapsed calculations
@@ -246,7 +249,7 @@ export function DownloadQueue({
             </button>
           )}
           <button
-            onClick={() => setCollapsed(!collapsed)}
+            onClick={onToggleCollapsed}
             className="p-1 rounded-md text-text-muted hover:text-text-primary hover:bg-surface-deep/50 transition-colors"
           >
             {collapsed ? (

@@ -406,6 +406,47 @@ impl NodeHandle {
         // after the original publisher goes offline.
         let _ = self.reannounce_subscribed_share_heads().await;
 
+        // Re-insert community membership entries so they survive app
+        // restarts.  The DHT is ephemeral and only share heads are
+        // restored from the database; community member entries must be
+        // re-created on every republish cycle.
+        {
+            let community_ids: Vec<[u8; 32]> = {
+                let state = self.state.read().await;
+                state.communities.keys().copied().collect()
+            };
+            if !community_ids.is_empty() {
+                let now = now_unix_secs().unwrap_or(0);
+                for cid in community_ids {
+                    let key = community_info_key(&ShareId(cid));
+                    let has_entry = {
+                        let mut state = self.state.write().await;
+                        state.dht.find_value(key, now).is_some()
+                    };
+                    if !has_entry {
+                        // No entry yet (e.g. after restart): create a
+                        // placeholder so the republish pushes it to the
+                        // relay.  The relay tunnel task will update the
+                        // address once the tunnel is registered.
+                        let cm = CommunityMembers {
+                            community_share_id: cid,
+                            members: vec![],
+                            updated_at: now,
+                        };
+                        if let Ok(encoded) = crate::cbor::to_vec(&cm) {
+                            let mut state = self.state.write().await;
+                            let _ = state.dht.store(
+                                key,
+                                encoded,
+                                DEFAULT_TTL_SECS,
+                                now,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let now = now_unix_secs()?;
         let values = {
             let mut state = self.state.write().await;
@@ -627,6 +668,74 @@ impl NodeHandle {
             .collect::<Vec<_>>();
         merge_peer_list(&mut peers, known);
         peers
+    }
+
+    /// Query seed peers for community members and merge all responses.
+    ///
+    /// Unlike [`Self::dht_find_value_from_network`] which returns on the
+    /// first hit — potentially a partial copy from a non-relay node —
+    /// this queries ALL seed peers and merges every `CommunityMembers`
+    /// response.  The relay's merge-on-store means its copy is the
+    /// superset, but querying all peers gives resilience when the relay
+    /// isn't the closest in XOR space.
+    pub async fn find_community_members<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        community_share_id: ShareId,
+        seed_peers: &[PeerAddr],
+    ) -> CommunityMembers {
+        let key = community_info_key(&community_share_id);
+        let now = now_unix_secs().unwrap_or(0);
+
+        // Start with local data (our own membership entry).
+        let mut merged = {
+            let mut state = self.state.write().await;
+            state
+                .dht
+                .find_value(key, now)
+                .and_then(|v| crate::cbor::from_slice::<CommunityMembers>(&v.value).ok())
+                .unwrap_or(CommunityMembers {
+                    community_share_id: community_share_id.0,
+                    members: vec![],
+                    updated_at: now,
+                })
+        };
+
+        // Query each seed peer for the community key and merge results.
+        for peer in seed_peers {
+            let Ok(result) = query_find_value(transport, peer, key).await else {
+                continue;
+            };
+            if let Some(remote) = result.value
+                && remote.key == key
+                && remote.value.len() <= MAX_VALUE_SIZE
+                && let Ok(cm) =
+                    crate::cbor::from_slice::<CommunityMembers>(&remote.value)
+                && cm.community_share_id == community_share_id.0
+            {
+                for member in cm.members {
+                    if !merged.members.contains(&member) {
+                        merged.members.push(member);
+                    }
+                }
+                merged.updated_at = merged.updated_at.max(cm.updated_at);
+            }
+        }
+
+        // Cache the merged result locally.
+        if let Ok(encoded) = crate::cbor::to_vec(&merged) {
+            let mut state = self.state.write().await;
+            let _ = state.dht.store(key, encoded, DEFAULT_TTL_SECS, now);
+        }
+
+        debug!(
+            community = %hex::encode(&community_share_id.0[..8]),
+            members = merged.members.len(),
+            seed_peers = seed_peers.len(),
+            "find_community_members: done"
+        );
+
+        merged
     }
 
     /// Insert or update the local DHT entry for a community the node has

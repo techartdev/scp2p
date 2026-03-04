@@ -1,4 +1,4 @@
-# Spec: Subscribed Catalog P2P Network (SCP2P) v0.1
+# Spec: Subscribed Catalog P2P Network (SCP2P)
 
 > **Implementation status (2026-02-27):** All Milestone 1–7 items are implemented in `crates/scp2p-core`.
 > 125 tests passing (115 core + 10 desktop). See `PLAN.md` for full progress detail.
@@ -15,7 +15,7 @@
 - Desktop nodes can be “full nodes” (route/relay/store).
 - Phones are “light nodes”: connect, subscribe, search locally, download/upload, but not expected to be always-on routers.
 
-**Non-goals v0.1**
+**Non-goals (current scope)**
 - Strong anonymity guarantees.
 - Global discovery / global ranking.
 - Perfect NAT traversal for every network condition.
@@ -49,12 +49,12 @@
 - `ContentId = BLAKE3(file_bytes)` (32 bytes).
 - `ManifestId = BLAKE3(manifest_cbor_bytes)` (32 bytes).
 
-### 2.3 Hash tree for content (v0.1 simple)
+### 2.3 Hash tree for content
 - Chunk size: **256 KiB**.
 - Each item has:
   - `content_id` = BLAKE3(whole file) for identity
   - `chunks[]` = list of BLAKE3(chunk_i)
-- v0.1 uses `chunks[]` (flat list). v0.2 can move to Merkle tree.
+- Currently uses `chunks[]` (flat list). A future version may move to Merkle tree.
 
 ---
 
@@ -142,7 +142,7 @@ PEX Message Types:
 - TTL default: **24h**, max **7d**.
 - Replication: store to `K=20` closest nodes (or best-effort if not enough peers).
 
-### 6.4 Keyspace usage in v0.1
+### 6.4 Keyspace usage
 We store **pointers**, not huge catalogs.
 
 Keys:
@@ -161,7 +161,7 @@ Keys:
 - Untrusted hints; chunk hash verification always required.
 - Nodes MUST publish this entry after completing a verified download (`self_addr` seeding).
 - Nodes SHOULD refresh this entry periodically (every ~10 min) to prevent TTL expiry.
-**Note:** The DHT doesn’t need to store the whole manifest; it can, but v0.1 prefers:
+**Note:** The DHT doesn't need to store the whole manifest; it can, but the current design prefers:
 - fetch manifest from peers (providers) + swarm,
 - DHT stores just “what is latest” and “who might have it”.
 
@@ -190,7 +190,8 @@ Keys:
 - `name: string`
 - `mime: string` (optional)
 - `tags: [string]` (optional)
-- `chunks: [bytes32]` (BLAKE3 per chunk)  *(optional if you support “chunk hashes on demand”; v0.1 ok to include)*- `path: string` (optional) — relative path within a multi-file/folder share (e.g. `"sub/dir/file.txt"`). Absent for single-file shares. Preserved through signing.
+- `chunks: [bytes32]` (BLAKE3 per chunk)  *(optional if you support "chunk hashes on demand")*
+- `path: string` (optional) — relative path within a multi-file/folder share (e.g. `"sub/dir/file.txt"`). Absent for single-file shares. Preserved through signing.
 `ShareRef`:
 - `share_id: bytes32`
 - `share_pubkey: bytes32` (optional if derivable)
@@ -221,7 +222,7 @@ Minimum index:
 - Build inverted index: `term -> [(share_id, content_id, score_fields)]`
 - Store in SQLite (FTS5) or embedded Rust index.
 
-### 8.2 Ranking (v0.1 simple)
+### 8.2 Ranking
 Score based on:
 - exact match in name > prefix match > tag match > description match
 - optional share weight (user-configured: trusted shares rank higher)
@@ -267,14 +268,14 @@ Providers are untrusted hints; chunk hash verification is always required.
   - Peer selection uses a scoring function: `score × (1 / (in_flight + 1))` so peers under load are deprioritized.
   - Failed chunks are placed in a retry queue and assigned to a different peer.
   - Stall protection: if no forward progress after 60 consecutive scheduling attempts, the download is aborted with an error.
-- v0.1 does not require rarest-first chunk ordering.
+- Rarest-first chunk ordering is not required.
 - Providers can limit:
   - max concurrent chunk streams per peer
   - bandwidth caps
 
 ---
 
-## 10. NAT and reachability (v0.1 pragmatic)
+## 10. NAT and reachability
 
 ### 10.1 Reachability states
 - `Direct`: accepts inbound QUIC/TCP.
@@ -294,11 +295,11 @@ Messages:
 - `RELAY_CONNECT { relay_slot_id }`
 - `RELAY_STREAM { ... }` (multiplexed data streams)
 
-**Important:** This is for connectivity and small control messages; content transfer via relay is allowed but discouraged/limited (configurable). v0.1 may allow limited chunk relay with strict caps.
+**Important:** This is for connectivity and small control messages; content transfer via relay is allowed but discouraged/limited (configurable). Limited chunk relay is permitted with strict caps.
 
 ---
 
-## 11. Abuse containment (v0.1)
+## 11. Abuse containment
 
 Because you’re subscription-scoped, the main “abuse” surface is:
 - toxic shares,
@@ -405,6 +406,256 @@ Publish a test suite with:
    - capture of message exchange for connect + PEX + GET_MANIFEST.
 5) **DHT behavior tests**
    - STORE/FIND_VALUE for ShareHead keys.
+
+---
+
+## 15. Large-Scale Community Discovery & Search Plan
+
+### 15.1 Goal
+
+Communities MUST remain usable at large scale (10k+ members, 100k+ public shares)
+without requiring O(N-peers) polling and without single-value DHT bottlenecks.
+
+### 15.2 Current limitations to remove
+
+- Single `community:info` value cannot scale indefinitely under 64 KiB value limits.
+- Community browse currently depends on probing many peers for status/share listings.
+- No native pagination/cursor model for community-wide discovery.
+- No dedicated community metadata search path.
+
+### 15.3 Design principles
+
+- Keep cryptographic verification first; no unauthenticated destructive updates.
+- Use append/update records + merge semantics; avoid global mutable blobs.
+- Keep relays bounded by quotas and paginated APIs.
+- Prefer incremental sync (cursor/delta) over full re-scan.
+
+### 15.4 DHT/community data model (new)
+
+#### 15.4.0 Typed value dispatch (required for validator scalability)
+
+To avoid O(N-message-types) trial deserialization during DHT validation, values in
+new community keyspaces MUST use a typed prefix/tag scheme that allows direct
+validator dispatch.
+
+- Required parsing model:
+  - `value = namespace_tag || typed_payload`
+  - validator routes by `namespace_tag` first, then performs a single decode path.
+- Example tags (illustrative):
+  - `0x31` = community member record
+  - `0x32` = community share record
+  - `0x33` = community bootstrap hint
+- Note: DHT keys remain opaque 32-byte hashes; the dispatch tag is carried in the
+  value payload, not in the hashed DHT key.
+- Implementations MUST NOT attempt brute-force decode across all known wire
+  structs for these keyspaces.
+
+#### 15.4.1 Per-member records (replace monolithic member list)
+
+- DHT key:
+  - `key = SHA-256("community:member:" || community_id || member_node_pubkey)`
+- Value:
+  - `CommunityMemberRecord = {`
+  - `community_id: bytes32,`
+  - `member_node_pubkey: bytes32,`
+  - `announce_seq: u64,`
+  - `status: "joined" | "left",`
+  - `issued_at: u64,`
+  - `expires_at: u64,`
+  - `signature: bytes64`  // signed by `member_node_pubkey`
+  - `}`
+- Validation:
+  - key must match `(community_id, member_node_pubkey)`
+  - signature must verify with `member_node_pubkey`
+  - newer `announce_seq` wins for the same `(community_id, member_node_pubkey)`
+  - `status = "left"` records are tombstones and MUST expire quickly (default 7 days)
+    to prevent unbounded accumulation.
+
+#### 15.4.1b Community bootstrap hint (kept for discovery bootstrapping)
+
+Keep a lightweight `community:info`-style hint record for first-contact discovery,
+even when per-member records are the canonical membership source.
+
+- DHT key:
+  - `key = SHA-256("community:info:" || community_id)`
+- Value:
+  - `CommunityBootstrapHint = {`
+  - `community_id: bytes32,`
+  - `member_count_estimate: u64,`
+  - `sample_members: [PeerAddr],` // bounded, e.g. max 16
+  - `index_peers: [PeerAddr],`    // peers/relays known to serve paged indexes
+  - `updated_at: u64`
+  - `}`
+- Constraints:
+  - strictly bounded payload size
+  - advisory only; not authoritative for membership correctness
+  - untrusted input: clients MUST treat `sample_members` and `index_peers` as
+    hints only and MUST verify discovered membership/share state using signed
+    `CommunityMemberRecord` / `CommunityShareRecord` data before trust
+  - used to seed initial paging queries and reduce cold-start failures.
+
+#### 15.4.2 Per-share community announcements
+
+- DHT key:
+  - `key = SHA-256("community:share:" || community_id || share_id)`
+- Value:
+  - `CommunityShareRecord = {`
+  - `community_id: bytes32,`
+  - `share_id: bytes32,`
+  - `share_pubkey: bytes32,`
+  - `latest_manifest_id: bytes32,`
+  - `latest_seq: u64,`
+  - `visibility: "public",`
+  - `updated_at: u64,`
+  - `title?: string,`
+  - `description?: string,`
+  - `signature: bytes64`  // signed by `share_pubkey`
+  - `}`
+- Validation:
+  - `share_id == SHA-256(share_pubkey)` (ShareId derivation rule)
+  - key must match `(community_id, share_id)`
+  - signature and manifest linkage must verify
+  - newer `latest_seq` wins for same `(community_id, share_id)`
+
+### 15.5 Relay-maintained secondary indexes (derived, bounded)
+
+Relays MAY maintain derived community indexes for fast pagination, but source-of-truth
+remains validated per-member/per-share records.
+
+- Member pages:
+  - `community:members:page:<community_id>:<bucket>:<page_no>`
+- Share pages:
+  - `community:shares:page:<community_id>:<time_bucket>:<page_no>`
+- Each page stores record references (`record_key`, `updated_at`, compact summary), not
+  unverified raw authority.
+
+### 15.6 Wire protocol additions (new message families)
+
+#### 15.6.1 Community browse pagination
+
+- `LIST_COMMUNITY_MEMBERS_PAGE { community_id, cursor?, limit }`
+- `COMMUNITY_MEMBERS_PAGE { entries: [CommunityMemberSummary], next_cursor? }`
+- `LIST_COMMUNITY_SHARES_PAGE { community_id, cursor?, limit, since_unix? }`
+- `COMMUNITY_SHARES_PAGE { entries: [CommunityShareSummary], next_cursor? }`
+
+Rules:
+- `limit` MUST be capped server-side.
+- Cursor MUST be opaque, stable, and tamper-checked by server.
+- Responses MUST be deterministic for identical `(community_id, cursor, limit)`.
+
+#### 15.6.2 Community metadata search
+
+- `SEARCH_COMMUNITY_SHARES { community_id, query, cursor?, limit, filters? }`
+- `COMMUNITY_SEARCH_RESULTS { hits: [CommunityShareHit], next_cursor? }`
+
+Scope:
+- Search over public share metadata (`title`, `description`, tags/labels if present).
+- This is distinct from local file-level subscription search in §8.
+
+#### 15.6.3 Delta/event sync
+
+- `LIST_COMMUNITY_EVENTS { community_id, since_cursor?, limit }`
+- `COMMUNITY_EVENTS { events: [CommunityEvent], next_cursor? }`
+- Event types:
+  - `MemberJoined`
+  - `MemberLeft`
+  - `ShareUpserted`
+  - `ShareWithdrawn` (optional, future)
+
+### 15.7 Abuse and relay load controls
+
+Servers MUST enforce:
+
+- Per-peer and per-community token buckets for:
+  - member page requests
+  - share page requests
+  - community search requests
+- Max `limit` per request type.
+- Max concurrent in-flight queries per peer/community.
+- Response size caps with explicit truncation + cursor continuation.
+
+Servers SHOULD implement:
+
+- Hot-window cache for recent pages/events.
+- Background compaction of superseded records.
+- Tombstone compaction:
+  - leave tombstones should be removed from derived indexes immediately
+  - source leave records expire after a short policy window (default 7 days).
+- Multi-relay partitioning is deferred; in this phase, each relay MAY hold a full
+  index copy for simplicity.
+
+### 15.8 Desktop/client behavior (required changes)
+
+- Community browse MUST query paginated index APIs first, not peer-by-peer full polling.
+- Client MUST persist cursors per joined community for incremental refresh.
+- Client SHOULD display stale-cache results immediately, then merge delta updates.
+- Peer-direct probes remain optional fallback/debug paths, not default browse path.
+
+### 15.9 Migration and compatibility
+
+#### 15.9.1 Rollout phases
+
+Phase A (dual-write):
+- Writers publish bootstrap hint (`community:info`) plus new per-record entries.
+- Readers prefer per-record model when supported; fallback to legacy behavior.
+
+Phase B (dual-read, per-record preferred):
+- Relay and desktop default to paginated APIs.
+- Legacy fallback remains for mixed networks.
+
+Phase C (deprecation):
+- stop writing old monolithic member blob; keep lightweight bootstrap hint.
+- retain read fallback for one release window.
+
+#### 15.9.2 Capability negotiation
+
+Add capability bits:
+- `community_paged_browse_v2`
+- `community_search_v2`
+- `community_delta_sync_v2`
+
+Nodes MUST gate new requests on negotiated capabilities.
+
+### 15.10 Success criteria (release gate)
+
+Minimum acceptance benchmarks:
+
+- 10k member synthetic community:
+  - browse first page p95 < 1.5s on reference relay hardware
+  - delta refresh p95 < 500ms for no-change polls
+- 100k public-share index:
+  - metadata search first page p95 < 2s
+  - bounded memory growth (no unbounded in-process accumulation)
+- Mixed-version interop:
+  - New nodes coexist with older nodes during migration without correctness loss
+
+### 15.11 Test matrix additions
+
+- Convergence/property tests:
+  - member join/leave ordering, replay, duplicate delivery
+  - share upsert conflict resolution by seq/timestamp/signature rules
+- Abuse tests:
+  - cursor tampering, query flood, large-limit rejection
+  - tombstone churn/retention bounds
+- Interop tests:
+  - dual-write/dual-read behavior across old/new nodes
+
+### 15.12 Implementation order (pragmatic)
+
+Recommended delivery sequence:
+
+1. Data model foundation:
+   - per-member records
+   - per-share records
+   - typed keyspace validator dispatch
+2. Paged browse APIs:
+   - members/shares page requests + cursors
+3. Client browse switch:
+   - desktop uses paged index flow first
+4. Follow-on:
+   - community metadata search
+   - delta/event sync
+   - advanced multi-relay partitioning (future)
 
 ---
 

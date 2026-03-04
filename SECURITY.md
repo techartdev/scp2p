@@ -23,7 +23,7 @@ Instead, please send a detailed report to the project maintainers. We will ackno
 
 ## Supported Versions
 
-Currently, only the latest version in the `main` branch is supported for security updates as we are in the **v0.1 Prototype** phase.
+Currently, only the latest version in the `main` branch is supported for security updates.
 
 ## Security Features in SCP2P
 
