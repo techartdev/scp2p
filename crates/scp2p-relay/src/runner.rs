@@ -10,7 +10,7 @@
 //! Call [`run`] to start the relay node.  The function blocks until a
 //! graceful shutdown signal (Ctrl-C / SIGTERM) is received, then returns.
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
@@ -78,9 +78,15 @@ pub async fn run(config: RelayConfig) -> anyhow::Result<()> {
     // ── 1. Storage ────────────────────────────────────────────────
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("create data directory: {}", config.data_dir.display()))?;
+
+    // RA-04: enforce owner-only permissions on the data directory and DB
+    // so the relay node identity key is not world-readable.
+    enforce_owner_only_dir(&config.data_dir)?;
+
     let db_path = config.data_dir.join("relay.db");
     let store = SqliteStore::open(&db_path)
         .with_context(|| format!("open state database: {}", db_path.display()))?;
+    enforce_owner_only_file(&db_path)?;
     info!(db = %db_path.display(), "state database opened");
 
     // ── 2. Node ───────────────────────────────────────────────────
@@ -295,13 +301,17 @@ fn parse_peer_addr(s: &str) -> anyhow::Result<PeerAddr> {
         (TransportProtocol::Tcp, s)
     };
 
-    // Optional @pubkey suffix
+    // Optional @pubkey suffix — fail closed on malformed hint (RA-06).
     let (addr_part, pubkey_hint) = if let Some((addr, key_hex)) = rest.split_once('@') {
-        let key = hex::decode(key_hex)
-            .ok()
-            .and_then(|b| b.try_into().ok())
-            .map(|arr: [u8; 32]| arr);
-        (addr, key)
+        let bytes = hex::decode(key_hex)
+            .with_context(|| format!("invalid pubkey hex in \"{s}\""))?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            anyhow::anyhow!(
+                "pubkey hint must be 32 bytes (got {}) in \"{s}\"",
+                v.len()
+            )
+        })?;
+        (addr, Some(arr))
     } else {
         (rest, None)
     };
@@ -345,6 +355,39 @@ fn build_default_announce_addrs(
         });
     }
     out
+}
+
+// ── RA-04: Owner-only permission enforcement ──────────────────────
+
+/// Enforce owner-only permissions on a directory (Unix: `chmod 700`).
+///
+/// On Windows this is a no-op — NTFS ACLs typically restrict access to the
+/// creating user's profile directory already, and programmatic ACL changes
+/// require the `windows-acl` crate or raw Win32 calls which are out of
+/// scope for the initial hardening pass.
+fn enforce_owner_only_dir(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("set permissions on {}", path.display()))?;
+    }
+    let _ = path; // suppress unused warning on non-Unix
+    Ok(())
+}
+
+/// Enforce owner-only permissions on a file (Unix: `chmod 600`).
+fn enforce_owner_only_file(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("set permissions on {}", path.display()))?;
+    }
+    let _ = path;
+    Ok(())
 }
 
 /// Wait for Ctrl-C (all platforms) or SIGTERM (Unix only).

@@ -408,7 +408,6 @@ enum RequestClass {
     Chunk,
     /// Community index queries: member/share pages, search, events.
     Community,
-    Other,
 }
 
 #[derive(Debug, Clone)]
@@ -733,8 +732,6 @@ impl NodeState {
             RequestClass::Relay => counter.relay = counter.relay.saturating_add(1),
             RequestClass::Chunk => counter.chunk = counter.chunk.saturating_add(1),
             RequestClass::Community => counter.community = counter.community.saturating_add(1),
-            // Truly uncategorized requests are still exempt.
-            RequestClass::Other => return Ok(()),
         }
 
         if counter.total > self.abuse_limits.max_total_requests_per_window {

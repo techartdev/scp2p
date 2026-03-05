@@ -14,8 +14,8 @@ use scp2p_core::{
     BoxedStream, Capabilities, FetchPolicy, Node, NodeConfig, NodeHandle, OwnedRelayAwareTransport,
     OwnedShareRecord, PeerAddr, PeerConnector, PeerRecord, PublicShareSummary, RelayAwareTransport,
     SearchPageQuery, ShareItemInfo, ShareVisibility, SqliteStore, Store, TransportProtocol,
-    build_tls_server_handle, quic_connect_bi_session_insecure, start_quic_server,
-    tls_connect_session_insecure,
+    build_tls_server_handle, full_node_capabilities, quic_connect_bi_session_insecure,
+    start_quic_server, tls_connect_session_insecure,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -139,7 +139,7 @@ impl DesktopAppState {
         let mut state = self.inner.write().await;
         let service_key = handle.ensure_node_identity().await?;
         state.node_signing_key = Some(service_key.clone());
-        let caps = Capabilities::default();
+        let caps = full_node_capabilities();
         if let Some(bind_tcp) = request.bind_tcp {
             let tls_server =
                 Arc::new(build_tls_server_handle().context("build TLS server handle")?);
@@ -177,7 +177,7 @@ impl DesktopAppState {
                     .node_signing_key
                     .clone()
                     .unwrap_or_else(|| SigningKey::generate(&mut OsRng)),
-                capabilities: Capabilities::default(),
+                capabilities: full_node_capabilities(),
             };
             let transport: Arc<dyn scp2p_core::RequestTransport> =
                 Arc::new(OwnedRelayAwareTransport::new(Arc::new(connector)));
@@ -214,7 +214,7 @@ impl DesktopAppState {
                         .node_signing_key
                         .clone()
                         .unwrap_or_else(|| SigningKey::generate(&mut OsRng)),
-                    capabilities: Capabilities::default(),
+                    capabilities: full_node_capabilities(),
                 };
                 let tunnel_bootstrap = bootstrap;
                 let tunnel_transport = transport;
@@ -688,37 +688,12 @@ impl DesktopAppState {
             .into_iter()
             .find(|community| community.share_id == share_id)
             .ok_or_else(|| anyhow::anyhow!("community is not joined"))?;
-        let mut peers = self.sync_peer_targets(&node).await?;
+        let peers = self.sync_peer_targets(&node).await?;
 
         let connector = self.build_connector().await;
         let transport = RelayAwareTransport::new(&connector);
 
-        // ── DHT-based community member discovery ──
-        // Look up community_info_key in the DHT via ALL known seed peers
-        // and merge every response.  The old approach used an iterative
-        // Kademlia lookup (`dht_find_value_from_network`) which returns
-        // on the FIRST peer that has any value.  Every node that has
-        // joined the community stores a partial `CommunityMembers`
-        // entry (containing only its own address) in its local DHT, so
-        // the iterative lookup could hit a non-relay node first and
-        // return an incomplete member list.  By querying ALL seed peers
-        // and merging, we always include the relay's merged superset.
         let self_addr = self.resolve_self_addr(&node).await.ok();
-        {
-            let cm = node
-                .find_community_members(&transport, scp2p_core::ShareId(community.share_id), &peers)
-                .await;
-            for member in cm.members {
-                // Skip our own address — we already handle local shares
-                // separately below.
-                if self_addr.as_ref().is_some_and(|sa| member == *sa) {
-                    continue;
-                }
-                if !peers.iter().any(|p| p == &member) {
-                    peers.push(member);
-                }
-            }
-        }
 
         if peers.is_empty() {
             return Ok(CommunityBrowseView {
@@ -958,6 +933,8 @@ impl DesktopAppState {
             });
         }
 
+        const MAX_SEARCH_PAGES: usize = 10;
+
         let connector = self.build_connector().await;
         let transport = RelayAwareTransport::new(&connector);
 
@@ -965,34 +942,43 @@ impl DesktopAppState {
         let mut merged_results: Vec<CommunitySearchHitView> = Vec::new();
         let mut first_err = None;
         for peer in &peers {
-            match node
-                .fetch_community_search_shares(
-                    &transport,
-                    peer,
-                    community.share_id,
-                    query.to_string(),
-                    None,
-                    100,
-                )
-                .await
-            {
-                Ok(resp) => {
-                    for h in resp.hits {
-                        if seen_ids.insert(h.share_id) {
-                            merged_results.push(CommunitySearchHitView {
-                                share_id_hex: hex::encode(h.share_id),
-                                share_pubkey_hex: hex::encode(h.share_pubkey),
-                                latest_seq: h.latest_seq,
-                                title: h.title,
-                                description: h.description,
-                                score: h.score,
-                            });
+            let mut cursor: Option<String> = None;
+            for _page in 0..MAX_SEARCH_PAGES {
+                match node
+                    .fetch_community_search_shares(
+                        &transport,
+                        peer,
+                        community.share_id,
+                        query.to_string(),
+                        cursor.clone(),
+                        100,
+                    )
+                    .await
+                {
+                    Ok(resp) => {
+                        let next = resp.next_cursor.clone();
+                        for h in resp.hits {
+                            if seen_ids.insert(h.share_id) {
+                                merged_results.push(CommunitySearchHitView {
+                                    share_id_hex: hex::encode(h.share_id),
+                                    share_pubkey_hex: hex::encode(h.share_pubkey),
+                                    latest_seq: h.latest_seq,
+                                    title: h.title,
+                                    description: h.description,
+                                    score: h.score,
+                                });
+                            }
+                        }
+                        cursor = next;
+                        if cursor.is_none() {
+                            break;
                         }
                     }
-                }
-                Err(err) => {
-                    if first_err.is_none() {
-                        first_err = Some(err);
+                    Err(err) => {
+                        if first_err.is_none() {
+                            first_err = Some(err);
+                        }
+                        break;
                     }
                 }
             }
@@ -1272,7 +1258,7 @@ impl DesktopAppState {
             .unwrap_or_else(|| SigningKey::generate(&mut OsRng));
         DesktopSessionConnector {
             signing_key,
-            capabilities: Capabilities::default(),
+            capabilities: full_node_capabilities(),
         }
     }
 

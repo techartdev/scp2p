@@ -28,7 +28,7 @@ use crate::{
     },
     search::IndexedItem,
     wire::{
-        CommunityEventsResp, CommunityMembers, CommunityMembersPageResponse,
+        CommunityEventsResp, CommunityMembersPageResponse,
         CommunityPublicShareList, CommunitySearchResultsResp, CommunitySharesPageResponse,
         CommunityStatus, Envelope, FLAG_RESPONSE, FindNode, FindNodeResult, FindValue,
         FindValueResult, GetCommunityStatus, ListCommunityEventsReq, ListCommunityMembersPage,
@@ -87,30 +87,55 @@ pub(super) fn hex_nibble(b: u8) -> Option<u8> {
 
 pub(super) fn request_class(payload: &WirePayload) -> RequestClass {
     match payload {
-        WirePayload::FindNode(_) | WirePayload::FindValue(_) | WirePayload::Store(_) => {
-            RequestClass::Dht
-        }
+        // DHT operations: node/value lookup, store, peer exchange.
+        WirePayload::FindNode(_)
+        | WirePayload::FindValue(_)
+        | WirePayload::Store(_)
+        | WirePayload::PexRequest(_)
+        | WirePayload::PexOffer(_)
+        | WirePayload::Providers(_) => RequestClass::Dht,
+
+        // Manifest/metadata fetches and their responses.
         WirePayload::GetManifest(_)
+        | WirePayload::ManifestData(_)
         | WirePayload::ListPublicShares(_)
+        | WirePayload::PublicShareList(_)
         | WirePayload::GetCommunityStatus(_)
+        | WirePayload::CommunityStatus(_)
         | WirePayload::ListCommunityPublicShares(_)
-        | WirePayload::GetChunkHashes(_) => RequestClass::Fetch,
+        | WirePayload::CommunityPublicShareList(_)
+        | WirePayload::GetChunkHashes(_)
+        | WirePayload::ChunkHashList(_)
+        | WirePayload::HaveContent(_) => RequestClass::Fetch,
+
         // Community index queries have their own rate-limit bucket so
         // that community browse/search cannot starve manifest/chunk
         // fetches sharing the generic Fetch counter.
         WirePayload::ListCommunityMembersPage(_)
+        | WirePayload::CommunityMembersPage(_)
         | WirePayload::ListCommunitySharesPage(_)
+        | WirePayload::CommunitySharesPage(_)
         | WirePayload::SearchCommunityShares(_)
-        | WirePayload::ListCommunityEvents(_) => RequestClass::Community,
+        | WirePayload::CommunitySearchResults(_)
+        | WirePayload::ListCommunityEvents(_)
+        | WirePayload::CommunityEvents(_) => RequestClass::Community,
+
         // Chunk data requests are rate-limited by per-peer chunk request
         // count.  Each chunk is up to CHUNK_SIZE (256 KiB), so the
         // `max_chunk_requests_per_window` field in `AbuseLimits`
         // effectively caps bandwidth per peer.
-        WirePayload::GetChunk(_) => RequestClass::Chunk,
+        WirePayload::GetChunk(_) | WirePayload::ChunkData(_) => RequestClass::Chunk,
+
+        // Relay operations: register, connect, stream, list.
         WirePayload::RelayRegister(_)
+        | WirePayload::RelayRegistered(_)
         | WirePayload::RelayConnect(_)
-        | WirePayload::RelayStream(_) => RequestClass::Relay,
-        _ => RequestClass::Other,
+        | WirePayload::RelayStream(_)
+        | WirePayload::RelayListRequest(_)
+        | WirePayload::RelayListResponse(_) => RequestClass::Relay,
+        // No catch-all — every variant is explicitly classified.
+        // If a new variant is added to WirePayload, this match will
+        // produce a compile error until it is categorized (RA-03).
     }
 }
 
@@ -175,6 +200,12 @@ pub(super) fn validate_dht_value_for_known_keyspaces(
             crate::wire::community_tags::BOOTSTRAP_HINT => {
                 return validate_community_bootstrap_hint(key, value);
             }
+            crate::wire::community_tags::MEMBERS_PAGE => {
+                return validate_materialized_members_page(key, value);
+            }
+            crate::wire::community_tags::SHARES_PAGE => {
+                return validate_materialized_shares_page(key, value);
+            }
             _ => {}
         }
     }
@@ -216,14 +247,6 @@ pub(super) fn validate_dht_value_for_known_keyspaces(
         anyhow::bail!("relay announcement key does not match any valid rendezvous slot");
     }
 
-    // Legacy community member lists stored at community_info_key(share_id).
-    if let Ok(cm) = crate::cbor::from_slice::<CommunityMembers>(value) {
-        let expected = community_info_key(&ShareId(cm.community_share_id));
-        if expected != key {
-            anyhow::bail!("community members value does not match community info key");
-        }
-        return Ok(());
-    }
     // Reject values that do not match any recognized keyspace to prevent
     // arbitrary data storage and potential abuse (§4.5).
     anyhow::bail!("DHT value does not match any recognized keyspace")
@@ -240,6 +263,20 @@ fn validate_community_member_record(key: [u8; 32], value: &[u8]) -> anyhow::Resu
     }
     // Cryptographic signature verification.
     record.verify_signature()?;
+    // Structural consistency check for the optional publisher auth token (§4.2).
+    // Full publisher-signature verification is deferred to ingestion where the
+    // community public key is available.  Here we only ensure the token is
+    // well-formed and binds to the correct community and member.
+    if let Some(token_bytes) = &record.auth_token_bytes {
+        let token = crate::cbor::from_slice::<super::CommunityMembershipToken>(token_bytes)
+            .map_err(|e| anyhow::anyhow!("auth_token_bytes is malformed: {e}"))?;
+        if token.community_share_id != record.community_id {
+            anyhow::bail!("auth token community_share_id does not match record community_id");
+        }
+        if token.member_node_pubkey != record.member_node_pubkey {
+            anyhow::bail!("auth token member_node_pubkey does not match record");
+        }
+    }
     Ok(())
 }
 
@@ -272,6 +309,36 @@ fn validate_community_bootstrap_hint(key: [u8; 32], value: &[u8]) -> anyhow::Res
     }
     if hint.index_peers.len() > CommunityBootstrapHint::MAX_INDEX_PEERS {
         anyhow::bail!("bootstrap hint index_peers exceeds max");
+    }
+    Ok(())
+}
+
+/// Validate a materialized members page (§15.5).
+fn validate_materialized_members_page(key: [u8; 32], value: &[u8]) -> anyhow::Result<()> {
+    use crate::dht_keys::community_members_page_key;
+    use crate::wire::MaterializedMembersPage;
+    let page = MaterializedMembersPage::decode_tagged(value)?;
+    let expected = community_members_page_key(&page.community_id, page.bucket, page.page_no);
+    if expected != key {
+        anyhow::bail!("materialized members page key mismatch");
+    }
+    if page.page_no >= page.total_pages {
+        anyhow::bail!("materialized members page_no exceeds total_pages");
+    }
+    Ok(())
+}
+
+/// Validate a materialized shares page (§15.5).
+fn validate_materialized_shares_page(key: [u8; 32], value: &[u8]) -> anyhow::Result<()> {
+    use crate::dht_keys::community_shares_page_key;
+    use crate::wire::MaterializedSharesPage;
+    let page = MaterializedSharesPage::decode_tagged(value)?;
+    let expected = community_shares_page_key(&page.community_id, page.bucket, page.page_no);
+    if expected != key {
+        anyhow::bail!("materialized shares page key mismatch");
+    }
+    if page.page_no >= page.total_pages {
+        anyhow::bail!("materialized shares page_no exceeds total_pages");
     }
     Ok(())
 }

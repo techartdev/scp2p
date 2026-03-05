@@ -52,6 +52,44 @@ pub fn community_share_key(community_id: &[u8; 32], share_id: &[u8; 32]) -> [u8;
     out
 }
 
+/// Bucket interval for materialized community pages (1 hour).
+pub const MATERIALIZED_BUCKET_SECS: u64 = 3600;
+
+/// Compute the time bucket for materialized community pages.
+pub fn materialized_bucket(now: u64) -> u64 {
+    now / MATERIALIZED_BUCKET_SECS
+}
+
+/// DHT key for a materialized members page (§15.5).
+///
+/// `SHA-256("community:members:page:" || community_id || bucket_be || page_no_be)`
+pub fn community_members_page_key(community_id: &[u8; 32], bucket: u64, page_no: u16) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"community:members:page:");
+    hasher.update(community_id);
+    hasher.update(bucket.to_be_bytes());
+    hasher.update(page_no.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// DHT key for a materialized shares page (§15.5).
+///
+/// `SHA-256("community:shares:page:" || community_id || bucket_be || page_no_be)`
+pub fn community_shares_page_key(community_id: &[u8; 32], bucket: u64, page_no: u16) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"community:shares:page:");
+    hasher.update(community_id);
+    hasher.update(bucket.to_be_bytes());
+    hasher.update(page_no.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 fn prefixed_hash(prefix: &[u8], id: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(prefix);
@@ -125,5 +163,39 @@ mod tests {
             community_share_key(&cid, &id),
             community_member_key(&cid, &id)
         );
+    }
+
+    #[test]
+    fn community_members_page_key_is_deterministic() {
+        let cid = [5u8; 32];
+        assert_eq!(
+            community_members_page_key(&cid, 100, 0),
+            community_members_page_key(&cid, 100, 0)
+        );
+    }
+
+    #[test]
+    fn community_members_page_key_varies_by_page_no() {
+        let cid = [5u8; 32];
+        assert_ne!(
+            community_members_page_key(&cid, 100, 0),
+            community_members_page_key(&cid, 100, 1)
+        );
+    }
+
+    #[test]
+    fn community_shares_page_key_distinct_from_members_page_key() {
+        let cid = [5u8; 32];
+        assert_ne!(
+            community_members_page_key(&cid, 100, 0),
+            community_shares_page_key(&cid, 100, 0)
+        );
+    }
+
+    #[test]
+    fn materialized_bucket_is_deterministic() {
+        assert_eq!(materialized_bucket(3600), 1);
+        assert_eq!(materialized_bucket(7200), 2);
+        assert_eq!(materialized_bucket(0), 0);
     }
 }

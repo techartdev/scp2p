@@ -23,3 +23,20 @@ pub struct Capabilities {
     #[serde(default)]
     pub community_delta_sync: bool,
 }
+
+/// Canonical capabilities for a full desktop/CLI node.
+///
+/// Advertised during TLS/QUIC handshake so that peers can route community
+/// browse, search, and event-sync requests to nodes that support them.
+pub fn full_node_capabilities() -> Capabilities {
+    Capabilities {
+        dht: true,
+        store: true,
+        relay: false,
+        content_seed: true,
+        mobile_light: false,
+        community_paged_browse: true,
+        community_search: true,
+        community_delta_sync: true,
+    }
+}

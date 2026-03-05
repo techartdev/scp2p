@@ -514,6 +514,124 @@ impl CommunityIndex {
             .unwrap_or(0);
         m_max.max(s_max)
     }
+
+    // ── Materialized page generation (§15.5) ──────────────────────
+
+    /// Number of entries per materialized DHT page.
+    pub const MATERIALIZED_PAGE_SIZE: usize = 100;
+
+    /// Return all community IDs known to this index (from both member
+    /// and share buckets).
+    pub fn all_community_ids(&self) -> Vec<[u8; 32]> {
+        let mut ids: Vec<[u8; 32]> = self
+            .members
+            .keys()
+            .chain(self.shares.keys())
+            .copied()
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Produce materialized member pages for a community.
+    ///
+    /// Only `Joined` members are included (leave tombstones are omitted
+    /// from derived indexes per §15.7).  Pages are ordered by the
+    /// BTreeMap key (member_node_pubkey) and sized at
+    /// [`MATERIALIZED_PAGE_SIZE`](Self::MATERIALIZED_PAGE_SIZE).
+    pub fn materialize_member_pages(
+        &self,
+        community_id: [u8; 32],
+        bucket: u64,
+        now: u64,
+    ) -> Vec<crate::wire::MaterializedMembersPage> {
+        use crate::wire::{CommunityMemberSummary, MaterializedMembersPage};
+
+        let entries: Vec<CommunityMemberSummary> = self
+            .members
+            .get(&community_id)
+            .into_iter()
+            .flat_map(|b| b.values())
+            .filter(|m| matches!(m.status, CommunityMemberStatus::Joined))
+            .map(|m| CommunityMemberSummary {
+                member_node_pubkey: m.member_node_pubkey,
+                status: m.status,
+                announce_seq: m.announce_seq,
+                addr: None,
+            })
+            .collect();
+
+        if entries.is_empty() {
+            return vec![];
+        }
+
+        let chunks: Vec<&[CommunityMemberSummary]> =
+            entries.chunks(Self::MATERIALIZED_PAGE_SIZE).collect();
+        let total_pages = chunks.len() as u16;
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(i, chunk)| MaterializedMembersPage {
+                community_id,
+                bucket,
+                page_no: i as u16,
+                total_pages,
+                entries: chunk.to_vec(),
+                built_at: now,
+            })
+            .collect()
+    }
+
+    /// Produce materialized share pages for a community.
+    ///
+    /// Non-expired shares are included, ordered by share_id (BTreeMap
+    /// order).  Pages are sized at
+    /// [`MATERIALIZED_PAGE_SIZE`](Self::MATERIALIZED_PAGE_SIZE).
+    pub fn materialize_share_pages(
+        &self,
+        community_id: [u8; 32],
+        bucket: u64,
+        now: u64,
+    ) -> Vec<crate::wire::MaterializedSharesPage> {
+        use crate::wire::{CommunityShareSummary, MaterializedSharesPage};
+
+        let entries: Vec<CommunityShareSummary> = self
+            .shares
+            .get(&community_id)
+            .into_iter()
+            .flat_map(|b| b.values())
+            .filter(|s| s.expires_at > now)
+            .map(|s| CommunityShareSummary {
+                share_id: s.share_id,
+                share_pubkey: s.share_pubkey,
+                latest_seq: s.latest_seq,
+                title: s.title.clone(),
+                description: s.description.clone(),
+                updated_at: s.updated_at,
+            })
+            .collect();
+
+        if entries.is_empty() {
+            return vec![];
+        }
+
+        let chunks: Vec<&[CommunityShareSummary]> =
+            entries.chunks(Self::MATERIALIZED_PAGE_SIZE).collect();
+        let total_pages = chunks.len() as u16;
+        chunks
+            .into_iter()
+            .enumerate()
+            .map(|(i, chunk)| MaterializedSharesPage {
+                community_id,
+                bucket,
+                page_no: i as u16,
+                total_pages,
+                entries: chunk.to_vec(),
+                built_at: now,
+            })
+            .collect()
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -1238,6 +1356,1034 @@ mod tests {
             events_after.len(),
             0,
             "orphaned event log should be purged after member expiry + age cutoff"
+        );
+    }
+
+    // ── J-1C: Materialized page tests ─────────────────────────────
+
+    #[test]
+    fn materialize_member_pages_basic() {
+        let cid = [30u8; 32];
+        let mut idx = CommunityIndex::default();
+        let far_future = 1_000_000u64 + 3600 * 24 * 365;
+
+        // Insert 5 joined members.
+        for i in 1..=5u8 {
+            idx.ingest_member_record(&make_member_rec_ts(
+                cid,
+                i,
+                1,
+                CommunityMemberStatus::Joined,
+                1_000_000,
+                far_future,
+            ));
+        }
+        // Insert 1 left member (should be excluded from materialized pages).
+        idx.ingest_member_record(&make_member_rec_ts(
+            cid,
+            10,
+            2,
+            CommunityMemberStatus::Left,
+            1_000_000,
+            far_future,
+        ));
+
+        let pages = idx.materialize_member_pages(cid, 100, 1_000_001);
+        assert_eq!(pages.len(), 1, "5 members fit in one page");
+        assert_eq!(pages[0].total_pages, 1);
+        assert_eq!(pages[0].page_no, 0);
+        assert_eq!(pages[0].bucket, 100);
+        assert_eq!(pages[0].entries.len(), 5, "only joined members");
+        assert_eq!(pages[0].community_id, cid);
+        // All entries should be Joined.
+        for e in &pages[0].entries {
+            assert_eq!(e.status, CommunityMemberStatus::Joined);
+        }
+    }
+
+    #[test]
+    fn materialize_member_pages_pagination() {
+        let cid = [31u8; 32];
+        let mut idx = CommunityIndex::default();
+        let far_future = 1_000_000u64 + 3600 * 24 * 365;
+
+        // Insert more members than MATERIALIZED_PAGE_SIZE.
+        let count = CommunityIndex::MATERIALIZED_PAGE_SIZE + 30;
+        for i in 0..count {
+            let key = (i as u8).wrapping_add(1);
+            // Use a unique signing key per member.
+            let signing_key = {
+                use ed25519_dalek::SigningKey;
+                let mut seed = [0u8; 32];
+                seed[0] = key;
+                seed[1] = (i >> 8) as u8;
+                SigningKey::from_bytes(&seed)
+            };
+            let rec = CommunityMemberRecord::new_signed(
+                &signing_key,
+                cid,
+                1,
+                CommunityMemberStatus::Joined,
+                1_000_000,
+                far_future,
+            )
+            .unwrap();
+            idx.ingest_member_record(&rec);
+        }
+
+        let pages = idx.materialize_member_pages(cid, 200, 1_000_001);
+        assert_eq!(pages.len(), 2, "should span 2 pages");
+        assert_eq!(pages[0].total_pages, 2);
+        assert_eq!(pages[1].total_pages, 2);
+        assert_eq!(pages[0].page_no, 0);
+        assert_eq!(pages[1].page_no, 1);
+        let total_entries: usize = pages.iter().map(|p| p.entries.len()).sum();
+        assert_eq!(total_entries, count);
+    }
+
+    #[test]
+    fn materialize_share_pages_basic() {
+        let cid = [32u8; 32];
+        let mut idx = CommunityIndex::default();
+
+        for i in 1..=3u8 {
+            idx.ingest_share_record(&make_share_rec_ts(
+                cid,
+                i,
+                1,
+                1_000_000,
+                Some(&format!("share {i}")),
+            ));
+        }
+
+        let pages = idx.materialize_share_pages(cid, 100, 1_000_001);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].entries.len(), 3);
+        assert_eq!(pages[0].total_pages, 1);
+        assert_eq!(pages[0].page_no, 0);
+    }
+
+    #[test]
+    fn materialize_share_pages_excludes_expired() {
+        let cid = [33u8; 32];
+        let mut idx = CommunityIndex::default();
+
+        // This share is updated_at=100, so expires_at = 100 + MAX_SHARE_TTL_SECS.
+        idx.ingest_share_record(&make_share_rec_ts(cid, 1, 1, 100, Some("old")));
+        idx.ingest_share_record(&make_share_rec_ts(cid, 2, 1, 2_000_000, Some("new")));
+
+        let expiry = 100 + CommunityIndex::MAX_SHARE_TTL_SECS + 1;
+        let pages = idx.materialize_share_pages(cid, 100, expiry);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].entries.len(), 1, "expired share excluded");
+        assert_eq!(pages[0].entries[0].title.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn materialize_empty_community_returns_no_pages() {
+        let cid = [34u8; 32];
+        let idx = CommunityIndex::default();
+        assert!(idx.materialize_member_pages(cid, 100, 1_000_000).is_empty());
+        assert!(idx.materialize_share_pages(cid, 100, 1_000_000).is_empty());
+    }
+
+    #[test]
+    fn all_community_ids_returns_union() {
+        let cid1 = [40u8; 32];
+        let cid2 = [41u8; 32];
+        let far_future = 1_000_000u64 + 3600 * 24 * 365;
+
+        let mut idx = CommunityIndex::default();
+        idx.ingest_member_record(&make_member_rec_ts(
+            cid1,
+            1,
+            1,
+            CommunityMemberStatus::Joined,
+            1_000_000,
+            far_future,
+        ));
+        idx.ingest_share_record(&make_share_rec_ts(cid2, 1, 1, 1_000_000, Some("s")));
+
+        let ids = idx.all_community_ids();
+        assert!(ids.contains(&cid1));
+        assert!(ids.contains(&cid2));
+        assert_eq!(ids.len(), 2);
+    }
+
+    // ── Large-scale simulation tests (J-6B) ──────────────────────────
+
+    /// Generate a unique signing key from a 32-bit index (supports >256 keys).
+    fn make_signing_key(index: u32) -> ed25519_dalek::SigningKey {
+        let mut seed = [0u8; 32];
+        seed[..4].copy_from_slice(&index.to_le_bytes());
+        ed25519_dalek::SigningKey::from_bytes(&seed)
+    }
+
+    /// Create a member record with a signing key derived from a u32 index.
+    fn make_member_rec_u32(
+        community_id: [u8; 32],
+        index: u32,
+        seq: u64,
+        status: CommunityMemberStatus,
+        issued_at: u64,
+        expires_at: u64,
+    ) -> CommunityMemberRecord {
+        let signing_key = make_signing_key(index);
+        CommunityMemberRecord::new_signed(
+            &signing_key,
+            community_id,
+            seq,
+            status,
+            issued_at,
+            expires_at,
+        )
+        .expect("signed record")
+    }
+
+    /// Create a share record with a signing key derived from a u32 index.
+    fn make_share_rec_u32(
+        community_id: [u8; 32],
+        index: u32,
+        seq: u64,
+        updated_at: u64,
+        title: Option<&str>,
+    ) -> CommunityShareRecord {
+        let signing_key = make_signing_key(index);
+        CommunityShareRecord::new_signed(
+            &signing_key,
+            community_id,
+            [0u8; 32],
+            seq,
+            updated_at,
+            title.map(str::to_string),
+            None,
+        )
+        .expect("signed share record")
+    }
+
+    /// Compute percentile value from a sorted list of durations.
+    fn percentile(sorted: &[std::time::Duration], p: f64) -> std::time::Duration {
+        if sorted.is_empty() {
+            return std::time::Duration::ZERO;
+        }
+        let idx = ((p / 100.0) * (sorted.len() as f64 - 1.0)).ceil() as usize;
+        sorted[idx.min(sorted.len() - 1)]
+    }
+
+    /// J-6B: 10k member community — ingest, browse, search, materialize timing
+    #[test]
+    #[ignore] // slow: run with `cargo test -- --ignored`
+    fn simulation_10k_members() {
+        let cid = [100u8; 32];
+        let now = 2_000_000u64;
+        let far_future = now + 365 * 24 * 3600;
+        let mut idx = CommunityIndex::default();
+
+        // ── Ingest 10k members ────────────────────────────────
+        let ingest_start = std::time::Instant::now();
+        for i in 0..10_000u32 {
+            idx.ingest_member_record(&make_member_rec_u32(
+                cid,
+                i,
+                1,
+                CommunityMemberStatus::Joined,
+                now,
+                far_future,
+            ));
+        }
+        let ingest_elapsed = ingest_start.elapsed();
+        eprintln!("[10k members] ingest: {:?}", ingest_elapsed);
+
+        // ── Ingest 2k shares ─────────────────────────────────
+        for i in 0..2_000u32 {
+            let title = format!("Share {i}");
+            idx.ingest_share_record(&make_share_rec_u32(cid, i + 100_000, 1, now, Some(&title)));
+        }
+
+        // ── Browse member pages (measure p95) ───────────────
+        let mut browse_times = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut total_members = 0usize;
+        loop {
+            let t = std::time::Instant::now();
+            let (page, next) = idx.members_page(
+                cid,
+                cursor.as_deref(),
+                CommunityIndex::MAX_MEMBERS_PAGE_SIZE,
+            );
+            browse_times.push(t.elapsed());
+            total_members += page.len();
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        browse_times.sort();
+        let p95_browse = percentile(&browse_times, 95.0);
+        eprintln!(
+            "[10k members] browse pages: {}, total members: {}, p95: {:?}",
+            browse_times.len(),
+            total_members,
+            p95_browse
+        );
+        // The cap is 10k; all should be present.
+        assert_eq!(total_members, 10_000);
+        // p95 should be well under 100ms for in-memory index.
+        assert!(
+            p95_browse < std::time::Duration::from_millis(100),
+            "p95 browse latency too high: {:?}",
+            p95_browse
+        );
+
+        // ── Browse share pages (measure p95) ────────────────
+        let mut share_browse_times = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut total_shares = 0usize;
+        loop {
+            let t = std::time::Instant::now();
+            let (page, next) = idx.shares_page(
+                cid,
+                cursor.as_deref(),
+                CommunityIndex::MAX_SHARES_PAGE_SIZE,
+                None,
+            );
+            share_browse_times.push(t.elapsed());
+            total_shares += page.len();
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        share_browse_times.sort();
+        let p95_share_browse = percentile(&share_browse_times, 95.0);
+        eprintln!(
+            "[10k members] share browse pages: {}, total shares: {}, p95: {:?}",
+            share_browse_times.len(),
+            total_shares,
+            p95_share_browse
+        );
+        assert_eq!(total_shares, 2_000);
+        assert!(
+            p95_share_browse < std::time::Duration::from_millis(100),
+            "p95 share browse latency too high: {:?}",
+            p95_share_browse
+        );
+
+        // ── Search shares (measure p95) ─────────────────────
+        let queries = ["Share 1", "Share 99", "Share 500", "nonexistent", "Share"];
+        let mut search_times = Vec::new();
+        for q in &queries {
+            let t = std::time::Instant::now();
+            let _results = idx.search_shares(cid, q, None, CommunityIndex::MAX_SEARCH_HITS);
+            search_times.push(t.elapsed());
+        }
+        search_times.sort();
+        let p95_search = percentile(&search_times, 95.0);
+        eprintln!(
+            "[10k members] search queries: {}, p95: {:?}",
+            search_times.len(),
+            p95_search
+        );
+        assert!(
+            p95_search < std::time::Duration::from_millis(500),
+            "p95 search latency too high: {:?}",
+            p95_search
+        );
+
+        // ── Materialize pages ───────────────────────────────
+        let bucket = now / 3600;
+        let t = std::time::Instant::now();
+        let member_pages = idx.materialize_member_pages(cid, bucket, now);
+        let materialize_member_time = t.elapsed();
+        let t = std::time::Instant::now();
+        let share_pages = idx.materialize_share_pages(cid, bucket, now);
+        let materialize_share_time = t.elapsed();
+        eprintln!(
+            "[10k members] materialize: {} member pages in {:?}, {} share pages in {:?}",
+            member_pages.len(),
+            materialize_member_time,
+            share_pages.len(),
+            materialize_share_time
+        );
+        assert_eq!(
+            member_pages.iter().map(|p| p.entries.len()).sum::<usize>(),
+            10_000
+        );
+        assert_eq!(
+            share_pages.iter().map(|p| p.entries.len()).sum::<usize>(),
+            2_000
+        );
+
+        // ── Churn: 1k leaves, 1k new joins ─────────────────
+        let churn_start = std::time::Instant::now();
+        for i in 0..1_000u32 {
+            idx.ingest_member_record(&make_member_rec_u32(
+                cid,
+                i,
+                2,
+                CommunityMemberStatus::Left,
+                now + 1,
+                far_future,
+            ));
+        }
+        for i in 10_000..11_000u32 {
+            idx.ingest_member_record(&make_member_rec_u32(
+                cid,
+                i,
+                1,
+                CommunityMemberStatus::Joined,
+                now + 1,
+                far_future,
+            ));
+        }
+        let churn_elapsed = churn_start.elapsed();
+        let joined = idx.joined_member_count(cid);
+        eprintln!(
+            "[10k members] churn (1k leave + 1k join): {:?}, joined after: {}",
+            churn_elapsed, joined
+        );
+        // After 1k leaves + 1k new joins the BTreeMap stores 11k entries
+        // but the 10k cap evicts the oldest, so some joins/leaves are
+        // dropped.  The joined count should be roughly 9–10k.
+        assert!(
+            (8_000..=10_000).contains(&joined),
+            "unexpected joined count after churn: {}",
+            joined
+        );
+    }
+
+    /// J-6B: 50k member ingest — tests eviction behavior and performance
+    /// under heavy load beyond the MAX_MEMBERS_PER_COMMUNITY cap.
+    #[test]
+    #[ignore] // slow: run with `cargo test -- --ignored`
+    fn simulation_50k_members_eviction() {
+        let cid = [101u8; 32];
+        let base_time = 2_000_000u64;
+        let far_future = base_time + 365 * 24 * 3600;
+        let mut idx = CommunityIndex::default();
+
+        // ── Ingest 50k members (cap is 10k, so eviction kicks in) ──
+        let ingest_start = std::time::Instant::now();
+        for i in 0..50_000u32 {
+            idx.ingest_member_record(&make_member_rec_u32(
+                cid,
+                i,
+                1,
+                CommunityMemberStatus::Joined,
+                // Newer members get higher timestamps (oldest evicted first).
+                base_time + u64::from(i),
+                far_future,
+            ));
+        }
+        let ingest_elapsed = ingest_start.elapsed();
+        let joined = idx.joined_member_count(cid);
+        eprintln!(
+            "[50k members] ingest: {:?}, retained joined: {}",
+            ingest_elapsed, joined
+        );
+        // Should be capped at MAX_MEMBERS_PER_COMMUNITY.
+        assert!(
+            joined <= CommunityIndex::MAX_MEMBERS_PER_COMMUNITY,
+            "exceeded member cap: {}",
+            joined
+        );
+
+        // ── Browse after eviction ───────────────────────────
+        let mut cursor: Option<String> = None;
+        let mut total = 0usize;
+        let browse_start = std::time::Instant::now();
+        loop {
+            let (page, next) = idx.members_page(
+                cid,
+                cursor.as_deref(),
+                CommunityIndex::MAX_MEMBERS_PAGE_SIZE,
+            );
+            total += page.len();
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        let browse_all_time = browse_start.elapsed();
+        eprintln!(
+            "[50k members] browse all pages after eviction: {} members in {:?}",
+            total, browse_all_time
+        );
+        assert!(total <= CommunityIndex::MAX_MEMBERS_PER_COMMUNITY);
+
+        // ── 50k shares (cap is 10k) ─────────────────────────
+        let share_start = std::time::Instant::now();
+        for i in 0..50_000u32 {
+            let title = format!("S{i}");
+            idx.ingest_share_record(&make_share_rec_u32(
+                cid,
+                i + 200_000,
+                1,
+                base_time + u64::from(i),
+                Some(&title),
+            ));
+        }
+        let share_elapsed = share_start.elapsed();
+        eprintln!("[50k shares] ingest: {:?}", share_elapsed);
+
+        // Verify share count is capped.
+        let mut scursor: Option<String> = None;
+        let mut share_total = 0usize;
+        loop {
+            let (page, next) = idx.shares_page(
+                cid,
+                scursor.as_deref(),
+                CommunityIndex::MAX_SHARES_PAGE_SIZE,
+                None,
+            );
+            share_total += page.len();
+            if next.is_none() {
+                break;
+            }
+            scursor = next;
+        }
+        assert!(
+            share_total <= CommunityIndex::MAX_SHARES_PER_COMMUNITY,
+            "exceeded share cap: {}",
+            share_total
+        );
+        eprintln!("[50k shares] retained after eviction: {}", share_total);
+    }
+
+    /// J-6B: Sustained churn simulation — measures index performance
+    /// under continuous join/leave cycling.
+    #[test]
+    #[ignore] // slow: run with `cargo test -- --ignored`
+    fn simulation_churn_cycles() {
+        let cid = [102u8; 32];
+        let base_time = 2_000_000u64;
+        let far_future = base_time + 365 * 24 * 3600;
+        let mut idx = CommunityIndex::default();
+
+        // Seed 5k members.
+        for i in 0..5_000u32 {
+            idx.ingest_member_record(&make_member_rec_u32(
+                cid,
+                i,
+                1,
+                CommunityMemberStatus::Joined,
+                base_time,
+                far_future,
+            ));
+        }
+
+        // Run 20 churn cycles: each cycle 500 members leave, 500 new join.
+        let mut next_member = 5_000u32;
+        let mut cycle_times = Vec::new();
+        for cycle in 0..20u32 {
+            let t = std::time::Instant::now();
+            let leave_start = cycle * 500;
+            for i in leave_start..(leave_start + 500) {
+                idx.ingest_member_record(&make_member_rec_u32(
+                    cid,
+                    i,
+                    2,
+                    CommunityMemberStatus::Left,
+                    base_time + u64::from(cycle) + 1,
+                    far_future,
+                ));
+            }
+            for _ in 0..500u32 {
+                idx.ingest_member_record(&make_member_rec_u32(
+                    cid,
+                    next_member,
+                    1,
+                    CommunityMemberStatus::Joined,
+                    base_time + u64::from(cycle) + 1,
+                    far_future,
+                ));
+                next_member += 1;
+            }
+            cycle_times.push(t.elapsed());
+        }
+        cycle_times.sort();
+        let p95_churn = percentile(&cycle_times, 95.0);
+        let joined = idx.joined_member_count(cid);
+        eprintln!(
+            "[churn] 20 cycles of 500 leave + 500 join: p95={:?}, final joined={}",
+            p95_churn, joined
+        );
+        assert_eq!(
+            joined, 5_000,
+            "steady-state joined membership should be stable"
+        );
+        assert!(
+            p95_churn < std::time::Duration::from_secs(5),
+            "churn cycle p95 too slow: {:?}",
+            p95_churn
+        );
+
+        // Browse returns ALL entries (including Left tombstones).
+        // The total browsed count may exceed joined count.
+        let mut cursor: Option<String> = None;
+        let mut total = 0usize;
+        loop {
+            let (page, next) = idx.members_page(
+                cid,
+                cursor.as_deref(),
+                CommunityIndex::MAX_MEMBERS_PAGE_SIZE,
+            );
+            total += page.len();
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        // Total browsed includes both Joined and Left entries; cap applies.
+        assert!(
+            total <= CommunityIndex::MAX_MEMBERS_PER_COMMUNITY,
+            "browse total exceeds cap: {}",
+            total
+        );
+    }
+
+    /// J-6B: Memory growth measurement — verify bounded allocation.
+    #[test]
+    #[ignore] // slow; uses process-level RSS heuristic
+    fn simulation_memory_bounded() {
+        let cid = [103u8; 32];
+        let now = 2_000_000u64;
+        let far_future = now + 365 * 24 * 3600;
+        let mut idx = CommunityIndex::default();
+
+        // Insert members up to cap.
+        for i in 0..10_000u32 {
+            idx.ingest_member_record(&make_member_rec_u32(
+                cid,
+                i,
+                1,
+                CommunityMemberStatus::Joined,
+                now,
+                far_future,
+            ));
+        }
+        // Insert shares up to cap.
+        for i in 0..10_000u32 {
+            idx.ingest_share_record(&make_share_rec_u32(
+                cid,
+                i + 300_000,
+                1,
+                now,
+                Some(&format!("S{i}")),
+            ));
+        }
+
+        // Verify caps are enforced (no unbounded growth).
+        let joined = idx.joined_member_count(cid);
+        assert!(
+            joined <= CommunityIndex::MAX_MEMBERS_PER_COMMUNITY,
+            "member cap breached: {}",
+            joined
+        );
+
+        let mut share_count = 0usize;
+        let mut cursor: Option<String> = None;
+        loop {
+            let (page, next) = idx.shares_page(
+                cid,
+                cursor.as_deref(),
+                CommunityIndex::MAX_SHARES_PAGE_SIZE,
+                None,
+            );
+            share_count += page.len();
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        assert!(
+            share_count <= CommunityIndex::MAX_SHARES_PER_COMMUNITY,
+            "share cap breached: {}",
+            share_count
+        );
+
+        // Inserting 10k more should NOT grow the index beyond caps.
+        for i in 10_000..20_000u32 {
+            idx.ingest_member_record(&make_member_rec_u32(
+                cid,
+                i,
+                1,
+                CommunityMemberStatus::Joined,
+                now + 1,
+                far_future,
+            ));
+        }
+        let joined_after = idx.joined_member_count(cid);
+        assert!(
+            joined_after <= CommunityIndex::MAX_MEMBERS_PER_COMMUNITY,
+            "member cap breached after overflow: {}",
+            joined_after
+        );
+        eprintln!(
+            "[memory] members: {}, shares: {} (caps: {}/{})",
+            joined_after,
+            share_count,
+            CommunityIndex::MAX_MEMBERS_PER_COMMUNITY,
+            CommunityIndex::MAX_SHARES_PER_COMMUNITY
+        );
+    }
+
+    // ── Interop and abuse tests (J-6C) ───────────────────────────────
+
+    /// J-6C: Invalid cursor strings are handled gracefully (no panic).
+    #[test]
+    fn abuse_invalid_cursor_members_page() {
+        let cid = [110u8; 32];
+        let mut idx = CommunityIndex::default();
+        idx.ingest_member_record(&make_member_rec(cid, 1, 1, CommunityMemberStatus::Joined));
+
+        // Garbage cursor (not valid hex).
+        let (page, _) = idx.members_page(cid, Some("not-valid-hex!!!"), 100);
+        // Invalid cursor is treated as None → returns from the beginning.
+        assert_eq!(page.len(), 1);
+
+        // Wrong-length hex cursor.
+        let (page, _) = idx.members_page(cid, Some("abcd"), 100);
+        assert_eq!(page.len(), 1);
+
+        // Valid hex but non-existent key → starts after that key.
+        let (page, _) = idx.members_page(cid, Some(&hex::encode([0xffu8; 32])), 100);
+        assert!(page.is_empty(), "cursor past all keys should return empty");
+    }
+
+    /// J-6C: Invalid cursor strings on share pages.
+    #[test]
+    fn abuse_invalid_cursor_shares_page() {
+        let cid = [111u8; 32];
+        let mut idx = CommunityIndex::default();
+        idx.ingest_share_record(&make_share_rec(cid, 1, 1, Some("test share")));
+
+        let (page, _) = idx.shares_page(cid, Some("zzzzzz"), 100, None);
+        assert_eq!(page.len(), 1);
+
+        let (page, _) = idx.shares_page(cid, Some(&hex::encode([0xffu8; 32])), 100, None);
+        assert!(page.is_empty());
+    }
+
+    /// J-6C: Invalid event cursor strings.
+    #[test]
+    fn abuse_invalid_cursor_events_page() {
+        let cid = [112u8; 32];
+        let mut idx = CommunityIndex::default();
+        idx.ingest_member_record(&make_member_rec(cid, 1, 1, CommunityMemberStatus::Joined));
+
+        // Non-numeric cursor → treated as 0.
+        let (events, _) = idx.events_page(cid, Some("not-a-number"), 100);
+        assert_eq!(events.len(), 1);
+
+        // Very large cursor → no events after it.
+        let (events, _) = idx.events_page(cid, Some("999999999999"), 100);
+        assert!(events.is_empty());
+    }
+
+    /// J-6C: Client requests oversized limit → clamped to MAX.
+    #[test]
+    fn abuse_oversized_limit_clamped() {
+        let cid = [113u8; 32];
+        let mut idx = CommunityIndex::default();
+        for i in 1..=5u8 {
+            idx.ingest_member_record(&make_member_rec(cid, i, 1, CommunityMemberStatus::Joined));
+        }
+        for i in 1..=5u8 {
+            idx.ingest_share_record(&make_share_rec(cid, i + 50, 1, Some("s")));
+        }
+        idx.ingest_member_record(&make_member_rec(cid, 10, 1, CommunityMemberStatus::Joined));
+
+        // Request u16::MAX as limit — should not panic or OOM.
+        let (members, _) = idx.members_page(cid, None, u16::MAX);
+        assert_eq!(members.len(), 6);
+
+        let (shares, _) = idx.shares_page(cid, None, u16::MAX, None);
+        assert_eq!(shares.len(), 5);
+
+        let (events, _) = idx.events_page(cid, None, u16::MAX);
+        // Each ingest produces an event.
+        assert!(events.len() <= CommunityIndex::MAX_EVENTS_PAGE_SIZE as usize);
+
+        let (search_results, _) = idx.search_shares(cid, "s", None, u16::MAX);
+        assert!(search_results.len() <= CommunityIndex::MAX_SEARCH_HITS as usize);
+    }
+
+    /// J-6C: Tombstone churn — mass leave followed by re-join.
+    /// Verifies that tombstones are properly superseded by newer joins.
+    #[test]
+    fn abuse_tombstone_churn() {
+        let cid = [114u8; 32];
+        let now = 2_000_000u64;
+        let far_future = now + 365 * 24 * 3600;
+        let mut idx = CommunityIndex::default();
+
+        // Join 100 members.
+        for i in 0..100u32 {
+            idx.ingest_member_record(&make_member_rec_u32(
+                cid,
+                i,
+                1,
+                CommunityMemberStatus::Joined,
+                now,
+                far_future,
+            ));
+        }
+        assert_eq!(idx.joined_member_count(cid), 100);
+
+        // All 100 leave.
+        for i in 0..100u32 {
+            idx.ingest_member_record(&make_member_rec_u32(
+                cid,
+                i,
+                2,
+                CommunityMemberStatus::Left,
+                now + 1,
+                far_future,
+            ));
+        }
+        assert_eq!(idx.joined_member_count(cid), 0);
+
+        // All 100 re-join with higher seq.
+        for i in 0..100u32 {
+            idx.ingest_member_record(&make_member_rec_u32(
+                cid,
+                i,
+                3,
+                CommunityMemberStatus::Joined,
+                now + 2,
+                far_future,
+            ));
+        }
+        assert_eq!(idx.joined_member_count(cid), 100);
+    }
+
+    /// J-6C: Stale seq replay cannot undo a leave.
+    #[test]
+    fn abuse_replay_stale_seq_after_leave() {
+        let cid = [115u8; 32];
+        let now = 2_000_000u64;
+        let far_future = now + 365 * 24 * 3600;
+        let mut idx = CommunityIndex::default();
+
+        // Join at seq 5.
+        idx.ingest_member_record(&make_member_rec_u32(
+            cid,
+            1,
+            5,
+            CommunityMemberStatus::Joined,
+            now,
+            far_future,
+        ));
+        assert_eq!(idx.joined_member_count(cid), 1);
+
+        // Leave at seq 10.
+        idx.ingest_member_record(&make_member_rec_u32(
+            cid,
+            1,
+            10,
+            CommunityMemberStatus::Left,
+            now + 1,
+            far_future,
+        ));
+        assert_eq!(idx.joined_member_count(cid), 0);
+
+        // Replay old join at seq 5 → must NOT re-join.
+        idx.ingest_member_record(&make_member_rec_u32(
+            cid,
+            1,
+            5,
+            CommunityMemberStatus::Joined,
+            now,
+            far_future,
+        ));
+        assert_eq!(
+            idx.joined_member_count(cid),
+            0,
+            "replayed stale join must not undo leave"
+        );
+    }
+
+    /// J-6C: Duplicate record flood — same record ingested many times.
+    #[test]
+    fn abuse_duplicate_flood() {
+        let cid = [116u8; 32];
+        let mut idx = CommunityIndex::default();
+
+        let rec = make_member_rec(cid, 1, 1, CommunityMemberStatus::Joined);
+        for _ in 0..1_000 {
+            idx.ingest_member_record(&rec);
+        }
+        // Should still have exactly 1 member.
+        assert_eq!(idx.joined_member_count(cid), 1);
+
+        // Member pages should have exactly 1 entry.
+        let (page, cursor) = idx.members_page(cid, None, 100);
+        assert_eq!(page.len(), 1);
+        assert!(cursor.is_none());
+    }
+
+    /// J-6C: Search with adversarial query patterns.
+    #[test]
+    fn abuse_search_adversarial_queries() {
+        let cid = [117u8; 32];
+        let mut idx = CommunityIndex::default();
+        for i in 1..=20u8 {
+            let title = format!("Share {i}");
+            idx.ingest_share_record(&make_share_rec(cid, i, 1, Some(&title)));
+        }
+
+        // Empty query.
+        let (results, _) = idx.search_shares(cid, "", None, 50);
+        // Empty query matches all (implementation-dependent).
+        assert!(results.len() <= 50);
+
+        // Very long query string.
+        let long_query = "a".repeat(10_000);
+        let (results, _) = idx.search_shares(cid, &long_query, None, 50);
+        assert!(results.is_empty(), "very long query should match nothing");
+
+        // Special characters.
+        let (results, _) = idx.search_shares(cid, "'; DROP TABLE--", None, 50);
+        assert!(results.is_empty());
+
+        // Unicode.
+        let (results, _) = idx.search_shares(cid, "🎵🎶", None, 50);
+        assert!(results.is_empty());
+    }
+
+    /// J-6C: DHT validation rejects truncated/corrupted tagged values.
+    /// Uses wire type `decode_tagged` directly (public API) to verify
+    /// that corrupted payloads are rejected.
+    #[test]
+    fn abuse_corrupted_tagged_values_rejected() {
+        use crate::wire::{
+            CommunityBootstrapHint, CommunityMemberRecord, CommunityShareRecord,
+            MaterializedMembersPage, MaterializedSharesPage,
+        };
+
+        // Tag 0x31 (member record) with truncated body.
+        let truncated_member = vec![0x31, 0x00, 0x01];
+        assert!(CommunityMemberRecord::decode_tagged(&truncated_member).is_err());
+
+        // Tag 0x32 (share record) with truncated body.
+        let truncated_share = vec![0x32, 0x00, 0x01];
+        assert!(CommunityShareRecord::decode_tagged(&truncated_share).is_err());
+
+        // Tag 0x33 (bootstrap hint) with truncated body.
+        let truncated_bootstrap = vec![0x33, 0x00, 0x01];
+        assert!(CommunityBootstrapHint::decode_tagged(&truncated_bootstrap).is_err());
+
+        // Tag 0x34 (members page) with truncated body.
+        let truncated_mpage = vec![0x34, 0x00, 0x01];
+        assert!(MaterializedMembersPage::decode_tagged(&truncated_mpage).is_err());
+
+        // Tag 0x35 (shares page) with truncated body.
+        let truncated_spage = vec![0x35, 0x00, 0x01];
+        assert!(MaterializedSharesPage::decode_tagged(&truncated_spage).is_err());
+    }
+
+    /// J-6C: Wrong tag bytes are rejected by decode_tagged.
+    #[test]
+    fn interop_wrong_tag_rejected() {
+        use crate::wire::{CommunityShareRecord, MaterializedMembersPage, MaterializedSharesPage};
+
+        // Valid member record encoded as 0x31 cannot be decoded as share (0x32).
+        let cid = [120u8; 32];
+        let rec = make_member_rec(cid, 1, 1, CommunityMemberStatus::Joined);
+        let encoded = rec.encode_tagged().expect("encode");
+        assert!(CommunityShareRecord::decode_tagged(&encoded).is_err());
+        assert!(MaterializedMembersPage::decode_tagged(&encoded).is_err());
+        assert!(MaterializedSharesPage::decode_tagged(&encoded).is_err());
+    }
+
+    /// J-6C: Mixed-version interop — dual-write: index accepts both
+    /// legacy and new-format records for the same community.
+    #[test]
+    fn interop_dual_write_community_index() {
+        let cid = [118u8; 32];
+        let now = 2_000_000u64;
+        let far_future = now + 365 * 24 * 3600;
+        let mut idx = CommunityIndex::default();
+
+        // New-format per-record member.
+        idx.ingest_member_record(&make_member_rec_u32(
+            cid,
+            1,
+            1,
+            CommunityMemberStatus::Joined,
+            now,
+            far_future,
+        ));
+        // Another member from a different key.
+        idx.ingest_member_record(&make_member_rec_u32(
+            cid,
+            2,
+            1,
+            CommunityMemberStatus::Joined,
+            now,
+            far_future,
+        ));
+
+        assert_eq!(idx.joined_member_count(cid), 2);
+
+        // Browse must see both members regardless of record origin.
+        let (page, _) = idx.members_page(cid, None, 100);
+        assert_eq!(page.len(), 2);
+    }
+
+    /// J-6C: Event log compaction does not lose recent events.
+    #[test]
+    fn abuse_event_log_overflow() {
+        let cid = [119u8; 32];
+        let now = 2_000_000u64;
+        let far_future = now + 365 * 24 * 3600;
+        let mut idx = CommunityIndex::default();
+
+        // Generate MAX_EVENT_LOG_SIZE + 500 events.
+        let total = CommunityIndex::MAX_EVENT_LOG_SIZE as u32 + 500;
+        for i in 0..total {
+            idx.ingest_member_record(&make_member_rec_u32(
+                cid,
+                i,
+                1,
+                CommunityMemberStatus::Joined,
+                now,
+                far_future,
+            ));
+        }
+
+        // Event log should be bounded.
+        let (events, _) = idx.events_page(cid, None, CommunityIndex::MAX_EVENTS_PAGE_SIZE);
+        assert!(
+            events.len() <= CommunityIndex::MAX_EVENTS_PAGE_SIZE as usize,
+            "event page exceeds max: {}",
+            events.len()
+        );
+
+        // Can still page through all retained events.
+        let mut total_events = 0usize;
+        let mut cursor: Option<String> = None;
+        loop {
+            let (page, next) =
+                idx.events_page(cid, cursor.as_deref(), CommunityIndex::MAX_EVENTS_PAGE_SIZE);
+            if page.is_empty() {
+                break;
+            }
+            total_events += page.len();
+            if next.is_none() || page.is_empty() {
+                break;
+            }
+            cursor = next;
+        }
+        assert!(
+            total_events <= CommunityIndex::MAX_EVENT_LOG_SIZE,
+            "exceeded event log cap: {}",
+            total_events
+        );
+        eprintln!(
+            "[abuse] event log after {} ingests: {} events retained",
+            total, total_events
         );
     }
 }

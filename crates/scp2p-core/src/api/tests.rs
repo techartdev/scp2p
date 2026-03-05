@@ -4862,7 +4862,8 @@ async fn peer_reputation_initial_reputations_seeded_in_policy() {
 
 // ── Community DHT discovery ───────────────────────────────────────────────
 
-/// Community member DHT entries pass validation and can be stored/retrieved.
+/// Community member DHT entries are rejected — legacy unsigned blobs no longer
+/// accepted (§15-Security: unauthenticated blobs can be forged by any peer).
 #[tokio::test]
 async fn community_members_dht_store_and_find() {
     let handle = Node::start(NodeConfig::default())
@@ -4891,14 +4892,11 @@ async fn community_members_dht_store_and_find() {
             ttl_secs: 3600,
         })
         .await
-        .expect("valid community members entry must be accepted");
+        .expect_err("unsigned CommunityMembers must be rejected (forgeability risk)");
 
+    // Nothing was stored, so find should return None.
     let found = handle.dht_find_value(key).await.expect("find_value");
-    assert!(found.is_some(), "should find stored community members");
-    let found_cm: crate::wire::CommunityMembers =
-        crate::cbor::from_slice(&found.unwrap().value).expect("decode");
-    assert_eq!(found_cm.members.len(), 1);
-    assert_eq!(found_cm.members[0], addr);
+    assert!(found.is_none(), "no entry should exist after rejected store");
 }
 
 /// Storing a CommunityMembers value at a mismatched key is rejected.
@@ -4924,7 +4922,7 @@ async fn community_members_dht_rejects_wrong_key() {
         .expect_err("community members at wrong key must be rejected");
 }
 
-/// dht_store merges incoming CommunityMembers with existing member list.
+/// dht_store rejects unsigned CommunityMembers — no merge occurs.
 #[tokio::test]
 async fn community_members_dht_merge_on_store() {
     let handle = Node::start(NodeConfig::default())
@@ -4948,7 +4946,6 @@ async fn community_members_dht_merge_on_store() {
         relay_via: None,
     };
 
-    // Store first entry with member A.
     let cm1 = crate::wire::CommunityMembers {
         community_share_id,
         members: vec![addr_a.clone()],
@@ -4961,9 +4958,8 @@ async fn community_members_dht_merge_on_store() {
             ttl_secs: 3600,
         })
         .await
-        .expect("store first");
+        .expect_err("unsigned CommunityMembers must be rejected");
 
-    // Store second entry with member B — should merge.
     let cm2 = crate::wire::CommunityMembers {
         community_share_id,
         members: vec![addr_b.clone()],
@@ -4976,19 +4972,11 @@ async fn community_members_dht_merge_on_store() {
             ttl_secs: 3600,
         })
         .await
-        .expect("store second");
+        .expect_err("unsigned CommunityMembers must be rejected");
 
-    let found = handle.dht_find_value(key).await.expect("find").unwrap();
-    let merged: crate::wire::CommunityMembers =
-        crate::cbor::from_slice(&found.value).expect("decode");
-    assert_eq!(
-        merged.members.len(),
-        2,
-        "should have both members after merge"
-    );
-    assert!(merged.members.contains(&addr_a));
-    assert!(merged.members.contains(&addr_b));
-    assert_eq!(merged.updated_at, 200, "updated_at should be max of both");
+    // Nothing was stored — no merged entry exists.
+    let found = handle.dht_find_value(key).await.expect("find");
+    assert!(found.is_none(), "no entry should exist after rejected stores");
 }
 
 /// upsert_community_member adds the node to the community DHT entry.
@@ -5026,4 +5014,195 @@ async fn upsert_community_member_roundtrip() {
     let cm2: crate::wire::CommunityMembers =
         crate::cbor::from_slice(&found2.value).expect("decode");
     assert_eq!(cm2.members.len(), 1, "should not duplicate");
+}
+
+// ── §15.5 Materialized community page validation ──────────────────────────
+
+#[tokio::test]
+async fn dht_validator_accepts_materialized_members_page() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+    let cid = [0xAA; 32];
+    let bucket = 12345u64;
+    let page = crate::wire::MaterializedMembersPage {
+        community_id: cid,
+        bucket,
+        page_no: 0,
+        total_pages: 1,
+        entries: vec![crate::wire::CommunityMemberSummary {
+            member_node_pubkey: [0xBB; 32],
+            status: crate::wire::CommunityMemberStatus::Joined,
+            announce_seq: 1,
+            addr: None,
+        }],
+        built_at: 1_700_000_000,
+    };
+    let key = crate::dht_keys::community_members_page_key(&cid, bucket, 0);
+    let encoded = page.encode_tagged().expect("encode");
+    handle
+        .dht_store(WireStore {
+            key,
+            value: encoded,
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("valid materialized members page should be accepted");
+}
+
+#[tokio::test]
+async fn dht_validator_rejects_materialized_members_page_at_wrong_key() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+    let cid = [0xAA; 32];
+    let page = crate::wire::MaterializedMembersPage {
+        community_id: cid,
+        bucket: 100,
+        page_no: 0,
+        total_pages: 1,
+        entries: vec![],
+        built_at: 100,
+    };
+    let wrong_key = [0u8; 32];
+    let encoded = page.encode_tagged().expect("encode");
+    handle
+        .dht_store(WireStore {
+            key: wrong_key,
+            value: encoded,
+            ttl_secs: 3600,
+        })
+        .await
+        .expect_err("materialized members page at wrong key must be rejected");
+}
+
+#[tokio::test]
+async fn dht_validator_accepts_materialized_shares_page() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+    let cid = [0xCC; 32];
+    let bucket = 99999u64;
+    let page = crate::wire::MaterializedSharesPage {
+        community_id: cid,
+        bucket,
+        page_no: 0,
+        total_pages: 1,
+        entries: vec![crate::wire::CommunityShareSummary {
+            share_id: [0xDD; 32],
+            share_pubkey: [0xEE; 32],
+            latest_seq: 5,
+            title: Some("test".into()),
+            description: None,
+            updated_at: 1_700_000_000,
+        }],
+        built_at: 1_700_000_000,
+    };
+    let key = crate::dht_keys::community_shares_page_key(&cid, bucket, 0);
+    let encoded = page.encode_tagged().expect("encode");
+    handle
+        .dht_store(WireStore {
+            key,
+            value: encoded,
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("valid materialized shares page should be accepted");
+}
+
+#[tokio::test]
+async fn dht_validator_rejects_materialized_shares_page_at_wrong_key() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+    let cid = [0xCC; 32];
+    let page = crate::wire::MaterializedSharesPage {
+        community_id: cid,
+        bucket: 100,
+        page_no: 0,
+        total_pages: 1,
+        entries: vec![],
+        built_at: 100,
+    };
+    let wrong_key = [0xFF; 32];
+    let encoded = page.encode_tagged().expect("encode");
+    handle
+        .dht_store(WireStore {
+            key: wrong_key,
+            value: encoded,
+            ttl_secs: 3600,
+        })
+        .await
+        .expect_err("materialized shares page at wrong key must be rejected");
+}
+
+#[tokio::test]
+async fn publish_materialized_community_pages() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+    let cid = [0x50; 32];
+
+    // Use the real wall-clock time so records are not expired.
+    let now: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let far_future = now + 3600 * 24 * 365;
+
+    // Ingest some member and share records so the index has data.
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x60; 32]);
+    let member_rec = crate::wire::CommunityMemberRecord::new_signed(
+        &signing_key,
+        cid,
+        1,
+        crate::wire::CommunityMemberStatus::Joined,
+        now,
+        far_future,
+    )
+    .expect("member rec");
+    {
+        let mut state = handle.state.write().await;
+        state.community_index.ingest_member_record(&member_rec);
+    }
+
+    let share_key = ed25519_dalek::SigningKey::from_bytes(&[0x70; 32]);
+    let share_rec = crate::wire::CommunityShareRecord::new_signed(
+        &share_key,
+        cid,
+        [0u8; 32],
+        1,
+        now,
+        Some("Test Share".to_string()),
+        None,
+    )
+    .expect("share rec");
+    {
+        let mut state = handle.state.write().await;
+        state.community_index.ingest_share_record(&share_rec);
+    }
+
+    // Publish materialized pages.
+    let count = handle
+        .publish_materialized_community_pages()
+        .await
+        .expect("publish");
+    assert!(
+        count >= 2,
+        "should publish at least 1 member page + 1 share page, got {count}"
+    );
+
+    // Verify the pages are stored in the local DHT using the same
+    // bucket the publisher would have computed.
+    let bucket = crate::dht_keys::materialized_bucket(now);
+    let members_key = crate::dht_keys::community_members_page_key(&cid, bucket, 0);
+    let found = handle.dht_find_value(members_key).await.expect("find");
+    assert!(
+        found.is_some(),
+        "materialized members page should be in DHT"
+    );
+
+    let shares_key = crate::dht_keys::community_shares_page_key(&cid, bucket, 0);
+    let found = handle.dht_find_value(shares_key).await.expect("find");
+    assert!(found.is_some(), "materialized shares page should be in DHT");
 }
