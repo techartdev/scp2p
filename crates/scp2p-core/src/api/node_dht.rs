@@ -6,12 +6,18 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //! DHT operations on `NodeHandle`: local and iterative find/store, republish loops.
 
-use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 
 use ed25519_dalek::SigningKey;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::transport_net::{
     QuicServerHandle, TlsServerHandle, quic_accept_bi_session, tls_accept_session,
@@ -413,44 +419,7 @@ impl NodeHandle {
         // after the original publisher goes offline.
         let _ = self.reannounce_subscribed_share_heads().await;
 
-        // Re-insert community membership entries so they survive app
-        // restarts.  The DHT is ephemeral and only share heads are
-        // restored from the database; community member entries must be
-        // re-created on every republish cycle.
-        {
-            let community_ids: Vec<[u8; 32]> = {
-                let state = self.state.read().await;
-                state.communities.keys().copied().collect()
-            };
-            if !community_ids.is_empty() {
-                let now = now_unix_secs().unwrap_or(0);
-                for cid in community_ids {
-                    let key = community_info_key(&ShareId(cid));
-                    let has_entry = {
-                        let mut state = self.state.write().await;
-                        state.dht.find_value(key, now).is_some()
-                    };
-                    if !has_entry {
-                        // No entry yet (e.g. after restart): create a
-                        // placeholder so the republish pushes it to the
-                        // relay.  The relay tunnel task will update the
-                        // address once the tunnel is registered.
-                        let cm = CommunityMembers {
-                            community_share_id: cid,
-                            members: vec![],
-                            updated_at: now,
-                        };
-                        if let Ok(encoded) = crate::cbor::to_vec(&cm) {
-                            let mut state = self.state.write().await;
-                            let _ = state.dht.store(key, encoded, DEFAULT_TTL_SECS, now);
-                        }
-                    }
-                }
-            }
-        }
-
-        // §15 per-member records: keep signed per-member records fresh
-        // alongside the legacy CommunityMembers blobs above.
+        // §15 per-member records: keep signed per-member records fresh.
         let _ = self.reannounce_community_member_records().await;
 
         let now = now_unix_secs()?;
@@ -581,6 +550,10 @@ impl NodeHandle {
     /// The returned task listens on `bind_addr`, wraps every accepted
     /// TCP stream in a TLS session using the provided server handle,
     /// then runs the SCP2P handshake and dispatches messages.
+    ///
+    /// A global semaphore limits the total number of concurrently
+    /// serviced connections, and per-IP tracking rejects connection
+    /// storms from individual addresses (RA-01).
     pub fn start_tls_dht_service(
         self,
         bind_addr: SocketAddr,
@@ -589,6 +562,13 @@ impl NodeHandle {
         tls_server: Arc<TlsServerHandle>,
     ) -> JoinHandle<anyhow::Result<()>> {
         tokio::spawn(async move {
+            let cfg = self.state.read().await.runtime_config.clone();
+            let max_conns = cfg.max_concurrent_connections.max(1);
+            let max_per_ip = cfg.max_connections_per_ip.max(1);
+            let semaphore = Arc::new(Semaphore::new(max_conns));
+            let ip_counts: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>> =
+                Arc::new(std::sync::Mutex::new(HashMap::new()));
+
             let listener = TcpListener::bind(bind_addr).await?;
             let mut nonce_tracker = crate::transport::NonceTracker::new();
             loop {
@@ -604,6 +584,29 @@ impl NodeHandle {
                 let Ok((stream, session, remote_addr)) = accepted else {
                     continue;
                 };
+
+                // Global concurrency check.
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("TLS connection limit reached ({max_conns}), rejecting");
+                        continue;
+                    }
+                };
+
+                // Per-IP concurrency check.
+                let ip = remote_addr.ip();
+                {
+                    let mut counts = ip_counts.lock().expect("ip_counts lock");
+                    let count = counts.entry(ip).or_insert(0);
+                    if *count >= max_per_ip {
+                        warn!(%ip, "per-IP TLS connection limit reached ({max_per_ip})");
+                        drop(permit);
+                        continue;
+                    }
+                    *count += 1;
+                }
+
                 let remote_peer = PeerAddr {
                     ip: remote_addr.ip(),
                     port: remote_addr.port(),
@@ -612,8 +615,20 @@ impl NodeHandle {
                     relay_via: None,
                 };
                 let node = self.clone();
+                let ip_counts_c = ip_counts.clone();
                 tokio::spawn(async move {
                     let _ = node.serve_wire_stream(stream, Some(remote_peer)).await;
+                    // Release per-IP counter.
+                    {
+                        let mut counts = ip_counts_c.lock().expect("ip_counts lock");
+                        if let Some(c) = counts.get_mut(&ip) {
+                            *c = c.saturating_sub(1);
+                            if *c == 0 {
+                                counts.remove(&ip);
+                            }
+                        }
+                    }
+                    drop(permit);
                 });
             }
         })
@@ -624,6 +639,10 @@ impl NodeHandle {
     /// The returned task accepts bidirectional QUIC streams on the
     /// given server endpoint, runs the SCP2P handshake, and dispatches
     /// messages.
+    ///
+    /// A global semaphore limits the total number of concurrently
+    /// serviced connections, and per-IP tracking rejects connection
+    /// storms from individual addresses (RA-01).
     pub fn start_quic_dht_service(
         self,
         quic_server: QuicServerHandle,
@@ -631,6 +650,13 @@ impl NodeHandle {
         capabilities: Capabilities,
     ) -> JoinHandle<anyhow::Result<()>> {
         tokio::spawn(async move {
+            let cfg = self.state.read().await.runtime_config.clone();
+            let max_conns = cfg.max_concurrent_connections.max(1);
+            let max_per_ip = cfg.max_connections_per_ip.max(1);
+            let semaphore = Arc::new(Semaphore::new(max_conns));
+            let ip_counts: Arc<std::sync::Mutex<HashMap<IpAddr, usize>>> =
+                Arc::new(std::sync::Mutex::new(HashMap::new()));
+
             let mut nonce_tracker = crate::transport::NonceTracker::new();
             loop {
                 let accepted = quic_accept_bi_session(
@@ -644,6 +670,29 @@ impl NodeHandle {
                 let Ok((stream, session, remote_addr)) = accepted else {
                     continue;
                 };
+
+                // Global concurrency check.
+                let permit = match semaphore.clone().try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        warn!("QUIC connection limit reached ({max_conns}), rejecting");
+                        continue;
+                    }
+                };
+
+                // Per-IP concurrency check.
+                let ip = remote_addr.ip();
+                {
+                    let mut counts = ip_counts.lock().expect("ip_counts lock");
+                    let count = counts.entry(ip).or_insert(0);
+                    if *count >= max_per_ip {
+                        warn!(%ip, "per-IP QUIC connection limit reached ({max_per_ip})");
+                        drop(permit);
+                        continue;
+                    }
+                    *count += 1;
+                }
+
                 let remote_peer = PeerAddr {
                     ip: remote_addr.ip(),
                     port: remote_addr.port(),
@@ -652,8 +701,20 @@ impl NodeHandle {
                     relay_via: None,
                 };
                 let node = self.clone();
+                let ip_counts_c = ip_counts.clone();
                 tokio::spawn(async move {
                     let _ = node.serve_wire_stream(stream, Some(remote_peer)).await;
+                    // Release per-IP counter.
+                    {
+                        let mut counts = ip_counts_c.lock().expect("ip_counts lock");
+                        if let Some(c) = counts.get_mut(&ip) {
+                            *c = c.saturating_sub(1);
+                            if *c == 0 {
+                                counts.remove(&ip);
+                            }
+                        }
+                    }
+                    drop(permit);
                 });
             }
         })
@@ -850,7 +911,7 @@ impl NodeHandle {
         };
         let expires_at = now + ttl;
 
-        let record = CommunityMemberRecord::new_signed(
+        let mut record = CommunityMemberRecord::new_signed(
             &signing_key,
             community_id,
             prev_seq + 1,
@@ -858,6 +919,18 @@ impl NodeHandle {
             now,
             expires_at,
         )?;
+        // Attach the publisher-issued membership token if we have one (§4.2).
+        // This lets peers that enforce token-gating accept our record as
+        // authorised by the community publisher.
+        {
+            let state = self.state.read().await;
+            if let Some(membership) = state.communities.get(&community_id)
+                && let Some(token) = &membership.token
+                && let Ok(token_bytes) = crate::cbor::to_vec(token)
+            {
+                record.auth_token_bytes = Some(serde_bytes::ByteBuf::from(token_bytes));
+            }
+        }
         let encoded = record.encode_tagged()?;
 
         let mut state = self.state.write().await;
@@ -997,6 +1070,159 @@ impl NodeHandle {
         );
         Ok(())
     }
+
+    // ── §15.5 materialized page publishing ──────────────────────────
+
+    /// Materialize the current community index into paged DHT values and
+    /// store them locally.
+    ///
+    /// For each known community, this produces compact member and share
+    /// pages tagged with the current time bucket and stores them under
+    /// their derived DHT keys.  A relay SHOULD call this periodically
+    /// (e.g. alongside `dht_republish_once`) so that clients can discover
+    /// community contents directly from the DHT.
+    ///
+    /// Returns the total number of pages published.
+    pub async fn publish_materialized_community_pages(&self) -> anyhow::Result<usize> {
+        use crate::dht_keys::{
+            community_members_page_key, community_shares_page_key, materialized_bucket,
+        };
+        let now = now_unix_secs()?;
+        let bucket = materialized_bucket(now);
+
+        let community_ids = {
+            let state = self.state.read().await;
+            state.community_index.all_community_ids()
+        };
+
+        let mut published = 0usize;
+
+        for cid in community_ids {
+            let (member_pages, share_pages) = {
+                let state = self.state.read().await;
+                (
+                    state
+                        .community_index
+                        .materialize_member_pages(cid, bucket, now),
+                    state
+                        .community_index
+                        .materialize_share_pages(cid, bucket, now),
+                )
+            };
+
+            let mut state = self.state.write().await;
+            for page in &member_pages {
+                let key = community_members_page_key(&cid, bucket, page.page_no);
+                let encoded = page.encode_tagged()?;
+                state.dht.store(key, encoded, DEFAULT_TTL_SECS, now)?;
+                published += 1;
+            }
+            for page in &share_pages {
+                let key = community_shares_page_key(&cid, bucket, page.page_no);
+                let encoded = page.encode_tagged()?;
+                state.dht.store(key, encoded, DEFAULT_TTL_SECS, now)?;
+                published += 1;
+            }
+            if !member_pages.is_empty() || !share_pages.is_empty() {
+                debug!(
+                    community = %hex::encode(&cid[..8]),
+                    member_pages = member_pages.len(),
+                    share_pages = share_pages.len(),
+                    bucket,
+                    "published materialized community pages"
+                );
+            }
+        }
+
+        Ok(published)
+    }
+
+    /// Fetch materialized member pages for a community from the DHT.
+    ///
+    /// Queries page 0 first to learn `total_pages`, then fetches
+    /// remaining pages.  Returns all member summaries found, or an
+    /// empty vec if the materialized pages are not available.
+    pub async fn fetch_materialized_member_pages<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        community_id: [u8; 32],
+        seed_peers: &[PeerAddr],
+    ) -> Vec<crate::wire::CommunityMemberSummary> {
+        use crate::dht_keys::{community_members_page_key, materialized_bucket};
+        use crate::wire::MaterializedMembersPage;
+        let now = now_unix_secs().unwrap_or(0);
+        let bucket = materialized_bucket(now);
+
+        let key0 = community_members_page_key(&community_id, bucket, 0);
+        let val0 = match self
+            .dht_find_value_iterative(transport, key0, seed_peers)
+            .await
+        {
+            Ok(Some(v)) => v,
+            _ => return vec![],
+        };
+        let page0 = match MaterializedMembersPage::decode_tagged(&val0.value) {
+            Ok(p) if p.community_id == community_id => p,
+            _ => return vec![],
+        };
+        let total = page0.total_pages;
+        let mut all = page0.entries;
+
+        for pg in 1..total {
+            let key = community_members_page_key(&community_id, bucket, pg);
+            if let Ok(Some(v)) = self
+                .dht_find_value_iterative(transport, key, seed_peers)
+                .await
+                && let Ok(page) = MaterializedMembersPage::decode_tagged(&v.value)
+            {
+                all.extend(page.entries);
+            }
+        }
+        all
+    }
+
+    /// Fetch materialized share pages for a community from the DHT.
+    ///
+    /// Similar to [`fetch_materialized_member_pages`] but for share
+    /// summaries.
+    pub async fn fetch_materialized_share_pages<T: RequestTransport + ?Sized>(
+        &self,
+        transport: &T,
+        community_id: [u8; 32],
+        seed_peers: &[PeerAddr],
+    ) -> Vec<crate::wire::CommunityShareSummary> {
+        use crate::dht_keys::{community_shares_page_key, materialized_bucket};
+        use crate::wire::MaterializedSharesPage;
+        let now = now_unix_secs().unwrap_or(0);
+        let bucket = materialized_bucket(now);
+
+        let key0 = community_shares_page_key(&community_id, bucket, 0);
+        let val0 = match self
+            .dht_find_value_iterative(transport, key0, seed_peers)
+            .await
+        {
+            Ok(Some(v)) => v,
+            _ => return vec![],
+        };
+        let page0 = match MaterializedSharesPage::decode_tagged(&val0.value) {
+            Ok(p) if p.community_id == community_id => p,
+            _ => return vec![],
+        };
+        let total = page0.total_pages;
+        let mut all = page0.entries;
+
+        for pg in 1..total {
+            let key = community_shares_page_key(&community_id, bucket, pg);
+            if let Ok(Some(v)) = self
+                .dht_find_value_iterative(transport, key, seed_peers)
+                .await
+                && let Ok(page) = MaterializedSharesPage::decode_tagged(&v.value)
+            {
+                all.extend(page.entries);
+            }
+        }
+        all
+    }
 }
 
 /// If `value` deserializes as [`CommunityMembers`], merge its member list
@@ -1016,8 +1242,44 @@ async fn ingest_into_community_index_if_applicable(key: [u8; 32], value: &[u8], 
             if let Ok(rec) = CommunityMemberRecord::decode_tagged(value) {
                 let expected = community_member_key(&rec.community_id, &rec.member_node_pubkey);
                 if expected == key {
-                    let mut state = node.state.write().await;
-                    state.community_index.ingest_member_record(&rec);
+                    // Publisher-auth gate (§4.2): if we have joined this community
+                    // with a publisher-issued token, require incoming member records
+                    // to carry a valid auth token signed by the community publisher.
+                    // For unknown or open (tokenless) communities, ingest freely.
+                    let auth_ok = {
+                        let state = node.state.read().await;
+                        if let Some(membership) = state.communities.get(&rec.community_id) {
+                            if membership.token.is_some() {
+                                match &rec.auth_token_bytes {
+                                    Some(token_bytes) => {
+                                        let now = now_unix_secs().ok();
+                                        crate::cbor::from_slice::<super::CommunityMembershipToken>(
+                                            token_bytes,
+                                        )
+                                        .map_err(|e| anyhow::anyhow!("{e}"))
+                                        .and_then(|t| t.verify(&membership.pubkey, now))
+                                        .is_ok()
+                                    }
+                                    None => {
+                                        debug!(
+                                            community = %hex::encode(&rec.community_id[..8]),
+                                            member = %hex::encode(&rec.member_node_pubkey[..8]),
+                                            "dropping member record: token-gated community requires auth token"
+                                        );
+                                        false
+                                    }
+                                }
+                            } else {
+                                true // open community — no token required
+                            }
+                        } else {
+                            true // unknown community — relay without checking
+                        }
+                    };
+                    if auth_ok {
+                        let mut state = node.state.write().await;
+                        state.community_index.ingest_member_record(&rec);
+                    }
                 }
             }
         }
@@ -1034,34 +1296,17 @@ async fn ingest_into_community_index_if_applicable(key: [u8; 32], value: &[u8], 
     }
 }
 
+/// No-op stub retained for call-site compatibility.
+///
+/// Legacy `CommunityMembers` blobs are no longer accepted by
+/// `validate_dht_value_for_known_keyspaces` (unsigned, easily forged by any
+/// peer).  New STORE requests for this key-space are rejected before this
+/// function is reached, so the merge logic is never needed.
 async fn merge_community_members_if_applicable(
-    key: [u8; 32],
+    _key: [u8; 32],
     value: Vec<u8>,
-    node: &NodeHandle,
-    now: u64,
+    _node: &NodeHandle,
+    _now: u64,
 ) -> Vec<u8> {
-    let Ok(incoming) = crate::cbor::from_slice::<CommunityMembers>(&value) else {
-        return value;
-    };
-    let expected = community_info_key(&ShareId(incoming.community_share_id));
-    if expected != key {
-        return value;
-    }
-    let existing = {
-        let mut state = node.state.write().await;
-        state
-            .dht
-            .find_value(key, now)
-            .and_then(|v| crate::cbor::from_slice::<CommunityMembers>(&v.value).ok())
-    };
-    let Some(mut merged) = existing else {
-        return value;
-    };
-    for member in incoming.members {
-        if !merged.members.contains(&member) {
-            merged.members.push(member);
-        }
-    }
-    merged.updated_at = merged.updated_at.max(incoming.updated_at);
-    crate::cbor::to_vec(&merged).unwrap_or(value)
+    value
 }

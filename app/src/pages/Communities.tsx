@@ -10,6 +10,8 @@ import {
   Link,
   Copy,
   Check,
+  Search,
+  CalendarDays,
 } from "lucide-react";
 import { Card, CardHeader } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
@@ -24,6 +26,8 @@ import * as cmd from "@/lib/commands";
 import { decodeShareLink, encodeShareLink, isShareLink } from "@/lib/shareLink";
 import type {
   CommunityBrowseView,
+  CommunitySearchView,
+  CommunityEventsView,
   CreateCommunityResult,
   RuntimeStatus,
   PageId,
@@ -56,7 +60,16 @@ export function Communities({ status, bg, onNavigate }: CommunitiesProps) {
     useState<CreateCommunityResult | null>(null);
   const [copiedLink, setCopiedLink] = useState(false);
 
+  // Search
+  const [searchTarget, setSearchTarget] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchData, setSearchData] = useState<CommunitySearchView | null>(null);
+  const [searching, setSearching] = useState(false);
 
+  // Events
+  const [eventsTarget, setEventsTarget] = useState<string | null>(null);
+  const [eventsData, setEventsData] = useState<CommunityEventsView | null>(null);
+  const [eventsLoading, setEventsLoading] = useState(false);
 
   const handleJoin = async () => {
     if (!joinId.trim() || !joinPubkey.trim()) return;
@@ -111,6 +124,41 @@ export function Communities({ status, bg, onNavigate }: CommunitiesProps) {
       setError(String(e));
     }
     setBrowsing(false);
+  };
+
+  const handleSearchOpen = (shareIdHex: string) => {
+    setSearchTarget(shareIdHex);
+    setSearchData(null);
+    setSearchQuery("");
+    setEventsTarget(null);
+    setEventsData(null);
+  };
+
+  const handleSearch = async (shareIdHex: string) => {
+    if (!searchQuery.trim()) return;
+    setSearching(true);
+    try {
+      const result = await cmd.searchCommunity(shareIdHex, searchQuery.trim());
+      setSearchData(result);
+    } catch (e) {
+      setError(String(e));
+    }
+    setSearching(false);
+  };
+
+  const handleEventsOpen = async (shareIdHex: string) => {
+    setEventsTarget(shareIdHex);
+    setEventsData(null);
+    setSearchTarget(null);
+    setSearchData(null);
+    setEventsLoading(true);
+    try {
+      const result = await cmd.communityEvents(shareIdHex);
+      setEventsData(result);
+    } catch (e) {
+      setError(String(e));
+    }
+    setEventsLoading(false);
   };
 
   const handleCreate = async () => {
@@ -220,6 +268,23 @@ export function Communities({ status, bg, onNavigate }: CommunitiesProps) {
                   Browse
                 </Button>
                 <Button
+                  variant="secondary"
+                  size="sm"
+                  icon={<Search className="h-3.5 w-3.5" />}
+                  onClick={() => handleSearchOpen(community.share_id_hex)}
+                >
+                  Search
+                </Button>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  icon={<CalendarDays className="h-3.5 w-3.5" />}
+                  onClick={() => handleEventsOpen(community.share_id_hex)}
+                  loading={eventsLoading && eventsTarget === community.share_id_hex}
+                >
+                  Events
+                </Button>
+                <Button
                   variant="ghost"
                   size="sm"
                   icon={<LogOut className="h-3.5 w-3.5" />}
@@ -324,6 +389,135 @@ export function Communities({ status, bg, onNavigate }: CommunitiesProps) {
                 </div>
               )}
             </div>
+          </Card>
+        </div>
+      )}
+
+      {/* Search panel */}
+      {searchTarget && (
+        <div className="mt-6 space-y-4">
+          <Card>
+            <CardHeader
+              title="Search Community Shares"
+              subtitle={`Community ${searchTarget.slice(0, 12)}...`}
+              icon={<Search className="h-4 w-4" />}
+              action={
+                <Button variant="ghost" size="sm" onClick={() => { setSearchTarget(null); setSearchData(null); }}>
+                  Close
+                </Button>
+              }
+            />
+            <div className="flex gap-2 mb-4">
+              <Input
+                placeholder="Search query…"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") handleSearch(searchTarget); }}
+                className="flex-1"
+              />
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => handleSearch(searchTarget)}
+                loading={searching}
+                disabled={!searchQuery.trim()}
+              >
+                Search
+              </Button>
+            </div>
+            {searchData && (
+              <div>
+                <div className="flex items-center gap-2 mb-2">
+                  <Bookmark className="h-4 w-4 text-text-muted" />
+                  <h4 className="text-xs font-semibold text-text-secondary uppercase tracking-wider">
+                    Results ({searchData.results.length})
+                  </h4>
+                </div>
+                {searchData.results.length === 0 ? (
+                  <p className="text-xs text-text-muted py-2">No results found</p>
+                ) : (
+                  <div className="space-y-2">
+                    {searchData.results.map((hit, i) => (
+                      <div
+                        key={i}
+                        className="flex items-center justify-between px-3 py-3 rounded-xl bg-surface border border-border-subtle"
+                      >
+                        <div className="space-y-1">
+                          {hit.title && (
+                            <p className="text-sm font-medium text-text-primary">{hit.title}</p>
+                          )}
+                          <HashDisplay hash={hit.share_id_hex} truncate={10} />
+                          <div className="flex items-center gap-3 text-xs text-text-muted">
+                            <span>Seq #{hit.latest_seq}</span>
+                            <span>Score {hit.score}</span>
+                          </div>
+                        </div>
+                        <ChevronRight className="h-4 w-4 text-text-muted" />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </Card>
+        </div>
+      )}
+
+      {/* Events panel */}
+      {eventsTarget && eventsData && (
+        <div className="mt-6 space-y-4">
+          <Card>
+            <CardHeader
+              title="Community Events"
+              subtitle={`Community ${eventsTarget.slice(0, 12)}...`}
+              icon={<CalendarDays className="h-4 w-4" />}
+              action={
+                <Button variant="ghost" size="sm" onClick={() => { setEventsTarget(null); setEventsData(null); }}>
+                  Close
+                </Button>
+              }
+            />
+            {eventsData.events.length === 0 ? (
+              <p className="text-xs text-text-muted py-2">No events found</p>
+            ) : (
+              <div className="space-y-1">
+                {eventsData.events.map((ev, i) => {
+                  let typeLabel: string;
+                  let detail: string;
+                  let seqVal: number;
+                  if (ev.type === "member_joined") {
+                    typeLabel = "joined";
+                    detail = ev.member_node_pubkey_hex.slice(0, 16) + "…";
+                    seqVal = ev.announce_seq;
+                  } else if (ev.type === "member_left") {
+                    typeLabel = "left";
+                    detail = ev.member_node_pubkey_hex.slice(0, 16) + "…";
+                    seqVal = ev.announce_seq;
+                  } else {
+                    typeLabel = "upserted";
+                    detail = ev.title ?? ev.share_id_hex.slice(0, 16) + "…";
+                    seqVal = ev.latest_seq;
+                  }
+                  return (
+                    <div
+                      key={i}
+                      className="flex items-center gap-3 px-3 py-2 rounded-xl bg-surface border border-border-subtle"
+                    >
+                      <Badge
+                        variant={ev.type === "member_joined" ? "success" : ev.type === "member_left" ? "danger" : "default"}
+                        size="sm"
+                      >
+                        {typeLabel}
+                      </Badge>
+                      <span className="text-xs font-mono text-text-secondary selectable truncate flex-1">
+                        {detail}
+                      </span>
+                      <span className="text-xs text-text-muted">seq #{seqVal}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </Card>
         </div>
       )}

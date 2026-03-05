@@ -31,7 +31,7 @@ pub use api::{
     OwnedShareRecord, SearchPage, SearchPageQuery, SearchQuery, SearchResult, SearchTrustFilter,
     ShareItemInfo, SubscriptionTrustLevel,
 };
-pub use capabilities::Capabilities;
+pub use capabilities::{Capabilities, full_node_capabilities};
 pub use config::NodeConfig;
 pub use content::{
     CHUNK_SIZE, ChunkedContent, chunk_hashes, compute_chunk_list_hash, describe_content,

@@ -73,6 +73,72 @@ fn check_cmd(program: &str, args: &[&str]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// RA-05: Quote a single argument for a systemd `ExecStart=` line.
+///
+/// systemd uses C-style quoting: if an argument contains whitespace,
+/// quotes, or backslashes it is wrapped in double quotes with internal
+/// `"` and `\` escaped.  See `systemd.syntax(7)`.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn systemd_quote(arg: &str) -> String {
+    if arg.is_empty() {
+        return r#""""#.to_string();
+    }
+    // If there's nothing that needs escaping we can emit bare.
+    let needs_quoting = arg.bytes().any(|b| {
+        b == b' '
+            || b == b'\t'
+            || b == b'"'
+            || b == b'\\'
+            || b == b'\''
+            || b == b'\n'
+            || b == b';'
+    });
+    if !needs_quoting {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 4);
+    out.push('"');
+    for ch in arg.chars() {
+        match ch {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// RA-05: Escape an argument for a macOS launchd XML `<string>` element.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn xml_escape(arg: &str) -> String {
+    arg.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+/// RA-05: Quote a single argument for Windows `sc.exe binPath=`.
+///
+/// If the argument contains spaces, wrap it in `\"...\"`  (the outer
+/// quote is for `sc.exe` parsing; the backslash-quote is for the Windows
+/// command line parser).
+#[cfg_attr(not(any(target_os = "windows", test)), allow(dead_code))]
+fn windows_arg_quote(arg: &str) -> String {
+    if arg.is_empty() {
+        return r#"\"\""#.to_string();
+    }
+    if arg.contains(' ') || arg.contains('"') {
+        let escaped = arg.replace('"', r#"\""#);
+        format!("\\\"{}\\\"", escaped)
+    } else {
+        arg.to_string()
+    }
+}
+
 // ── Linux / systemd ────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
@@ -81,9 +147,10 @@ fn install_systemd(bin: &Path, relay_args: &[&str]) -> anyhow::Result<()> {
 
     let bin_str = bin.to_string_lossy();
     let exec_start = if relay_args.is_empty() {
-        bin_str.to_string()
+        systemd_quote(&bin_str)
     } else {
-        format!("{} {}", bin_str, relay_args.join(" "))
+        let quoted_args: Vec<String> = relay_args.iter().map(|a| systemd_quote(a)).collect();
+        format!("{} {}", systemd_quote(&bin_str), quoted_args.join(" "))
     };
 
     let unit = format!(
@@ -137,14 +204,9 @@ fn install_launchd(bin: &Path, relay_args: &[&str]) -> anyhow::Result<()> {
     let bin_str = bin.to_string_lossy();
 
     // Build the <array> of <string> entries for ProgramArguments.
-    let mut prog_args = format!("        <string>{bin_str}</string>\n");
+    let mut prog_args = format!("        <string>{}</string>\n", xml_escape(&bin_str));
     for arg in relay_args {
-        // Escape XML special chars minimally.
-        let escaped = arg
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
-        prog_args.push_str(&format!("        <string>{escaped}</string>\n"));
+        prog_args.push_str(&format!("        <string>{}</string>\n", xml_escape(arg)));
     }
 
     let plist = format!(
@@ -205,11 +267,13 @@ fn install_launchd(bin: &Path, relay_args: &[&str]) -> anyhow::Result<()> {
 fn install_windows_service(bin: &Path, relay_args: &[&str]) -> anyhow::Result<()> {
     let bin_str = bin.to_string_lossy();
 
-    // Build binPath — quote the exe, append args separated by spaces.
+    // Build binPath — quote the exe, append properly escaped args.
     let bin_path = if relay_args.is_empty() {
         format!("\"{}\"", bin_str)
     } else {
-        format!("\"{}\" {}", bin_str, relay_args.join(" "))
+        let quoted_args: Vec<String> =
+            relay_args.iter().map(|a| windows_arg_quote(a)).collect();
+        format!("\"{}\" {}", bin_str, quoted_args.join(" "))
     };
 
     // Delete old service if present (ignore errors).
@@ -247,4 +311,57 @@ fn install_windows_service(bin: &Path, relay_args: &[&str]) -> anyhow::Result<()
     println!("  sc.exe delete scp2p-relay");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemd_quote_bare() {
+        assert_eq!(systemd_quote("--bind-tcp=0.0.0.0:7001"), "--bind-tcp=0.0.0.0:7001");
+    }
+
+    #[test]
+    fn systemd_quote_with_spaces() {
+        assert_eq!(systemd_quote("--data-dir=/my path"), r#""--data-dir=/my path""#);
+    }
+
+    #[test]
+    fn systemd_quote_with_double_quotes() {
+        assert_eq!(systemd_quote(r#"say "hello""#), r#""say \"hello\"""#);
+    }
+
+    #[test]
+    fn systemd_quote_empty() {
+        assert_eq!(systemd_quote(""), r#""""#);
+    }
+
+    #[test]
+    fn xml_escape_special_chars() {
+        assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+    }
+
+    #[test]
+    fn xml_escape_plain() {
+        assert_eq!(xml_escape("--bind-tcp=0.0.0.0:7001"), "--bind-tcp=0.0.0.0:7001");
+    }
+
+    #[test]
+    fn windows_arg_quote_bare() {
+        assert_eq!(windows_arg_quote("--bind-tcp=0.0.0.0:7001"), "--bind-tcp=0.0.0.0:7001");
+    }
+
+    #[test]
+    fn windows_arg_quote_with_spaces() {
+        assert_eq!(
+            windows_arg_quote("--data-dir=C:\\My Dir"),
+            "\\\"--data-dir=C:\\My Dir\\\""
+        );
+    }
+
+    #[test]
+    fn windows_arg_quote_empty() {
+        assert_eq!(windows_arg_quote(""), r#"\"\""#);
+    }
 }

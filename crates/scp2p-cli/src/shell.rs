@@ -13,11 +13,11 @@ use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{InquireError, Select, Text};
 use rand::rngs::OsRng;
 use scp2p_core::{
-    BoxedStream, Capabilities, FetchPolicy, Node, NodeConfig, NodeId, OwnedRelayAwareTransport,
+    BoxedStream, FetchPolicy, Node, NodeConfig, NodeId, OwnedRelayAwareTransport,
     PeerAddr, PeerConnector, PeerRecord, PersistedCommunity, RelayAwareTransport, RequestTransport,
     SearchQuery, ShareId, ShareVisibility, SqliteStore, Store, TransportProtocol,
-    build_tls_server_handle, quic_connect_bi_session_insecure, start_quic_server,
-    tls_connect_session_insecure,
+    build_tls_server_handle, full_node_capabilities, quic_connect_bi_session_insecure,
+    start_quic_server, tls_connect_session_insecure,
 };
 use tracing::{info, warn};
 
@@ -37,7 +37,7 @@ impl PeerConnector for CliConnector {
                 let (stream, _) = tls_connect_session_insecure(
                     remote,
                     &self.signing_key,
-                    Capabilities::default(),
+                    full_node_capabilities(),
                     expected,
                 )
                 .await?;
@@ -47,7 +47,7 @@ impl PeerConnector for CliConnector {
                 let s = quic_connect_bi_session_insecure(
                     remote,
                     &self.signing_key,
-                    Capabilities::default(),
+                    full_node_capabilities(),
                     expected,
                 )
                 .await?;
@@ -132,7 +132,7 @@ pub async fn run(
     let _svc = node.clone().start_tls_dht_service(
         bind_tcp,
         node_key.clone(),
-        Capabilities::default(),
+        full_node_capabilities(),
         tls,
     );
 
@@ -143,7 +143,7 @@ pub async fn run(
         Some(node.clone().start_quic_dht_service(
             quic_server,
             node_key.clone(),
-            Capabilities::default(),
+            full_node_capabilities(),
         ))
     } else {
         None
@@ -594,6 +594,8 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
             "🔗  Join a community",
             "🚪  Leave a community",
             "🔍  Browse a community",
+            "🔎  Search community shares",
+            "📅  View community events",
             "\u{2190}   Back",
         ];
 
@@ -768,6 +770,231 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                     println!("  {} participant(s):", participants.len());
                     for p in &participants {
                         println!("    {p}");
+                    }
+                }
+
+                // ── Paginated share listing ─────────────────────────────────
+                if !participants.is_empty() {
+                    const MAX_BROWSE_PAGES: usize = 50;
+                    let pb2 = spinner("Fetching community shares…");
+                    let mut all_shares = Vec::new();
+                    let mut seen_share_ids = std::collections::HashSet::<[u8; 32]>::new();
+                    'browse_peers: for peer in &ctx.bootstrap_peers {
+                        let mut cursor: Option<String> = None;
+                        for _page in 0..MAX_BROWSE_PAGES {
+                            match ctx
+                                .node
+                                .fetch_community_shares_page(
+                                    &transport,
+                                    peer,
+                                    community.share_id,
+                                    cursor.clone(),
+                                    50,
+                                    None,
+                                )
+                                .await
+                            {
+                                Ok(resp) => {
+                                    let next = resp.next_cursor.clone();
+                                    for entry in resp.entries {
+                                        if seen_share_ids.insert(entry.share_id) {
+                                            all_shares.push(entry);
+                                        }
+                                    }
+                                    cursor = next;
+                                    if cursor.is_none() {
+                                        break 'browse_peers;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    pb2.finish_and_clear();
+                    if all_shares.is_empty() {
+                        println!("  No public shares found.");
+                    } else {
+                        println!("  {} share(s):", all_shares.len());
+                        for s in &all_shares {
+                            let title =
+                                s.title.as_deref().unwrap_or("(untitled)");
+                            println!(
+                                "    {}  seq={}  share={}…",
+                                title,
+                                s.latest_seq,
+                                hex::encode(&s.share_id[..8]),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // ── Search community shares ───────────────────────────────────────
+            c if c.contains("Search") => {
+                let communities: Vec<PersistedCommunity> = ctx.node.communities().await;
+                if communities.is_empty() {
+                    println!("\n  No communities joined yet.");
+                    continue;
+                }
+                if ctx.bootstrap_peers.is_empty() {
+                    println!(
+                        "\n  No bootstrap peers configured — unable to search without peers."
+                    );
+                    continue;
+                }
+
+                let choices: Vec<String> = communities
+                    .iter()
+                    .map(|c| format!("{}...", hex::encode(&c.share_id[..8])))
+                    .collect();
+                let pick = match opt(
+                    Select::new("Pick a community to search:", choices.clone()).prompt(),
+                )? {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let idx = choices.iter().position(|ch| *ch == pick).unwrap_or(0);
+                let community = &communities[idx];
+
+                let query = match opt(Text::new("Search query:").prompt())? {
+                    Some(q) => q,
+                    None => continue,
+                };
+
+                let transport = ctx.transport();
+                let pb = spinner("Searching community shares…");
+                const MAX_SEARCH_PAGES: usize = 10;
+                let mut merged: Vec<scp2p_core::wire::CommunityShareHit> = Vec::new();
+                let mut seen_hit_ids = std::collections::HashSet::<[u8; 32]>::new();
+                'search_peers: for peer in &ctx.bootstrap_peers {
+                    let mut cursor: Option<String> = None;
+                    for _page in 0..MAX_SEARCH_PAGES {
+                        match ctx
+                            .node
+                            .fetch_community_search_shares(
+                                &transport,
+                                peer,
+                                community.share_id,
+                                query.clone(),
+                                cursor.clone(),
+                                50,
+                            )
+                            .await
+                        {
+                            Ok(resp) => {
+                                let next = resp.next_cursor.clone();
+                                for h in resp.hits {
+                                    if seen_hit_ids.insert(h.share_id) {
+                                        merged.push(h);
+                                    }
+                                }
+                                cursor = next;
+                                if cursor.is_none() {
+                                    break 'search_peers;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                pb.finish_and_clear();
+                merged.sort_by(|a, b| b.score.cmp(&a.score));
+                if merged.is_empty() {
+                    println!("\n  No results.");
+                } else {
+                    println!("\n  {} result(s):", merged.len());
+                    for h in &merged {
+                        let title = h.title.as_deref().unwrap_or("(untitled)");
+                        println!(
+                            "  [score={}]  {}  share={}…",
+                            h.score,
+                            title,
+                            hex::encode(&h.share_id[..8]),
+                        );
+                    }
+                }
+            }
+
+            // ── View community events ─────────────────────────────────────────
+            c if c.contains("events") => {
+                let communities: Vec<PersistedCommunity> = ctx.node.communities().await;
+                if communities.is_empty() {
+                    println!("\n  No communities joined yet.");
+                    continue;
+                }
+                if ctx.bootstrap_peers.is_empty() {
+                    println!(
+                        "\n  No bootstrap peers configured — unable to fetch events without peers."
+                    );
+                    continue;
+                }
+
+                let choices: Vec<String> = communities
+                    .iter()
+                    .map(|c| format!("{}...", hex::encode(&c.share_id[..8])))
+                    .collect();
+                let pick = match opt(
+                    Select::new("Pick a community:", choices.clone()).prompt(),
+                )? {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let idx = choices.iter().position(|ch| *ch == pick).unwrap_or(0);
+                let community = &communities[idx];
+
+                let transport = ctx.transport();
+                let pb = spinner("Fetching community events…");
+                let mut all_events: Vec<scp2p_core::wire::CommunityEvent> = Vec::new();
+                for peer in &ctx.bootstrap_peers {
+                    match ctx
+                        .node
+                        .fetch_community_events(
+                            &transport,
+                            peer,
+                            community.share_id,
+                            None,
+                            100,
+                        )
+                        .await
+                    {
+                        Ok(resp) => {
+                            all_events.extend(resp.events);
+                            break; // one peer is enough for events
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                pb.finish_and_clear();
+                if all_events.is_empty() {
+                    println!("\n  No events found.");
+                } else {
+                    println!("\n  {} event(s):", all_events.len());
+                    for ev in &all_events {
+                        match ev {
+                            scp2p_core::wire::CommunityEvent::MemberJoined {
+                                member_node_pubkey,
+                                announce_seq,
+                            } => println!(
+                                "  joined   seq={announce_seq}  node={}…",
+                                hex::encode(&member_node_pubkey[..8])
+                            ),
+                            scp2p_core::wire::CommunityEvent::MemberLeft {
+                                member_node_pubkey,
+                                announce_seq,
+                            } => println!(
+                                "  left     seq={announce_seq}  node={}…",
+                                hex::encode(&member_node_pubkey[..8])
+                            ),
+                            scp2p_core::wire::CommunityEvent::ShareUpserted {
+                                share_id,
+                                latest_seq,
+                                title,
+                            } => println!(
+                                "  upserted seq={latest_seq}  share={}…  title={}",
+                                hex::encode(&share_id[..8]),
+                                title.as_deref().unwrap_or("(untitled)")
+                            ),
+                        }
                     }
                 }
             }

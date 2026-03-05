@@ -32,6 +32,13 @@ pub struct NodeConfig {
     /// requester.  In permissive mode (default `false`), any caller can
     /// enumerate this node's community public shares.
     pub community_strict_mode: bool,
+    /// Maximum concurrent incoming connections (TLS + QUIC combined).
+    /// Prevents unbounded task spawning under connection floods.
+    /// Default: 256.
+    pub max_concurrent_connections: usize,
+    /// Maximum simultaneous connections from a single IP address.
+    /// Limits per-IP connection storms.  Default: 8.
+    pub max_connections_per_ip: usize,
 }
 
 impl Default for NodeConfig {
@@ -51,6 +58,8 @@ impl Default for NodeConfig {
             max_subscriptions: 200,
             auto_protect_publisher_keys: true,
             community_strict_mode: false,
+            max_concurrent_connections: 256,
+            max_connections_per_ip: 8,
         }
     }
 }

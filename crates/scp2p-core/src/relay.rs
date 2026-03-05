@@ -313,6 +313,12 @@ pub struct RelayLimits {
     pub max_content_bytes_per_day: u64,
     pub max_streams_per_day: usize,
     pub content_relay_enabled: bool,
+    /// Hard global cap on simultaneous relay slots.
+    /// Defaults to `RelayCapacity::default().max_tunnels` (64).
+    pub max_tunnels: u16,
+    /// Maximum slots a single owner (pubkey) may hold simultaneously.
+    /// Default: 4.
+    pub max_slots_per_owner: u16,
 }
 
 impl Default for RelayLimits {
@@ -322,6 +328,8 @@ impl Default for RelayLimits {
             max_content_bytes_per_day: 4 * 1024 * 1024,
             max_streams_per_day: 1024,
             content_relay_enabled: false,
+            max_tunnels: RelayCapacity::default().max_tunnels,
+            max_slots_per_owner: 4,
         }
     }
 }
@@ -417,7 +425,31 @@ impl RelayManager {
         self.announcements.retain(|_, ann| ann.is_fresh(now));
     }
 
-    pub fn register(&mut self, owner_peer: String, now: u64) -> RelaySlot {
+    pub fn register(&mut self, owner_peer: String, now: u64) -> anyhow::Result<RelaySlot> {
+        self.evict_expired(now);
+
+        // RA-02: enforce hard global tunnel cap.
+        if self.slots.len() >= self.limits.max_tunnels as usize {
+            anyhow::bail!(
+                "relay slot limit reached ({}/{})",
+                self.slots.len(),
+                self.limits.max_tunnels
+            );
+        }
+        // RA-02: enforce per-owner slot cap.
+        let owner_count = self
+            .slots
+            .values()
+            .filter(|s| s.owner_peer == owner_peer)
+            .count();
+        if owner_count >= self.limits.max_slots_per_owner as usize {
+            anyhow::bail!(
+                "per-owner relay slot limit reached ({}/{})",
+                owner_count,
+                self.limits.max_slots_per_owner
+            );
+        }
+
         // Generate a random slot ID to prevent enumeration attacks.
         let slot_id = loop {
             let candidate = rand::random::<u64>();
@@ -432,7 +464,7 @@ impl RelayManager {
             expires_at: now.saturating_add(RELAY_SLOT_TTL_SECS),
         };
         self.slots.insert(slot.relay_slot_id, slot.clone());
-        slot
+        Ok(slot)
     }
 
     pub fn register_or_renew(
@@ -443,7 +475,7 @@ impl RelayManager {
     ) -> anyhow::Result<RelaySlot> {
         self.evict_expired(now);
         let Some(slot_id) = relay_slot_id else {
-            return Ok(self.register(owner_peer, now));
+            return self.register(owner_peer, now);
         };
         let slot = self
             .slots
@@ -661,7 +693,7 @@ mod tests {
     #[test]
     fn register_and_connect_roundtrip() {
         let mut relay = RelayManager::default();
-        let slot = relay.register("peer-a".into(), 100);
+        let slot = relay.register("peer-a".into(), 100).expect("register");
         let link = relay
             .connect("peer-b".into(), slot.relay_slot_id, 101)
             .expect("connect");
@@ -672,7 +704,7 @@ mod tests {
     #[test]
     fn expired_slots_are_rejected() {
         let mut relay = RelayManager::default();
-        let slot = relay.register("peer-a".into(), 100);
+        let slot = relay.register("peer-a".into(), 100).expect("register");
         let err = relay
             .connect(
                 "peer-b".into(),
@@ -686,7 +718,7 @@ mod tests {
     #[test]
     fn register_or_renew_extends_existing_slot() {
         let mut relay = RelayManager::default();
-        let slot = relay.register("peer-a".into(), 100);
+        let slot = relay.register("peer-a".into(), 100).expect("register");
         let renewed = relay
             .register_or_renew("peer-a".into(), Some(slot.relay_slot_id), 150)
             .expect("renew");
@@ -697,7 +729,7 @@ mod tests {
     #[test]
     fn renew_rejects_wrong_owner() {
         let mut relay = RelayManager::default();
-        let slot = relay.register("peer-a".into(), 100);
+        let slot = relay.register("peer-a".into(), 100).expect("register");
         let err = relay
             .register_or_renew("peer-b".into(), Some(slot.relay_slot_id), 101)
             .expect_err("owner mismatch must fail");
@@ -707,7 +739,7 @@ mod tests {
     #[test]
     fn content_relay_disabled_by_default() {
         let mut relay = RelayManager::default();
-        let slot = relay.register("peer-a".into(), 100);
+        let slot = relay.register("peer-a".into(), 100).expect("register");
         relay
             .connect("peer-b".into(), slot.relay_slot_id, 101)
             .expect("connect");
@@ -727,7 +759,7 @@ mod tests {
     #[test]
     fn unauthorized_peer_is_rejected_from_relay_stream() {
         let mut relay = RelayManager::default();
-        let slot = relay.register("peer-a".into(), 100);
+        let slot = relay.register("peer-a".into(), 100).expect("register");
         relay
             .connect("peer-b".into(), slot.relay_slot_id, 101)
             .expect("connect");
@@ -777,7 +809,7 @@ mod tests {
             max_control_bytes_per_day: 5,
             ..RelayLimits::default()
         });
-        let slot = relay.register("peer-a".into(), 100);
+        let slot = relay.register("peer-a".into(), 100).expect("register");
         relay
             .connect("peer-b".into(), slot.relay_slot_id, 101)
             .expect("connect");
@@ -811,7 +843,7 @@ mod tests {
             max_streams_per_day: 1,
             ..RelayLimits::default()
         });
-        let slot = relay.register("peer-a".into(), 100);
+        let slot = relay.register("peer-a".into(), 100).expect("register");
         relay
             .connect("peer-b".into(), slot.relay_slot_id, 101)
             .expect("connect");
@@ -836,6 +868,38 @@ mod tests {
             )
             .expect_err("must exceed stream cap");
         assert!(err.to_string().contains("stream quota"));
+    }
+
+    #[test]
+    fn global_slot_cap_is_enforced() {
+        let mut relay = RelayManager::default();
+        relay.set_limits(RelayLimits {
+            max_tunnels: 2,
+            max_slots_per_owner: 2,
+            ..RelayLimits::default()
+        });
+        relay.register("peer-a".into(), 100).expect("slot 1");
+        relay.register("peer-b".into(), 100).expect("slot 2");
+        let err = relay
+            .register("peer-c".into(), 100)
+            .expect_err("must reject at cap");
+        assert!(err.to_string().contains("slot limit"));
+    }
+
+    #[test]
+    fn per_owner_slot_cap_is_enforced() {
+        let mut relay = RelayManager::default();
+        relay.set_limits(RelayLimits {
+            max_tunnels: 100,
+            max_slots_per_owner: 2,
+            ..RelayLimits::default()
+        });
+        relay.register("peer-a".into(), 100).expect("slot 1");
+        relay.register("peer-a".into(), 100).expect("slot 2");
+        let err = relay
+            .register("peer-a".into(), 100)
+            .expect_err("must reject per-owner cap");
+        assert!(err.to_string().contains("per-owner"));
     }
 
     // ── RelayAnnouncement tests ───────────────────────────────────

@@ -801,6 +801,10 @@ pub mod community_tags {
     pub const SHARE_RECORD: u8 = 0x32;
     /// Lightweight community bootstrap hint (§15.4.1b).
     pub const BOOTSTRAP_HINT: u8 = 0x33;
+    /// Materialized members page (§15.5, relay-derived).
+    pub const MEMBERS_PAGE: u8 = 0x34;
+    /// Materialized shares page (§15.5, relay-derived).
+    pub const SHARES_PAGE: u8 = 0x35;
 }
 
 /// Per-member community record stored in the DHT (§15.4.1).
@@ -817,6 +821,17 @@ pub struct CommunityMemberRecord {
     pub expires_at: u64,
     #[serde(with = "serde_bytes")]
     pub signature: Vec<u8>,
+    /// Optional publisher-issued authorization token (§4.2).
+    ///
+    /// When the community enforces publisher authorization, the community
+    /// publisher signs a [`CommunityMembershipToken`] for this member and
+    /// the member includes its CBOR-encoded bytes here.  Relaying peers
+    /// for which this community is token-gated will reject records without
+    /// a valid token.
+    ///
+    /// `None` for open (self-join) communities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_bytes: Option<serde_bytes::ByteBuf>,
 }
 
 /// Member status for per-member community records.
@@ -870,6 +885,7 @@ impl CommunityMemberRecord {
             issued_at,
             expires_at,
             signature: sig.to_bytes().to_vec(),
+            auth_token_bytes: None,
         })
     }
 
@@ -1105,6 +1121,90 @@ impl CommunityBootstrapHint {
         }
         if data[0] != community_tags::BOOTSTRAP_HINT {
             anyhow::bail!("wrong tag for community bootstrap hint: 0x{:02x}", data[0]);
+        }
+        Ok(crate::cbor::from_slice(&data[1..])?)
+    }
+}
+
+/// Materialized community members page stored in the DHT (§15.5).
+///
+/// Relay-derived snapshot of a page of community members.  These are
+/// advisory cache entries — the source of truth remains the individual
+/// signed `CommunityMemberRecord` values.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaterializedMembersPage {
+    pub community_id: [u8; 32],
+    /// Time bucket (unix secs / `MATERIALIZED_BUCKET_SECS`).
+    pub bucket: u64,
+    /// Zero-based page number within this bucket snapshot.
+    pub page_no: u16,
+    /// Total pages in the snapshot (so the client knows when to stop).
+    pub total_pages: u16,
+    /// Member summaries for this page.
+    pub entries: Vec<CommunityMemberSummary>,
+    /// UNIX timestamp when this page was built.
+    pub built_at: u64,
+}
+
+impl MaterializedMembersPage {
+    /// Encode with typed tag prefix for DHT storage.
+    pub fn encode_tagged(&self) -> anyhow::Result<Vec<u8>> {
+        let cbor = crate::cbor::to_vec(self)?;
+        let mut out = Vec::with_capacity(1 + cbor.len());
+        out.push(community_tags::MEMBERS_PAGE);
+        out.extend_from_slice(&cbor);
+        Ok(out)
+    }
+
+    /// Decode from a tagged value payload.
+    pub fn decode_tagged(data: &[u8]) -> anyhow::Result<Self> {
+        if data.is_empty() {
+            anyhow::bail!("empty tagged materialized members page");
+        }
+        if data[0] != community_tags::MEMBERS_PAGE {
+            anyhow::bail!("wrong tag for materialized members page: 0x{:02x}", data[0]);
+        }
+        Ok(crate::cbor::from_slice(&data[1..])?)
+    }
+}
+
+/// Materialized community shares page stored in the DHT (§15.5).
+///
+/// Relay-derived snapshot of a page of community shares.  These are
+/// advisory cache entries — the source of truth remains the individual
+/// signed `CommunityShareRecord` values.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MaterializedSharesPage {
+    pub community_id: [u8; 32],
+    /// Time bucket (unix secs / `MATERIALIZED_BUCKET_SECS`).
+    pub bucket: u64,
+    /// Zero-based page number within this bucket snapshot.
+    pub page_no: u16,
+    /// Total pages in the snapshot.
+    pub total_pages: u16,
+    /// Share summaries for this page.
+    pub entries: Vec<CommunityShareSummary>,
+    /// UNIX timestamp when this page was built.
+    pub built_at: u64,
+}
+
+impl MaterializedSharesPage {
+    /// Encode with typed tag prefix for DHT storage.
+    pub fn encode_tagged(&self) -> anyhow::Result<Vec<u8>> {
+        let cbor = crate::cbor::to_vec(self)?;
+        let mut out = Vec::with_capacity(1 + cbor.len());
+        out.push(community_tags::SHARES_PAGE);
+        out.extend_from_slice(&cbor);
+        Ok(out)
+    }
+
+    /// Decode from a tagged value payload.
+    pub fn decode_tagged(data: &[u8]) -> anyhow::Result<Self> {
+        if data.is_empty() {
+            anyhow::bail!("empty tagged materialized shares page");
+        }
+        if data[0] != community_tags::SHARES_PAGE {
+            anyhow::bail!("wrong tag for materialized shares page: 0x{:02x}", data[0]);
         }
         Ok(crate::cbor::from_slice(&data[1..])?)
     }
@@ -2206,5 +2306,79 @@ mod tests {
         let mut tagged = rec.encode_tagged().expect("encode");
         tagged[0] = community_tags::SHARE_RECORD; // wrong tag
         assert!(CommunityMemberRecord::decode_tagged(&tagged).is_err());
+    }
+
+    #[test]
+    fn materialized_members_page_roundtrip() {
+        let page = MaterializedMembersPage {
+            community_id: [0xAA; 32],
+            bucket: 12345,
+            page_no: 0,
+            total_pages: 2,
+            entries: vec![CommunityMemberSummary {
+                member_node_pubkey: [0xBB; 32],
+                status: CommunityMemberStatus::Joined,
+                announce_seq: 1,
+                addr: None,
+            }],
+            built_at: 1_700_000_000,
+        };
+        let tagged = page.encode_tagged().expect("encode");
+        assert_eq!(tagged[0], community_tags::MEMBERS_PAGE);
+        let decoded = MaterializedMembersPage::decode_tagged(&tagged).expect("decode");
+        assert_eq!(decoded, page);
+    }
+
+    #[test]
+    fn materialized_shares_page_roundtrip() {
+        let page = MaterializedSharesPage {
+            community_id: [0xCC; 32],
+            bucket: 99999,
+            page_no: 1,
+            total_pages: 3,
+            entries: vec![CommunityShareSummary {
+                share_id: [0xDD; 32],
+                share_pubkey: [0xEE; 32],
+                latest_seq: 5,
+                title: Some("test".into()),
+                description: None,
+                updated_at: 1_700_000_000,
+            }],
+            built_at: 1_700_000_000,
+        };
+        let tagged = page.encode_tagged().expect("encode");
+        assert_eq!(tagged[0], community_tags::SHARES_PAGE);
+        let decoded = MaterializedSharesPage::decode_tagged(&tagged).expect("decode");
+        assert_eq!(decoded, page);
+    }
+
+    #[test]
+    fn materialized_members_page_wrong_tag_rejected() {
+        let page = MaterializedMembersPage {
+            community_id: [0x11; 32],
+            bucket: 1,
+            page_no: 0,
+            total_pages: 1,
+            entries: vec![],
+            built_at: 100,
+        };
+        let mut tagged = page.encode_tagged().expect("encode");
+        tagged[0] = community_tags::SHARES_PAGE; // wrong tag
+        assert!(MaterializedMembersPage::decode_tagged(&tagged).is_err());
+    }
+
+    #[test]
+    fn materialized_shares_page_wrong_tag_rejected() {
+        let page = MaterializedSharesPage {
+            community_id: [0x22; 32],
+            bucket: 1,
+            page_no: 0,
+            total_pages: 1,
+            entries: vec![],
+            built_at: 100,
+        };
+        let mut tagged = page.encode_tagged().expect("encode");
+        tagged[0] = community_tags::MEMBERS_PAGE; // wrong tag
+        assert!(MaterializedSharesPage::decode_tagged(&tagged).is_err());
     }
 }
