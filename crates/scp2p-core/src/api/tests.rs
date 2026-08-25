@@ -4986,30 +4986,25 @@ async fn community_members_dht_merge_on_store() {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// Phase C — legacy CommunityMembers retirement (DEPRECATION_SCHEDULE)
+// Phase D — legacy CommunityMembers fully removed (DEPRECATION_SCHEDULE)
 // ══════════════════════════════════════════════════════════════════
 //
-// Documents the actual mixed-version behaviour that Phase C depends on.
-// The headline finding: the legacy blob is ALREADY unreachable over the
-// network.  `validate_dht_value_for_known_keyspaces` rejects unsigned
-// `CommunityMembers` values (they are trivially forgeable), so a remote
-// STORE never lands.  Only the *local* write path in
-// `upsert_community_member` still produces one, because it writes straight
-// into the local DHT without passing the validator.
+// Phase C established that the legacy blob was already unreachable over
+// the network: `validate_dht_value_for_known_keyspaces` rejects unsigned
+// `CommunityMembers` values (trivially forgeable), so a remote STORE never
+// lands.  The only producer wrote straight into the *local* DHT, bypassing
+// the validator.
 //
-// The practical consequence is that "stop writing the legacy blob" is a
-// local-state cleanup, not a wire-compatibility event: no peer has been
-// able to receive one since the validator was tightened.
+// Phase D deletes those producers (`upsert_community_member`,
+// `reannounce_community_memberships`, `find_community_members`) and the
+// client-side legacy browse path.  These tests keep the underlying
+// invariants pinned so a regression cannot quietly reintroduce them.
 
-/// A legacy blob written locally is never accepted from a remote peer,
-/// so it cannot propagate.  This is the invariant that makes retiring the
-/// write path safe.
+/// A hand-forged legacy blob is rejected by the DHT validator, which is
+/// why removing the write path could not break replication — nothing was
+/// replicating.
 #[tokio::test]
-async fn phase_c_legacy_blob_is_local_only_and_never_replicates() {
-    let handle = Node::start(NodeConfig::default())
-        .await
-        .expect("start node");
-
+async fn phase_d_legacy_blob_is_rejected_by_validator() {
     let community_share_id = ShareId([131u8; 32]);
     let key = crate::dht_keys::community_info_key(&community_share_id);
     let addr = PeerAddr {
@@ -5020,19 +5015,14 @@ async fn phase_c_legacy_blob_is_local_only_and_never_replicates() {
         relay_via: None,
     };
 
-    // The local write path still produces a legacy blob (deprecated in
-    // Phase C, removed in Phase D) — exercised here deliberately to prove
-    // it cannot escape the local node.
-    #[allow(deprecated)]
-    handle
-        .upsert_community_member(community_share_id, addr.clone())
-        .await
-        .expect("local upsert succeeds");
-    let local = handle.dht_find_value(key).await.expect("find");
-    assert!(local.is_some(), "local blob exists (pre-Phase-C behaviour)");
+    // Construct the blob exactly as the removed write path would have.
+    let blob = crate::cbor::to_vec(&crate::wire::CommunityMembers {
+        community_share_id: community_share_id.0,
+        members: vec![addr],
+        updated_at: 1_700_000_000,
+    })
+    .expect("encode legacy blob");
 
-    // But that exact value, arriving from a peer, is rejected outright.
-    let blob = local.expect("local value").value;
     let peer_node = Node::start(NodeConfig::default())
         .await
         .expect("start peer");
@@ -5051,10 +5041,9 @@ async fn phase_c_legacy_blob_is_local_only_and_never_replicates() {
 }
 
 /// The per-record replacement propagates over the same path the legacy
-/// blob cannot, confirming there is a working substitute before the
-/// legacy write is removed.
+/// blob cannot, confirming the substitute genuinely works.
 #[tokio::test]
-async fn phase_c_per_record_membership_replicates_where_legacy_cannot() {
+async fn phase_d_per_record_membership_replicates_where_legacy_cannot() {
     use crate::dht_keys::community_member_key;
     use crate::wire::{CommunityMemberRecord, CommunityMemberStatus};
 
@@ -5104,11 +5093,14 @@ async fn phase_c_per_record_membership_replicates_where_legacy_cannot() {
     assert!(receiver.dht_find_value(key).await.expect("find").is_some());
 }
 
-/// Read-side fallback must survive Phase C: a node that never writes a
-/// legacy blob still answers legacy `ListCommunityPublicShares` requests,
-/// so older peers keep working through the deprecation window.
+/// Phase D removes the legacy *client* browse path but deliberately keeps
+/// the *server* handler, so a peer still issuing `ListCommunityPublicShares`
+/// gets a correct answer rather than an unknown-message-type error.
+///
+/// This same call also backs local self-listing in desktop browse, so the
+/// method must keep working regardless of the wire-path decision.
 #[tokio::test]
-async fn phase_c_legacy_read_path_still_serves_without_legacy_writes() {
+async fn phase_d_legacy_server_handler_still_serves() {
     let mut rng = OsRng;
     let handle = Node::start(NodeConfig::default())
         .await
@@ -5170,46 +5162,9 @@ async fn phase_c_legacy_read_path_still_serves_without_legacy_writes() {
     assert_eq!(shares[0].share_id, share.share_id().0);
 }
 
-/// upsert_community_member adds the node to the community DHT entry.
-///
-/// Retained through the Phase C deprecation window to pin the legacy
-/// behaviour until the method is removed in v0.6.0 (Phase D).
-#[tokio::test]
-#[allow(deprecated)]
-async fn upsert_community_member_roundtrip() {
-    let handle = Node::start(NodeConfig::default())
-        .await
-        .expect("start node");
-
-    let community_share_id = ShareId([77u8; 32]);
-    let addr = PeerAddr {
-        ip: "10.0.0.3".parse().unwrap(),
-        port: 7777,
-        transport: TransportProtocol::Tcp,
-        pubkey_hint: None,
-        relay_via: None,
-    };
-    handle
-        .upsert_community_member(community_share_id, addr.clone())
-        .await
-        .expect("upsert");
-
-    let key = crate::dht_keys::community_info_key(&community_share_id);
-    let found = handle.dht_find_value(key).await.expect("find").unwrap();
-    let cm: crate::wire::CommunityMembers = crate::cbor::from_slice(&found.value).expect("decode");
-    assert_eq!(cm.members.len(), 1);
-    assert_eq!(cm.members[0], addr);
-
-    // Upserting the same address again should not duplicate.
-    handle
-        .upsert_community_member(community_share_id, addr.clone())
-        .await
-        .expect("upsert again");
-    let found2 = handle.dht_find_value(key).await.expect("find").unwrap();
-    let cm2: crate::wire::CommunityMembers =
-        crate::cbor::from_slice(&found2.value).expect("decode");
-    assert_eq!(cm2.members.len(), 1, "should not duplicate");
-}
+// Phase D: `upsert_community_member_roundtrip` removed alongside the method
+// it exercised.  The invariant that mattered — a legacy blob cannot cross
+// the wire — is pinned by `phase_d_legacy_blob_is_rejected_by_validator`.
 
 // ── §15.5 Materialized community page validation ──────────────────────────
 

@@ -37,8 +37,7 @@ use crate::{
     net_fetch::RequestTransport,
     peer::PeerAddr,
     wire::{
-        CommunityMemberRecord, CommunityMembers, CommunityShareRecord, FindNode,
-        Store as WireStore, community_tags,
+        CommunityMemberRecord, CommunityShareRecord, FindNode, Store as WireStore, community_tags,
     },
 };
 
@@ -117,7 +116,7 @@ impl NodeHandle {
     pub async fn dht_store(&self, req: WireStore) -> anyhow::Result<()> {
         validate_dht_value_for_known_keyspaces(req.key, &req.value)?;
         let now = now_unix_secs()?;
-        let value = merge_community_members_if_applicable(req.key, req.value, self, now).await;
+        let value = req.value;
         ingest_into_community_index_if_applicable(req.key, &value, self).await;
         let mut state = self.state.write().await;
         state
@@ -740,160 +739,20 @@ impl NodeHandle {
         peers
     }
 
-    /// Query seed peers for community members and merge all responses.
-    ///
-    /// Unlike [`Self::dht_find_value_from_network`] which returns on the
-    /// first hit — potentially a partial copy from a non-relay node —
-    /// this queries ALL seed peers and merges every `CommunityMembers`
-    /// response.  The relay's merge-on-store means its copy is the
-    /// superset, but querying all peers gives resilience when the relay
-    /// isn't the closest in XOR space.
-    pub async fn find_community_members<T: RequestTransport + ?Sized>(
-        &self,
-        transport: &T,
-        community_share_id: ShareId,
-        seed_peers: &[PeerAddr],
-    ) -> CommunityMembers {
-        let key = community_info_key(&community_share_id);
-        let now = now_unix_secs().unwrap_or(0);
+    // Phase D: `find_community_members` removed.  It read and merged the
+    // legacy unsigned `CommunityMembers` blob, which the DHT validator
+    // rejects, so it could only ever return this node's own local entry.
+    // Membership discovery now goes through signed per-member records
+    // (§15.4.1) surfaced by the paged member index (§15.6.1) — see
+    // `fetch_community_members_page`.
 
-        // Start with local data (our own membership entry).
-        let mut merged = {
-            let mut state = self.state.write().await;
-            state
-                .dht
-                .find_value(key, now)
-                .and_then(|v| crate::cbor::from_slice::<CommunityMembers>(&v.value).ok())
-                .unwrap_or(CommunityMembers {
-                    community_share_id: community_share_id.0,
-                    members: vec![],
-                    updated_at: now,
-                })
-        };
-
-        // Query each seed peer for the community key and merge results.
-        for peer in seed_peers {
-            let Ok(result) = query_find_value(transport, peer, key).await else {
-                continue;
-            };
-            if let Some(remote) = result.value
-                && remote.key == key
-                && remote.value.len() <= MAX_VALUE_SIZE
-                && let Ok(cm) = crate::cbor::from_slice::<CommunityMembers>(&remote.value)
-                && cm.community_share_id == community_share_id.0
-            {
-                for member in cm.members {
-                    if !merged.members.contains(&member) {
-                        merged.members.push(member);
-                    }
-                }
-                merged.updated_at = merged.updated_at.max(cm.updated_at);
-            }
-        }
-
-        // Cache the merged result locally.
-        if let Ok(encoded) = crate::cbor::to_vec(&merged) {
-            let mut state = self.state.write().await;
-            let _ = state.dht.store(key, encoded, DEFAULT_TTL_SECS, now);
-        }
-
-        debug!(
-            community = %hex::encode(&community_share_id.0[..8]),
-            members = merged.members.len(),
-            seed_peers = seed_peers.len(),
-            "find_community_members: done"
-        );
-
-        merged
-    }
-
-    /// Insert or update the local DHT entry for a community the node has
-    /// joined so that other peers can discover this node as a community
-    /// member via `community_info_key(share_id)`.
-    ///
-    /// # Deprecated (Phase C)
-    ///
-    /// Writes the legacy unsigned `CommunityMembers` blob.  That value is
-    /// **already rejected by every receiving peer** —
-    /// `validate_dht_value_for_known_keyspaces` refuses unsigned blobs
-    /// because any peer could forge one — so it never replicates and only
-    /// occupies local DHT space.
-    ///
-    /// Use [`NodeHandle::publish_community_member_record`] instead, which
-    /// publishes a signed per-member record (§15.4.1) that peers accept.
-    /// Scheduled for removal in v0.6.0 (Phase D).
-    #[deprecated(
-        since = "0.5.0",
-        note = "legacy unsigned CommunityMembers blob; receiving peers reject it. Use publish_community_member_record (§15.4.1). Removed in v0.6.0."
-    )]
-    pub async fn upsert_community_member(
-        &self,
-        community_share_id: ShareId,
-        self_addr: PeerAddr,
-    ) -> anyhow::Result<()> {
-        let key = community_info_key(&community_share_id);
-        let now = now_unix_secs()?;
-        let mut state = self.state.write().await;
-        let mut cm: CommunityMembers = state
-            .dht
-            .find_value(key, now)
-            .and_then(|v| crate::cbor::from_slice(&v.value).ok())
-            .unwrap_or(CommunityMembers {
-                community_share_id: community_share_id.0,
-                members: vec![],
-                updated_at: now,
-            });
-        if !cm.members.contains(&self_addr) {
-            cm.members.push(self_addr);
-        }
-        cm.updated_at = now;
-        state
-            .dht
-            .store(key, crate::cbor::to_vec(&cm)?, DEFAULT_TTL_SECS, now)?;
-        Ok(())
-    }
-
-    /// Re-announce DHT community member entries for all joined communities.
-    ///
-    /// # Deprecated (Phase C)
-    ///
-    /// Refreshes legacy unsigned blobs that no peer accepts.  The signed
-    /// equivalent, [`NodeHandle::reannounce_community_member_records`], is
-    /// already called from `dht_republish_once`.
-    /// Scheduled for removal in v0.6.0 (Phase D).
-    #[deprecated(
-        since = "0.5.0",
-        note = "refreshes legacy blobs that peers reject. Use reannounce_community_member_records (§15.4.1). Removed in v0.6.0."
-    )]
-    pub async fn reannounce_community_memberships(
-        &self,
-        self_addr: PeerAddr,
-    ) -> anyhow::Result<usize> {
-        let community_ids: Vec<[u8; 32]> = {
-            let state = self.state.read().await;
-            state.communities.keys().copied().collect()
-        };
-        let mut count = 0usize;
-        for cid in community_ids {
-            #[allow(deprecated)]
-            let result = self
-                .upsert_community_member(ShareId(cid), self_addr.clone())
-                .await;
-            if let Err(e) = result {
-                debug!(
-                    community = %hex::encode(&cid[..8]),
-                    error = %e,
-                    "reannounce_community_memberships: failed"
-                );
-            } else {
-                count += 1;
-            }
-        }
-        if count > 0 {
-            debug!(count, "reannounce_community_memberships: updated");
-        }
-        Ok(count)
-    }
+    // Phase D: `upsert_community_member` and
+    // `reannounce_community_memberships` removed.  Both wrote the legacy
+    // unsigned `CommunityMembers` blob, which every receiving peer rejected
+    // as forgeable, so they only ever produced dead local state.  Signed
+    // per-member records (§15.4.1) are the replacement — see
+    // `publish_community_member_record` and
+    // `reannounce_community_member_records` below.
 
     // ── §15 per-member record APIs ──────────────────────────────────
 
@@ -1253,9 +1112,6 @@ impl NodeHandle {
     }
 }
 
-/// If `value` deserializes as [`CommunityMembers`], merge its member list
-/// with any existing entry already stored in the local DHT at `key`.
-/// Otherwise return `value` unchanged.
 /// Attempt to ingest a raw DHT value into the community index.
 ///
 /// Checks the tag byte and decodes the record only for the two typed
@@ -1357,17 +1213,7 @@ async fn ingest_into_community_index_if_applicable(key: [u8; 32], value: &[u8], 
     }
 }
 
-/// No-op stub retained for call-site compatibility.
-///
-/// Legacy `CommunityMembers` blobs are no longer accepted by
-/// `validate_dht_value_for_known_keyspaces` (unsigned, easily forged by any
-/// peer).  New STORE requests for this key-space are rejected before this
-/// function is reached, so the merge logic is never needed.
-async fn merge_community_members_if_applicable(
-    _key: [u8; 32],
-    value: Vec<u8>,
-    _node: &NodeHandle,
-    _now: u64,
-) -> Vec<u8> {
-    value
-}
+// Phase D: `merge_community_members_if_applicable` removed.  It had already
+// been reduced to an identity function — legacy blobs are rejected by
+// `validate_dht_value_for_known_keyspaces` before `dht_store` reaches any
+// merge step — so the call site now passes the value through directly.

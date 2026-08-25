@@ -359,8 +359,14 @@ Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community
     - Removed from desktop `join_community`, `create_community`, and the relay-tunnel reannounce path.
     - `upsert_community_member` and `reannounce_community_memberships` marked `#[deprecated]` (not deleted) so out-of-tree callers get a compile-time warning before removal in v0.6.0 (Phase D). Production code builds with zero deprecation warnings, confirming no live call sites remain.
     - **Finding that made this safe:** the schedule assumed the legacy blob was still crossing the wire, but `validate_dht_value_for_known_keyspaces` already rejects unsigned `CommunityMembers` values as forgeable — a remote `STORE` never lands. The sole remaining producer wrote directly into the *local* DHT, bypassing the validator. Removing the write therefore drops dead local state rather than breaking interop.
-    - 3 interop tests: `phase_c_legacy_blob_is_local_only_and_never_replicates`, `phase_c_per_record_membership_replicates_where_legacy_cannot`, `phase_c_legacy_read_path_still_serves_without_legacy_writes`. These are the mixed-version checks the plan required before advancing a phase.
+    - 3 interop tests written before any code changed. These are the mixed-version checks the plan required before advancing a phase.
     - Read-side fallback retained through v0.5.x per schedule; removed in Phase D.
+  - **Phase 4 / Phase D (done, v0.6.0): legacy client path and producers deleted.**
+    - Removed: `upsert_community_member`, `reannounce_community_memberships` (wrote blobs peers rejected); `find_community_members` (read/merged those blobs, so it could only ever return this node's own local entry); `query_community_public_shares` + `fetch_community_public_shares_from_peer` (client half of the legacy browse request); the legacy fallback arm in desktop `browse_community`; and `merge_community_members_if_applicable`, which had already decayed to an identity function.
+    - **Kept deliberately:** the *server-side* `ListCommunityPublicShares` handler (`MsgType` 406/407 stay registered) — answering a legacy request correctly costs nothing and beats an unknown-message-type error. Also kept `list_local_community_public_shares`, which additionally backs **local self-listing** in desktop browse; removing it would have been a real regression unrelated to the wire path.
+    - **Why no release window between C and D:** the schedule assumed one was needed for stragglers, but v0.5.0 raised `PROTOCOL_VERSION` to 2 (§16) and pre-1.0 policy demands an exact match. Any peer old enough to need the fallback cannot handshake with a v0.5.0+ node at all, so the fallback was unreachable code rather than a compatibility bridge. Confirmed with the user that no external deployments exist yet.
+    - Tests renamed/retargeted to Phase D: `phase_d_legacy_blob_is_rejected_by_validator` (constructs the blob directly now that the producer is gone), `phase_d_per_record_membership_replicates_where_legacy_cannot`, `phase_d_legacy_server_handler_still_serves`. Deleted `upsert_community_member_roundtrip` — its subject no longer exists, and the invariant that mattered is covered by the first test.
+    - `CommunityMembers` remains in `wire.rs` solely so the DHT validator can recognise and reject it.
 
 - [x] **J-5B: Protocol version bump and capability flags**
   - `Capabilities` gains `community_paged_browse`, `community_search`, `community_delta_sync` (all `#[serde(default)]` bool fields)
@@ -449,8 +455,12 @@ Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community
 
 | Priority | Items | Notes |
 |----------|-------|-------|
-| **1 — Done** | A (all), B, C.§2.10, D.§4.14, E (all), F, G.1, G.2, G.3, H.1, H.2, H.3, **I.1, I.2, I.3**, **D.§4.9**, **C.§2.7, C.§2.8, C.§2.9**, **D.§4.8, D.§4.10, D.§4.11**, **J-1A…J-7C (all)**, **H.4 RA-01..RA-06** | 321 tests passing (297 core + 15 desktop + 9 relay), 6 ignored (4 simulations + 2 release-gate benchmarks), clippy clean. |
+| **1 — Done** | A (all), B, C.§2.10, D.§4.14, E (all), F, G.1, G.2, G.3, H.1, H.2, H.3, **I.1, I.2, I.3**, **D.§4.9**, **C.§2.7, C.§2.8, C.§2.9**, **D.§4.8, D.§4.10, D.§4.11**, **J-1A…J-7C (all)**, **J-5A Phase C + Phase D**, **H.4 RA-01..RA-06** | 325 tests passing (301 core + 15 desktop + 9 relay), 6 ignored (4 simulations + 2 release-gate benchmarks), clippy clean. Community migration complete through Phase D. |
 | **2 — Deferred** | D.§4.12, J-3C | Mobile incentives require platform APIs outside the library layer. Multi-relay partitioning deferred until relay federation is needed. |
+
+Every item from the original advisories is now either implemented or
+explicitly deferred with a stated reason. The two deferrals are blocked on
+external factors (platform APIs; relay federation demand), not on effort.
 
 ### Test-suite maintenance
 

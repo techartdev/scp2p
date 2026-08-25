@@ -851,32 +851,20 @@ impl DesktopAppState {
                                 }
                             }
                         }
-                        _ => {
-                            // Peer does not have paged index — fall back to
-                            // per-peer ListCommunityPublicShares (§15.2).
-                            match node
-                                .fetch_community_public_shares_from_peer(
-                                    &transport,
-                                    &peer,
-                                    scp2p_core::ShareId(community.share_id),
-                                    community.share_pubkey,
-                                    64,
-                                )
-                                .await
-                            {
-                                Ok(shares) => {
-                                    for share in shares {
-                                        if seen_shares.insert(share.share_id) {
-                                            public_shares.push(public_share_view(&peer, share));
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    if first_err.is_none() {
-                                        first_err = Some(err);
-                                    }
-                                }
+                        Err(err) => {
+                            // Phase D: the legacy per-peer
+                            // `ListCommunityPublicShares` fallback is gone.
+                            // Every reachable peer speaks protocol v2 and
+                            // therefore serves the paged index (§15.6.1), so a
+                            // failure here is a real error rather than an
+                            // old-peer signal to downgrade.
+                            if first_err.is_none() {
+                                first_err = Some(err);
                             }
+                        }
+                        Ok(_) => {
+                            // Empty first page: the peer has no shares for
+                            // this community.  Nothing to merge.
                         }
                     }
                 }

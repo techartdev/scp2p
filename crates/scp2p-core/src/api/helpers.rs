@@ -28,13 +28,13 @@ use crate::{
     },
     search::IndexedItem,
     wire::{
-        CommunityEventsResp, CommunityMembersPageResponse, CommunityPublicShareList,
-        CommunitySearchResultsResp, CommunitySharesPageResponse, CommunityStatus, Envelope,
-        FLAG_RESPONSE, FindNode, FindNodeResult, FindValue, FindValueResult, GetCommunityStatus,
-        ListCommunityEventsReq, ListCommunityMembersPage, ListCommunityPublicShares,
-        ListCommunitySharesPage, ListPublicShares, MsgType, Providers, PublicShareList,
-        RelayListRequest, RelayListResponse, RelayPayloadKind as WireRelayPayloadKind,
-        SearchCommunitySharesReq, Store as WireStore, WirePayload,
+        CommunityEventsResp, CommunityMembersPageResponse, CommunitySearchResultsResp,
+        CommunitySharesPageResponse, CommunityStatus, Envelope, FLAG_RESPONSE, FindNode,
+        FindNodeResult, FindValue, FindValueResult, GetCommunityStatus, ListCommunityEventsReq,
+        ListCommunityMembersPage, ListCommunitySharesPage, ListPublicShares, MsgType, Providers,
+        PublicShareList, RelayListRequest, RelayListResponse,
+        RelayPayloadKind as WireRelayPayloadKind, SearchCommunitySharesReq, Store as WireStore,
+        WirePayload,
     },
 };
 
@@ -518,45 +518,10 @@ pub(super) struct CommunityStatusResult {
     pub name: Option<String>,
 }
 
-pub(super) async fn query_community_public_shares<T: RequestTransport + ?Sized>(
-    transport: &T,
-    peer: &PeerAddr,
-    community_share_id: ShareId,
-    community_share_pubkey: [u8; 32],
-    max_entries: u16,
-    requester_node_pubkey: Option<[u8; 32]>,
-    requester_membership_proof: Option<Vec<u8>>,
-) -> anyhow::Result<Vec<PublicShareSummary>> {
-    let req_id = next_req_id();
-    let request = Envelope::from_typed(
-        req_id,
-        0,
-        &WirePayload::ListCommunityPublicShares(ListCommunityPublicShares {
-            community_share_id: community_share_id.0,
-            community_share_pubkey,
-            max_entries,
-            requester_node_pubkey,
-            requester_membership_proof,
-        }),
-    )?;
-    let response = transport
-        .request(peer, request, Duration::from_secs(3))
-        .await?;
-    if response.r#type != MsgType::CommunityPublicShareList as u16 {
-        anyhow::bail!("unexpected community public share list response type");
-    }
-    if response.req_id != req_id {
-        anyhow::bail!("community public share list response req_id mismatch");
-    }
-    if response.flags & FLAG_RESPONSE == 0 {
-        anyhow::bail!("community public share list response missing response flag");
-    }
-    let payload: CommunityPublicShareList = crate::cbor::from_slice(&response.payload)?;
-    if payload.community_share_id != community_share_id.0 {
-        anyhow::bail!("community public share list response share_id mismatch");
-    }
-    Ok(payload.shares)
-}
+// Phase D: `query_community_public_shares` removed — clients no longer
+// issue the legacy `ListCommunityPublicShares` request.  The server-side
+// handler is retained (see `node_net.rs`) so that a peer still sending it
+// gets a correct answer instead of an unknown-message-type error.
 
 /// Ask a peer for a paged member list for a community (§15.6.1).
 pub(super) async fn query_community_members_page<T: RequestTransport + ?Sized>(

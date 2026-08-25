@@ -1306,38 +1306,12 @@ impl NodeHandle {
         Ok((result.joined, result.name))
     }
 
-    pub async fn fetch_community_public_shares_from_peer<T: RequestTransport + ?Sized>(
-        &self,
-        transport: &T,
-        peer: &PeerAddr,
-        community_share_id: ShareId,
-        community_share_pubkey: [u8; 32],
-        max_entries: u16,
-    ) -> anyhow::Result<Vec<PublicShareSummary>> {
-        // Build requester identity fields to support strict-mode servers.
-        let (requester_node_pubkey, requester_membership_proof) = {
-            let state = self.state.read().await;
-            let node_pubkey = state
-                .node_key
-                .map(|k| SigningKey::from_bytes(&k).verifying_key().to_bytes());
-            let proof = state
-                .communities
-                .get(&community_share_id.0)
-                .and_then(|m| m.token.as_ref())
-                .and_then(|t| crate::cbor::to_vec(t).ok());
-            (node_pubkey, proof)
-        };
-        query_community_public_shares(
-            transport,
-            peer,
-            community_share_id,
-            community_share_pubkey,
-            max_entries,
-            requester_node_pubkey,
-            requester_membership_proof,
-        )
-        .await
-    }
+    // Phase D: `fetch_community_public_shares_from_peer` removed.  Clients
+    // browse via the paged index (§15.6.1) exclusively; see
+    // `fetch_community_shares_page`.  The server-side handler for
+    // `ListCommunityPublicShares` is retained so that any peer still issuing
+    // the legacy request receives a correct answer rather than an
+    // unknown-message-type error.
 
     /// Fetch a paged member list from a remote peer (\u00a715.6.1).
     pub async fn fetch_community_members_page<T: RequestTransport + ?Sized>(

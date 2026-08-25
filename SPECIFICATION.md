@@ -976,3 +976,10 @@ with the stated pre-1.0 policy.
 - rotation chain resolution with revocation dominance, cycle detection, depth cap
 - enforcement in subscription manifest verification
 - `PROTOCOL_VERSION` bumped 1 → 2
+
+### Milestone 12: Legacy community migration complete (Phase D) [done]
+- legacy `CommunityMembers` producers deleted (write, reannounce, read-merge)
+- legacy client browse path removed; all browse goes through the paged index (§15.6.1)
+- server-side `ListCommunityPublicShares` handler retained for inbound compatibility
+- local self-listing preserved (distinct concern from the wire path)
+- see `DEPRECATION_SCHEDULE.md` Phase D for the full rationale

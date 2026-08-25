@@ -1,8 +1,8 @@
 # SCP2P — Community Subsystem Deprecation Schedule
 
 > **Applies to:** §15 Large-Scale Community Discovery & Search migration
-> **Current version:** 0.5.0 (protocol version 2)
-> **Current phase:** Phase C — legacy write removed
+> **Current version:** 0.6.0-dev (protocol version 2)
+> **Current phase:** Phase D — legacy client path removed (migration complete)
 > **Last updated:** 2026-03-06
 
 ---
@@ -71,14 +71,50 @@ and operator guidance for each rollout phase.
 > now `#[deprecated]` rather than deleted, so any out-of-tree caller gets
 > a compile-time warning before removal in v0.6.0.
 
-### Phase D — Full removal (planned: v0.6.0)
+### Phase D — Full removal (**current: v0.6.0**)
 
 | Aspect | Behavior |
 |--------|----------|
 | **Writers** | Per-record model only. |
-| **Readers** | Legacy `ListCommunityPublicShares` fallback **removed**. All community browse goes through paginated/search APIs or materialized pages. |
-| **Relays** | Legacy blob code paths fully removed from codebase. |
+| **Readers** | Legacy `ListCommunityPublicShares` **client** path removed. All community browse goes through paginated/search APIs or materialized pages. |
+| **Relays** | Legacy blob code paths removed from the codebase. |
 | **Minimum versions** | Desktop ≥ 0.5.0, Relay ≥ 0.6.0, CLI ≥ 0.5.0 |
+
+> **Why Phase D followed Phase C immediately.**
+>
+> The schedule anticipated a release window between C and D so that
+> stragglers could upgrade. That window turned out to be unnecessary,
+> for a reason the original plan did not foresee: **v0.5.0 raised
+> `PROTOCOL_VERSION` to 2 (§16), and pre-1.0 policy requires an exact
+> match.** Any peer old enough to need the legacy fallback cannot complete
+> a handshake with a v0.5.0+ node at all, so the fallback could never be
+> exercised. It was unreachable code, not a compatibility bridge.
+>
+> **What was removed:**
+> - `upsert_community_member`, `reannounce_community_memberships` — wrote
+>   the legacy blob that receiving peers rejected.
+> - `find_community_members` — read and merged that blob; since the
+>   validator rejects it, this could only ever return the node's own local
+>   entry.
+> - `query_community_public_shares` and
+>   `fetch_community_public_shares_from_peer` — the client half of the
+>   legacy browse request.
+> - The legacy fallback arm in desktop `browse_community`.
+>
+> **What was deliberately kept:**
+> - The **server-side** `ListCommunityPublicShares` handler. Answering a
+>   legacy request correctly costs nothing and is strictly friendlier than
+>   returning an unknown-message-type error. `MsgType` 406/407 and the
+>   wire structs remain registered.
+> - `list_local_community_public_shares`, which also backs **local
+>   self-listing** in desktop browse — your own shares appear without a
+>   network round-trip. This is a separate concern from the wire path and
+>   would have been a real regression to remove.
+>
+> Pinned by three tests in `api/tests.rs`:
+> `phase_d_legacy_blob_is_rejected_by_validator`,
+> `phase_d_per_record_membership_replicates_where_legacy_cannot`, and
+> `phase_d_legacy_server_handler_still_serves`.
 
 ---
 
@@ -88,19 +124,28 @@ and operator guidance for each rollout phase.
 |-----------|--------|--------|--------|--------|
 | Legacy blob write | ✅ | ✅ | ❌ | ❌ |
 | Legacy blob read | ✅ | ✅ | ✅ (fallback) | ❌ |
+| Legacy browse — client sends | ✅ | ✅ (fallback) | ✅ (fallback) | ❌ |
+| Legacy browse — server answers | ✅ | ✅ | ✅ | ✅ (retained) |
 | Per-record write | ✅ | ✅ | ✅ | ✅ |
 | Per-record read | ✅ | ✅ | ✅ | ✅ |
 | Materialized pages | ✅ | ✅ | ✅ | ✅ |
-| Paginated browse API | ✅ | ✅ (default) | ✅ | ✅ |
+| Paginated browse API | ✅ | ✅ (default) | ✅ | ✅ (only) |
 | Community search API | ✅ | ✅ | ✅ | ✅ |
 | Delta-sync API | ✅ | ✅ | ✅ | ✅ |
 | Key rotation/revocation (§16) | ❌ | ❌ | ✅ | ✅ |
 | `PROTOCOL_VERSION` | 1 | 1 | 2 | 2 |
 
-Note the protocol-version row: v0.5.x does **not** handshake with v0.4.x or
-earlier (§16.8). Legacy-blob compatibility is therefore moot across that
-boundary — those peers cannot connect at all. The legacy read fallback in
-v0.5.x exists for mixed *v0.5.x* deployments, not for v0.4.x interop.
+Two rows deserve attention:
+
+**Protocol version.** v0.5.0+ does **not** handshake with v0.4.x or earlier
+(§16.8). Legacy compatibility is therefore moot across that boundary — those
+peers cannot connect at all. This is what made Phase D safe to ship without
+waiting a release window: the fallback it removed was unreachable.
+
+**Legacy browse is split into send/answer.** v0.6.x clients never *send*
+`ListCommunityPublicShares`, but a v0.6.x server still *answers* it. Keeping
+the handler costs nothing and is friendlier than an unknown-message-type
+error, so `MsgType` 406/407 stay registered.
 
 ---
 
@@ -145,7 +190,7 @@ capability data is only learned after a successful handshake.
 | `0x35` | `MaterializedSharesPage` | **Stable** | Same |
 | `0x36` | `KeyRotationRecord` | **Stable** | §16; added v0.5.0 (protocol v2) |
 | `0x37` | `KeyRevocationRecord` | **Stable** | §16; added v0.5.0 (protocol v2) |
-| Legacy `CommunityMembers` | (untagged CBOR) | **Deprecated** | Removed in v0.6.0 |
+| Legacy `CommunityMembers` | (untagged CBOR) | **Removed** | Producers deleted in v0.6.0 (Phase D). The struct remains in `wire.rs` only so the DHT validator can recognise and reject it. |
 
 ---
 
