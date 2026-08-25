@@ -261,11 +261,12 @@ impl DesktopAppState {
                                                 })
                                                 .await;
                                             let _ = tunnel_handle
-                                                .reannounce_content_providers(self_addr.clone())
+                                                .reannounce_content_providers(self_addr)
                                                 .await;
-                                            let _ = tunnel_handle
-                                                .reannounce_community_memberships(self_addr)
-                                                .await;
+                                            // Phase C: legacy community blob
+                                            // reannouncement removed; signed
+                                            // per-member records are refreshed
+                                            // by `dht_republish_once`.
                                         }
                                     }
 
@@ -432,12 +433,11 @@ impl DesktopAppState {
                 scp2p_core::wire::CommunityMemberStatus::Joined,
             )
             .await;
-        // Also publish legacy CommunityMembers blob for backward compat.
-        if let Ok(self_addr) = self.resolve_self_addr(&node).await {
-            let _ = node
-                .upsert_community_member(scp2p_core::ShareId(share_id), self_addr)
-                .await;
-        }
+        // Phase C (DEPRECATION_SCHEDULE): the legacy `CommunityMembers` blob
+        // is no longer written.  It was already unreachable over the network —
+        // the DHT validator rejects unsigned blobs as forgeable — so this only
+        // removes dead local state.  The signed per-member record above is the
+        // replacement; the read-side fallback stays until Phase D.
         self.community_views().await
     }
 
@@ -480,10 +480,8 @@ impl DesktopAppState {
                 scp2p_core::wire::CommunityMemberStatus::Joined,
             )
             .await;
-        // Also publish legacy CommunityMembers blob for backward compat.
-        if let Ok(self_addr) = self.resolve_self_addr(&node).await {
-            let _ = node.upsert_community_member(share_id, self_addr).await;
-        }
+        // Phase C: legacy `CommunityMembers` blob no longer written (see
+        // `join_community` for rationale).
         Ok(CreateCommunityResult {
             share_id_hex: hex::encode(share_id.0),
             share_pubkey_hex: hex::encode(share_pubkey.to_bytes()),

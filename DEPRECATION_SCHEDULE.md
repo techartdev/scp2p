@@ -1,9 +1,9 @@
 # SCP2P — Community Subsystem Deprecation Schedule
 
 > **Applies to:** §15 Large-Scale Community Discovery & Search migration
-> **Current version:** 0.4.0 (protocol version 1)
-> **Current phase:** Phase B — per-record preferred
-> **Last updated:** 2026-03-05
+> **Current version:** 0.5.0 (protocol version 2)
+> **Current phase:** Phase C — legacy write removed
+> **Last updated:** 2026-03-06
 
 ---
 
@@ -29,7 +29,7 @@ and operator guidance for each rollout phase.
 | **Relays** | Ingest both tag `0x31`/`0x32` records into `CommunityIndex`; serve paginated, search, and delta-sync endpoints. Publish materialized pages (tags `0x34`/`0x35`) hourly. |
 | **Minimum versions** | Desktop ≥ 0.3.0, Relay ≥ 0.3.0, CLI ≥ 0.3.0 |
 
-### Phase B — Per-record preferred (**current: v0.4.0**)
+### Phase B — Per-record preferred (v0.4.0)
 
 | Aspect | Behavior |
 |--------|----------|
@@ -38,7 +38,7 @@ and operator guidance for each rollout phase.
 | **Relays** | Give per-record index full authority; legacy blob lookups dropped from hot path. |
 | **Minimum versions** | Desktop ≥ 0.3.0, Relay ≥ 0.4.0 |
 
-### Phase C — Legacy write removal (planned: v0.5.0)
+### Phase C — Legacy write removal (**current: v0.5.0**)
 
 | Aspect | Behavior |
 |--------|----------|
@@ -46,6 +46,30 @@ and operator guidance for each rollout phase.
 | **Readers** | Retain read-side fallback for one additional release window (v0.5.x) to support mixed networks with Phase-A writers still in the wild. |
 | **Relays** | No longer accept or store legacy community blobs. |
 | **Minimum versions** | Desktop ≥ 0.4.0, Relay ≥ 0.5.0, CLI ≥ 0.4.0 |
+
+> **Phase C was less disruptive than this schedule anticipated.**
+>
+> When Phase C was drafted it assumed the legacy blob was still flowing
+> between peers, so dropping the write looked like a wire-compatibility
+> event. It is not. `validate_dht_value_for_known_keyspaces` already
+> rejects unsigned `CommunityMembers` values — any peer can forge one, so
+> a remote `STORE` never lands. The only remaining producer was
+> `upsert_community_member`, which writes straight into the *local* DHT
+> without passing the validator.
+>
+> So the blob has been unable to replicate for some time; removing the
+> write only drops dead local state. Verified by three tests in
+> `api/tests.rs`:
+> `phase_c_legacy_blob_is_local_only_and_never_replicates` (a locally
+> written blob is rejected when offered to a peer),
+> `phase_c_per_record_membership_replicates_where_legacy_cannot` (the
+> signed replacement crosses the same boundary), and
+> `phase_c_legacy_read_path_still_serves_without_legacy_writes` (the
+> legacy read fallback keeps working with no legacy writes anywhere).
+>
+> `upsert_community_member` and `reannounce_community_memberships` are
+> now `#[deprecated]` rather than deleted, so any out-of-tree caller gets
+> a compile-time warning before removal in v0.6.0.
 
 ### Phase D — Full removal (planned: v0.6.0)
 
@@ -70,6 +94,13 @@ and operator guidance for each rollout phase.
 | Paginated browse API | ✅ | ✅ (default) | ✅ | ✅ |
 | Community search API | ✅ | ✅ | ✅ | ✅ |
 | Delta-sync API | ✅ | ✅ | ✅ | ✅ |
+| Key rotation/revocation (§16) | ❌ | ❌ | ✅ | ✅ |
+| `PROTOCOL_VERSION` | 1 | 1 | 2 | 2 |
+
+Note the protocol-version row: v0.5.x does **not** handshake with v0.4.x or
+earlier (§16.8). Legacy-blob compatibility is therefore moot across that
+boundary — those peers cannot connect at all. The legacy read fallback in
+v0.5.x exists for mixed *v0.5.x* deployments, not for v0.4.x interop.
 
 ---
 

@@ -354,7 +354,13 @@ Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community
   - `publish_share` emits `CommunityShareRecord` for each community in `manifest.communities`.
   - `dht_republish_once` calls `reannounce_community_member_records()` alongside legacy community membership refresh.
   - `publish_community_member_record` and `publish_community_share_record` now ingest into `community_index` immediately (not just on `dht_store` path).
-  - Phase 2/3 (future): read new first with fallback, then stop writing legacy blobs.
+  - Phase 2 (done, v0.4.0): read new first with fallback — capability-gated routing, see J-5B enforcement note.
+  - **Phase 3 / Phase C (done, v0.5.0): legacy `CommunityMembers` blob writes removed.**
+    - Removed from desktop `join_community`, `create_community`, and the relay-tunnel reannounce path.
+    - `upsert_community_member` and `reannounce_community_memberships` marked `#[deprecated]` (not deleted) so out-of-tree callers get a compile-time warning before removal in v0.6.0 (Phase D). Production code builds with zero deprecation warnings, confirming no live call sites remain.
+    - **Finding that made this safe:** the schedule assumed the legacy blob was still crossing the wire, but `validate_dht_value_for_known_keyspaces` already rejects unsigned `CommunityMembers` values as forgeable — a remote `STORE` never lands. The sole remaining producer wrote directly into the *local* DHT, bypassing the validator. Removing the write therefore drops dead local state rather than breaking interop.
+    - 3 interop tests: `phase_c_legacy_blob_is_local_only_and_never_replicates`, `phase_c_per_record_membership_replicates_where_legacy_cannot`, `phase_c_legacy_read_path_still_serves_without_legacy_writes`. These are the mixed-version checks the plan required before advancing a phase.
+    - Read-side fallback retained through v0.5.x per schedule; removed in Phase D.
 
 - [x] **J-5B: Protocol version bump and capability flags**
   - `Capabilities` gains `community_paged_browse`, `community_search`, `community_delta_sync` (all `#[serde(default)]` bool fields)

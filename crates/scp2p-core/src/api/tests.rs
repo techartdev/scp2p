@@ -4985,8 +4985,197 @@ async fn community_members_dht_merge_on_store() {
     );
 }
 
-/// upsert_community_member adds the node to the community DHT entry.
+// ══════════════════════════════════════════════════════════════════
+// Phase C — legacy CommunityMembers retirement (DEPRECATION_SCHEDULE)
+// ══════════════════════════════════════════════════════════════════
+//
+// Documents the actual mixed-version behaviour that Phase C depends on.
+// The headline finding: the legacy blob is ALREADY unreachable over the
+// network.  `validate_dht_value_for_known_keyspaces` rejects unsigned
+// `CommunityMembers` values (they are trivially forgeable), so a remote
+// STORE never lands.  Only the *local* write path in
+// `upsert_community_member` still produces one, because it writes straight
+// into the local DHT without passing the validator.
+//
+// The practical consequence is that "stop writing the legacy blob" is a
+// local-state cleanup, not a wire-compatibility event: no peer has been
+// able to receive one since the validator was tightened.
+
+/// A legacy blob written locally is never accepted from a remote peer,
+/// so it cannot propagate.  This is the invariant that makes retiring the
+/// write path safe.
 #[tokio::test]
+async fn phase_c_legacy_blob_is_local_only_and_never_replicates() {
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    let community_share_id = ShareId([131u8; 32]);
+    let key = crate::dht_keys::community_info_key(&community_share_id);
+    let addr = PeerAddr {
+        ip: "10.0.0.9".parse().unwrap(),
+        port: 7000,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+
+    // The local write path still produces a legacy blob (deprecated in
+    // Phase C, removed in Phase D) — exercised here deliberately to prove
+    // it cannot escape the local node.
+    #[allow(deprecated)]
+    handle
+        .upsert_community_member(community_share_id, addr.clone())
+        .await
+        .expect("local upsert succeeds");
+    let local = handle.dht_find_value(key).await.expect("find");
+    assert!(local.is_some(), "local blob exists (pre-Phase-C behaviour)");
+
+    // But that exact value, arriving from a peer, is rejected outright.
+    let blob = local.expect("local value").value;
+    let peer_node = Node::start(NodeConfig::default())
+        .await
+        .expect("start peer");
+    peer_node
+        .dht_store(WireStore {
+            key,
+            value: blob,
+            ttl_secs: 3600,
+        })
+        .await
+        .expect_err("legacy blob must be rejected on the receiving side");
+    assert!(
+        peer_node.dht_find_value(key).await.expect("find").is_none(),
+        "peer must not hold a legacy blob"
+    );
+}
+
+/// The per-record replacement propagates over the same path the legacy
+/// blob cannot, confirming there is a working substitute before the
+/// legacy write is removed.
+#[tokio::test]
+async fn phase_c_per_record_membership_replicates_where_legacy_cannot() {
+    use crate::dht_keys::community_member_key;
+    use crate::wire::{CommunityMemberRecord, CommunityMemberStatus};
+
+    let publisher = Node::start(NodeConfig::default())
+        .await
+        .expect("start publisher");
+    let receiver = Node::start(NodeConfig::default())
+        .await
+        .expect("start receiver");
+
+    let member_key = SigningKey::generate(&mut OsRng);
+    let member_pubkey = member_key.verifying_key().to_bytes();
+    let community_id = [132u8; 32];
+    let now = crate::transport::now_unix_secs().expect("now");
+
+    let record = CommunityMemberRecord::new_signed(
+        &member_key,
+        community_id,
+        1,
+        CommunityMemberStatus::Joined,
+        now,
+        now + 86_400,
+    )
+    .expect("sign member record");
+
+    let key = community_member_key(&community_id, &member_pubkey);
+    let encoded = record.encode_tagged().expect("encode");
+
+    // Both the origin and a remote peer accept the signed record.
+    publisher
+        .dht_store(WireStore {
+            key,
+            value: encoded.clone(),
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("publisher stores signed record");
+    receiver
+        .dht_store(WireStore {
+            key,
+            value: encoded,
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("receiver accepts signed record — legacy blob could not do this");
+
+    assert!(receiver.dht_find_value(key).await.expect("find").is_some());
+}
+
+/// Read-side fallback must survive Phase C: a node that never writes a
+/// legacy blob still answers legacy `ListCommunityPublicShares` requests,
+/// so older peers keep working through the deprecation window.
+#[tokio::test]
+async fn phase_c_legacy_read_path_still_serves_without_legacy_writes() {
+    let mut rng = OsRng;
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start node");
+
+    // Publish a public share into a community, using only the modern path.
+    let community = ShareKeypair::new(SigningKey::generate(&mut rng));
+    let share = ShareKeypair::new(SigningKey::generate(&mut rng));
+    let community_id = community.share_id().0;
+
+    // The listing endpoint only serves communities this node has joined.
+    // Join via the modern path only — no legacy blob is written.
+    handle
+        .join_community(ShareId(community_id), community.verifying_key().to_bytes())
+        .await
+        .expect("join community");
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let file = dir.path().join("doc.txt");
+    tokio::fs::write(&file, b"phase c payload")
+        .await
+        .expect("write file");
+
+    let provider = PeerAddr {
+        ip: "127.0.0.1".parse().unwrap(),
+        port: 7100,
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: None,
+        relay_via: None,
+    };
+    handle
+        .publish_files(
+            &[file],
+            None,
+            "Phase C Share",
+            None,
+            crate::manifest::ShareVisibility::Public,
+            &[community_id],
+            provider,
+            &share,
+        )
+        .await
+        .expect("publish");
+
+    // The legacy per-peer listing endpoint still answers, with no legacy
+    // CommunityMembers blob involved anywhere.
+    let shares = handle
+        .list_local_community_public_shares(
+            ShareId(community_id),
+            community.verifying_key().to_bytes(),
+            64,
+            None,
+            None,
+        )
+        .await
+        .expect("legacy listing still works");
+
+    assert_eq!(shares.len(), 1, "legacy read path must keep serving");
+    assert_eq!(shares[0].share_id, share.share_id().0);
+}
+
+/// upsert_community_member adds the node to the community DHT entry.
+///
+/// Retained through the Phase C deprecation window to pin the legacy
+/// behaviour until the method is removed in v0.6.0 (Phase D).
+#[tokio::test]
+#[allow(deprecated)]
 async fn upsert_community_member_roundtrip() {
     let handle = Node::start(NodeConfig::default())
         .await

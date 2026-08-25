@@ -810,6 +810,22 @@ impl NodeHandle {
     /// Insert or update the local DHT entry for a community the node has
     /// joined so that other peers can discover this node as a community
     /// member via `community_info_key(share_id)`.
+    ///
+    /// # Deprecated (Phase C)
+    ///
+    /// Writes the legacy unsigned `CommunityMembers` blob.  That value is
+    /// **already rejected by every receiving peer** —
+    /// `validate_dht_value_for_known_keyspaces` refuses unsigned blobs
+    /// because any peer could forge one — so it never replicates and only
+    /// occupies local DHT space.
+    ///
+    /// Use [`NodeHandle::publish_community_member_record`] instead, which
+    /// publishes a signed per-member record (§15.4.1) that peers accept.
+    /// Scheduled for removal in v0.6.0 (Phase D).
+    #[deprecated(
+        since = "0.5.0",
+        note = "legacy unsigned CommunityMembers blob; receiving peers reject it. Use publish_community_member_record (§15.4.1). Removed in v0.6.0."
+    )]
     pub async fn upsert_community_member(
         &self,
         community_share_id: ShareId,
@@ -839,8 +855,16 @@ impl NodeHandle {
 
     /// Re-announce DHT community member entries for all joined communities.
     ///
-    /// Called during `dht_republish_once` to keep community member
-    /// announcements fresh and ensure they survive app restarts.
+    /// # Deprecated (Phase C)
+    ///
+    /// Refreshes legacy unsigned blobs that no peer accepts.  The signed
+    /// equivalent, [`NodeHandle::reannounce_community_member_records`], is
+    /// already called from `dht_republish_once`.
+    /// Scheduled for removal in v0.6.0 (Phase D).
+    #[deprecated(
+        since = "0.5.0",
+        note = "refreshes legacy blobs that peers reject. Use reannounce_community_member_records (§15.4.1). Removed in v0.6.0."
+    )]
     pub async fn reannounce_community_memberships(
         &self,
         self_addr: PeerAddr,
@@ -851,10 +875,11 @@ impl NodeHandle {
         };
         let mut count = 0usize;
         for cid in community_ids {
-            if let Err(e) = self
+            #[allow(deprecated)]
+            let result = self
                 .upsert_community_member(ShareId(cid), self_addr.clone())
-                .await
-            {
+                .await;
+            if let Err(e) = result {
                 debug!(
                     community = %hex::encode(&cid[..8]),
                     error = %e,
