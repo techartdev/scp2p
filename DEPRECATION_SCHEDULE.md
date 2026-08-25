@@ -1,8 +1,9 @@
 # SCP2P — Community Subsystem Deprecation Schedule
 
 > **Applies to:** §15 Large-Scale Community Discovery & Search migration
-> **Current version:** 0.3.2 (protocol version 1)
-> **Last updated:** 2026-03-01
+> **Current version:** 0.4.0 (protocol version 1)
+> **Current phase:** Phase B — per-record preferred
+> **Last updated:** 2026-03-05
 
 ---
 
@@ -28,7 +29,7 @@ and operator guidance for each rollout phase.
 | **Relays** | Ingest both tag `0x31`/`0x32` records into `CommunityIndex`; serve paginated, search, and delta-sync endpoints. Publish materialized pages (tags `0x34`/`0x35`) hourly. |
 | **Minimum versions** | Desktop ≥ 0.3.0, Relay ≥ 0.3.0, CLI ≥ 0.3.0 |
 
-### Phase B — Per-record preferred (planned: v0.4.0)
+### Phase B — Per-record preferred (**current: v0.4.0**)
 
 | Aspect | Behavior |
 |--------|----------|
@@ -86,6 +87,19 @@ Peers advertise supported community features via `Capabilities` fields
 Clients **MUST** gate protocol-specific requests on these flags. Sending a
 paginated browse request to a peer that lacks `community_paged_browse` will
 receive an unknown-message-type error.
+
+**Implementation status (v0.4.0):** enforced. Capabilities observed during
+handshake are persisted per peer with a freshness window; requests are routed
+via `NodeHandle::filter_peers_by_capability`. Semantics differ by request type:
+
+| Request | Peers known to lack capability | Rationale |
+|---|---|---|
+| Paged browse | sorted last, still queried | legacy `ListCommunityPublicShares` fallback exists through Phase C |
+| Community search | dropped | no legacy equivalent — a query would only error |
+| Delta sync | dropped | no legacy equivalent |
+
+Peers whose capabilities have never been observed are still tried, since
+capability data is only learned after a successful handshake.
 
 ---
 

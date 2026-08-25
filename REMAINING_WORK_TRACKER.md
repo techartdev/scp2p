@@ -349,6 +349,17 @@ Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community
 - [x] **J-5B: Protocol version bump and capability flags**
   - `Capabilities` gains `community_paged_browse`, `community_search`, `community_delta_sync` (all `#[serde(default)]` bool fields)
   - All existing `Capabilities` initialisers updated to use `..Default::default()`
+  - **Enforcement (added v0.4.0):** flags were previously advertised but never
+    checked before dispatch, violating the §15.9.2 MUST. Now enforced:
+    `PeerDb::peers_with_capability` / `peer_supports` (fresh-capability
+    predicate selectors, generalised from `relay_capable_peers`),
+    `NodeHandle::filter_peers_by_capability` plus three convenience wrappers,
+    and `AppState::prefer_capable_peers` applied to browse, search, and events.
+    Search and delta sync **drop** known-incapable peers (no legacy fallback);
+    browse only **deprioritises** them so the Phase-C legacy fallback still
+    works. Peers with unobserved capabilities remain candidates.
+    Tests: `peer_supports_requires_fresh_capability_data`,
+    `peers_with_capability_selects_only_advertising_peers`.
 
 - [x] **J-5C: Explicit deprecation window**
   - Published `DEPRECATION_SCHEDULE.md` with 4-phase rollout (A–D), version compatibility matrix, minimum version requirements per component, capability flag reference, wire format stability table, operator guidance for relay and desktop/CLI, and protocol version policy.
@@ -357,6 +368,24 @@ Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community
 
 - [x] **J-6A: Property tests**
   - 11 new tests in `community_index::tests`: exhaustive permutation-based CRDT convergence (all orderings of 4 member records, 4 share records, 6 mixed ops), duplicate idempotency, replay-cannot-undo-leave, same-seq tiebreak by `updated_at`, share TTL purge, event compaction for orphaned logs, member/share eviction cap enforcement.
+
+- [x] **J-6B-net: §15.10 release-gate benchmark (end-to-end over TLS)** — *added v0.4.0*
+  - Gap closed: the simulations below measure only the in-memory index (µs-scale)
+    and never exercise the network, so they could not discharge the §15.10 gate,
+    which is specified over the wire.
+  - `release_gate_10k_member_browse_and_delta_over_network` and
+    `release_gate_100k_share_search_over_network` in `api/tests.rs` drive the
+    full path: client → TLS → envelope encode → dispatch → `CommunityIndex` →
+    response encode → decode.
+  - Measured: browse p95 **7.4 ms** (gate 1.5 s), share page p95 **24.3 ms**,
+    no-change delta refresh p95 **17.3 ms** (gate 500 ms), search p95 **4.4 ms**
+    (gate 2 s), retention **10,000 of 100,000 ingested** (bounded memory).
+  - Recorded in `SPECIFICATION.md` §15.10.1. Run:
+    `cargo test -p scp2p-core --release release_gate -- --ignored --nocapture`
+  - Note: benchmarks raise `AbuseLimits` above the protective 120-community-
+    requests-per-window default (J-3A), which is a safety control, not a
+    throughput target. Discovered because the first run was correctly rejected
+    by that limiter.
 
 - [x] **J-6B: Large-scale simulation**
   - 4 `#[ignore]` tests in `community_index::tests` (run with `--ignored`):

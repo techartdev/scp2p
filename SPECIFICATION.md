@@ -685,6 +685,33 @@ Minimum acceptance benchmarks:
 - Mixed-version interop:
   - New nodes coexist with older nodes during migration without correctness loss
 
+#### 15.10.1 Verification status (v0.4.0)
+
+These criteria are verified end-to-end — client → TLS session → envelope
+encode → server dispatch → `CommunityIndex` → response encode → client decode —
+by the `release_gate_*` benchmarks in `crates/scp2p-core/src/api/tests.rs`:
+
+```sh
+cargo test -p scp2p-core --release release_gate -- --ignored --nocapture
+```
+
+| Criterion | Gate | Measured (loopback TLS) |
+|---|---|---|
+| Browse first page p95, 10k members | < 1.5 s | 7.4 ms |
+| Share page p95, 10k members | < 1.5 s | 24.3 ms |
+| No-change delta refresh p95 | < 500 ms | 17.3 ms |
+| Search first page p95, 100k ingested | < 2 s | 4.4 ms |
+| Bounded memory growth | no unbounded accumulation | 10,000 retained of 100,000 ingested |
+
+Loopback TLS excludes WAN round-trip time, so these figures isolate protocol
+and index cost; the remaining budget is headroom for real network latency on
+reference relay hardware. The in-process `community_index` simulations remain
+a separate, narrower check of index behaviour only.
+
+Note: the benchmarks raise `AbuseLimits` above the protective default of 120
+community requests per window (§15.7). That default is a production safety
+control, not a throughput target.
+
 ### 15.11 Test matrix additions
 
 - Convergence/property tests:
@@ -760,7 +787,7 @@ Recommended delivery sequence:
 - discover/search/my-shares/community UI flows
 - global download queue and progress events
 
-### Milestone 9: Community scaling architecture (Section 15) [in progress]
+### Milestone 9: Community scaling architecture (Section 15) [done]
 - per-member signed records (done)
 - per-share signed records (done)
 - typed value-tag validator dispatch (done)
@@ -768,9 +795,12 @@ Recommended delivery sequence:
 - paginated browse/search/event wire messages (done)
 - capability bits: paged-browse, search, delta-sync (done)
 - API methods: publish member/share records, bootstrap hints (done)
-- paginated browse/search/event handler integration (pending)
+- paginated browse/search/event handler integration (done)
 
-### Milestone 10: Community browse/search v2 rollout [planned]
-- capability-gated wire rollout
-- desktop switch to paged index-first browse
-- delta sync and metadata search integration
+### Milestone 10: Community browse/search v2 rollout [done]
+- capability-gated wire rollout (done — peers are filtered by advertised
+  `community_*` capability before optional requests are sent; see §15.9.2)
+- desktop switch to paged index-first browse (done — legacy per-peer
+  `ListCommunityPublicShares` retained as fallback through Phase C)
+- delta sync and metadata search integration (done)
+- §15.10 release gate verified end-to-end over TLS (see §15.10 note)

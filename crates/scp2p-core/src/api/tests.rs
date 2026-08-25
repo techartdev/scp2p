@@ -4896,7 +4896,10 @@ async fn community_members_dht_store_and_find() {
 
     // Nothing was stored, so find should return None.
     let found = handle.dht_find_value(key).await.expect("find_value");
-    assert!(found.is_none(), "no entry should exist after rejected store");
+    assert!(
+        found.is_none(),
+        "no entry should exist after rejected store"
+    );
 }
 
 /// Storing a CommunityMembers value at a mismatched key is rejected.
@@ -4976,7 +4979,10 @@ async fn community_members_dht_merge_on_store() {
 
     // Nothing was stored — no merged entry exists.
     let found = handle.dht_find_value(key).await.expect("find");
-    assert!(found.is_none(), "no entry should exist after rejected stores");
+    assert!(
+        found.is_none(),
+        "no entry should exist after rejected stores"
+    );
 }
 
 /// upsert_community_member adds the node to the community DHT entry.
@@ -5205,4 +5211,319 @@ async fn publish_materialized_community_pages() {
     let shares_key = crate::dht_keys::community_shares_page_key(&cid, bucket, 0);
     let found = handle.dht_find_value(shares_key).await.expect("find");
     assert!(found.is_some(), "materialized shares page should be in DHT");
+}
+
+// ══════════════════════════════════════════════════════════════════
+// §15.10 release-gate benchmarks (end-to-end over real TLS)
+// ══════════════════════════════════════════════════════════════════
+//
+// The `community_index` simulations measure only the in-memory index and
+// therefore report microsecond latencies.  These benchmarks drive the full
+// network path instead:
+//
+//   client → TLS session → envelope encode → server dispatch
+//          → CommunityIndex → response encode → client decode
+//
+// §15.10 acceptance criteria measured here:
+//
+//   | Criterion                                    | Gate     |
+//   |----------------------------------------------|----------|
+//   | 10k-member community, browse first page p95   | < 1.5 s  |
+//   | delta refresh p95 for no-change polls         | < 500 ms |
+//   | 100k-share index, search first page p95       | < 2 s    |
+//   | bounded memory growth                         | eviction |
+//
+// Loopback TLS removes WAN latency, so these isolate *protocol + index*
+// cost; the gate budgets leave headroom for real RTT on relay hardware.
+//
+// Run explicitly:
+//   cargo test -p scp2p-core --release release_gate -- --ignored --nocapture
+
+/// Nearest-rank percentile over duration samples.
+fn gate_percentile(samples: &[Duration], p: f64) -> Duration {
+    if samples.is_empty() {
+        return Duration::ZERO;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+/// Start a TLS-serving node advertising full community capabilities.
+async fn start_release_gate_server() -> (
+    NodeHandle,
+    PeerAddr,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let mut rng = OsRng;
+    let node_key = SigningKey::generate(&mut rng);
+    let handle = Node::start(NodeConfig::default())
+        .await
+        .expect("start gate server");
+
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind probe");
+    let bind_addr = probe.local_addr().expect("probe addr");
+    drop(probe);
+
+    // Benchmarks intentionally issue far more than the default 120
+    // community requests per window (J-3A).  That default is a protective
+    // production value, not a throughput target, so raise it here to
+    // measure latency rather than rate-limiter rejection.
+    handle
+        .set_abuse_limits(AbuseLimits {
+            window_secs: 60,
+            max_total_requests_per_window: 100_000,
+            max_dht_requests_per_window: 100_000,
+            max_fetch_requests_per_window: 100_000,
+            max_relay_requests_per_window: 100_000,
+            max_chunk_requests_per_window: 100_000,
+            max_community_requests_per_window: 100_000,
+        })
+        .await
+        .expect("relax abuse limits for benchmark");
+
+    let tls_server = Arc::new(build_tls_server_handle().expect("tls"));
+    let task = handle.clone().start_tls_dht_service(
+        bind_addr,
+        node_key.clone(),
+        crate::capabilities::full_node_capabilities(),
+        tls_server,
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let peer = PeerAddr {
+        ip: "127.0.0.1".parse().expect("ip"),
+        port: bind_addr.port(),
+        transport: TransportProtocol::Tcp,
+        pubkey_hint: Some(node_key.verifying_key().to_bytes()),
+        relay_via: None,
+    };
+    (handle, peer, task)
+}
+
+/// Seed signed member/share records straight into the server index.
+async fn seed_gate_community(
+    handle: &NodeHandle,
+    community_id: [u8; 32],
+    members: usize,
+    shares: usize,
+    now: u64,
+) {
+    use crate::wire::{CommunityMemberRecord, CommunityMemberStatus, CommunityShareRecord};
+    let mut rng = OsRng;
+    let mut state = handle.state.write().await;
+    for _ in 0..members {
+        let key = SigningKey::generate(&mut rng);
+        let rec = CommunityMemberRecord::new_signed(
+            &key,
+            community_id,
+            1,
+            CommunityMemberStatus::Joined,
+            now,
+            now + 86_400,
+        )
+        .expect("sign member");
+        state.community_index.ingest_member_record(&rec);
+    }
+    for i in 0..shares {
+        let key = SigningKey::generate(&mut rng);
+        let rec = CommunityShareRecord::new_signed(
+            &key,
+            community_id,
+            [7u8; 32],
+            1,
+            now,
+            Some(format!("share about topic alpha {i}")),
+            Some(format!("description for benchmark share number {i}")),
+        )
+        .expect("sign share");
+        state.community_index.ingest_share_record(&rec);
+    }
+}
+
+/// Count retained shares by draining paged browse (no private field access).
+async fn count_retained_shares(
+    client: &NodeHandle,
+    transport: &TlsSessionTransport,
+    peer: &PeerAddr,
+    community_id: [u8; 32],
+) -> usize {
+    let mut total = 0usize;
+    let mut cursor = None;
+    for _ in 0..2_000 {
+        let resp = client
+            .fetch_community_shares_page(transport, peer, community_id, cursor.clone(), 100, None)
+            .await
+            .expect("shares page");
+        total += resp.entries.len();
+        if resp.next_cursor.is_none() || resp.next_cursor == cursor {
+            break;
+        }
+        cursor = resp.next_cursor;
+    }
+    total
+}
+
+/// §15.10: 10k-member community — browse first page p95 < 1.5s and
+/// no-change delta refresh p95 < 500ms, measured over real TLS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "release-gate benchmark; run with --ignored --release"]
+async fn release_gate_10k_member_browse_and_delta_over_network() {
+    const MEMBERS: usize = 10_000;
+    const SHARES: usize = 2_000;
+    const ITERATIONS: usize = 30;
+
+    let (server, peer, _task) = start_release_gate_server().await;
+    let community_id = [42u8; 32];
+    let now = 1_700_000_000u64;
+
+    let seed_start = std::time::Instant::now();
+    seed_gate_community(&server, community_id, MEMBERS, SHARES, now).await;
+    eprintln!(
+        "[gate] seeded {MEMBERS} members + {SHARES} shares in {:?}",
+        seed_start.elapsed()
+    );
+
+    let client = Node::start(NodeConfig::default())
+        .await
+        .expect("start client");
+    let transport = TlsSessionTransport {
+        signing_key: SigningKey::generate(&mut OsRng),
+        capabilities: crate::capabilities::full_node_capabilities(),
+    };
+
+    // ── Members first page ──
+    let mut browse = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = std::time::Instant::now();
+        let resp = client
+            .fetch_community_members_page(&transport, &peer, community_id, None, 100)
+            .await
+            .expect("members page over TLS");
+        browse.push(start.elapsed());
+        assert!(!resp.entries.is_empty(), "members page must not be empty");
+    }
+    let p95_browse = gate_percentile(&browse, 95.0);
+    eprintln!("[gate] members first-page p95 = {p95_browse:?} (gate < 1.5s)");
+    assert!(
+        p95_browse < Duration::from_millis(1_500),
+        "§15.10 browse p95 {p95_browse:?} exceeds 1.5s gate"
+    );
+
+    // ── Shares first page ──
+    let mut shares_lat = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = std::time::Instant::now();
+        let resp = client
+            .fetch_community_shares_page(&transport, &peer, community_id, None, 100, None)
+            .await
+            .expect("shares page over TLS");
+        shares_lat.push(start.elapsed());
+        assert!(!resp.entries.is_empty(), "shares page must not be empty");
+    }
+    let p95_shares = gate_percentile(&shares_lat, 95.0);
+    eprintln!("[gate] shares first-page p95 = {p95_shares:?} (gate < 1.5s)");
+    assert!(
+        p95_shares < Duration::from_millis(1_500),
+        "§15.10 shares browse p95 {p95_shares:?} exceeds 1.5s gate"
+    );
+
+    // ── No-change delta refresh ──
+    // Drain to the tip so later polls legitimately return nothing.
+    // 2k members + 2k shares generate ~4k events, but the log is capped at
+    // MAX_EVENT_LOG_SIZE and pages hold 200, so this bound is ample.
+    let mut cursor = None;
+    for _ in 0..200 {
+        let resp = client
+            .fetch_community_events(&transport, &peer, community_id, cursor.clone(), 200)
+            .await
+            .expect("drain events");
+        if resp.events.is_empty() || resp.next_cursor == cursor || resp.next_cursor.is_none() {
+            if resp.next_cursor.is_some() {
+                cursor = resp.next_cursor;
+            }
+            break;
+        }
+        cursor = resp.next_cursor;
+    }
+
+    let mut delta = Vec::with_capacity(ITERATIONS);
+    for _ in 0..ITERATIONS {
+        let start = std::time::Instant::now();
+        let resp = client
+            .fetch_community_events(&transport, &peer, community_id, cursor.clone(), 200)
+            .await
+            .expect("no-change poll");
+        delta.push(start.elapsed());
+        assert!(resp.events.is_empty(), "no-change poll returned events");
+    }
+    let p95_delta = gate_percentile(&delta, 95.0);
+    eprintln!("[gate] no-change delta refresh p95 = {p95_delta:?} (gate < 500ms)");
+    assert!(
+        p95_delta < Duration::from_millis(500),
+        "§15.10 delta refresh p95 {p95_delta:?} exceeds 500ms gate"
+    );
+}
+
+/// §15.10: 100k-share ingest — search first page p95 < 2s with bounded
+/// memory growth (eviction keeps retention at the per-community cap).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "release-gate benchmark; run with --ignored --release"]
+async fn release_gate_100k_share_search_over_network() {
+    const INGESTED: usize = 100_000;
+    const ITERATIONS: usize = 20;
+
+    let (server, peer, _task) = start_release_gate_server().await;
+    let community_id = [43u8; 32];
+    let now = 1_700_000_000u64;
+
+    let seed_start = std::time::Instant::now();
+    seed_gate_community(&server, community_id, 0, INGESTED, now).await;
+    eprintln!(
+        "[gate] ingested {INGESTED} shares in {:?}",
+        seed_start.elapsed()
+    );
+
+    let client = Node::start(NodeConfig::default())
+        .await
+        .expect("start client");
+    let transport = TlsSessionTransport {
+        signing_key: SigningKey::generate(&mut OsRng),
+        capabilities: crate::capabilities::full_node_capabilities(),
+    };
+
+    // Bounded memory growth: retention must be capped well below ingest.
+    let retained = count_retained_shares(&client, &transport, &peer, community_id).await;
+    eprintln!("[gate] retained shares after {INGESTED} ingest = {retained}");
+    assert!(
+        retained < INGESTED,
+        "§15.10 bounded memory: expected eviction below {INGESTED}, retained {retained}"
+    );
+
+    let mut search = Vec::with_capacity(ITERATIONS);
+    for i in 0..ITERATIONS {
+        let query = if i % 2 == 0 { "alpha" } else { "benchmark" };
+        let start = std::time::Instant::now();
+        let _ = client
+            .fetch_community_search_shares(
+                &transport,
+                &peer,
+                community_id,
+                query.to_string(),
+                None,
+                100,
+            )
+            .await
+            .expect("search over TLS");
+        search.push(start.elapsed());
+    }
+    let p95_search = gate_percentile(&search, 95.0);
+    eprintln!("[gate] search first-page p95 = {p95_search:?} (gate < 2s)");
+    assert!(
+        p95_search < Duration::from_secs(2),
+        "§15.10 search p95 {p95_search:?} exceeds 2s gate"
+    );
 }

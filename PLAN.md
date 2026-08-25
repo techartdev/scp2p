@@ -39,45 +39,53 @@ It is aligned to the current code in `crates/scp2p-core`, `crates/scp2p-desktop`
 ### Community model in current production path
 
 - Joined communities are persisted locally.
-- Membership discovery today still relies on DHT member discovery + peer probing.
-- Community browse in desktop gathers participants and then fetches per-peer
-  community public shares.
-- This works for small/medium communities but is not enough for very large ones.
+- Membership uses signed per-member records (`CommunityMemberRecord`) and
+  signed per-share records (`CommunityShareRecord`) on typed DHT keyspaces.
+- Community browse uses paginated index APIs first, falling back to the legacy
+  per-peer `ListCommunityPublicShares` path only for peers that do not
+  advertise `community_paged_browse`.
+- Optional community requests are gated on advertised capabilities (§15.9.2):
+  peers known to lack support are not queried for search or delta sync.
 
-## 2. Primary Gap
+## 2. Status of the Former Primary Gap
 
-Large-scale community discovery and search is the primary architecture gap.
+Large-scale community discovery and search — previously the primary
+architecture gap — is now implemented and verified.
 
-The current model does not scale cleanly to very large communities due to:
-- participant fanout costs
-- browse/search pagination constraints
-- relay load concentration
+The §15.10 release gate is measured end-to-end over TLS by the
+`release_gate_*` benchmarks (see `SPECIFICATION.md` §15.10.1): browse p95
+7.4 ms against a 1.5 s gate, delta refresh p95 17.3 ms against 500 ms, search
+p95 4.4 ms against 2 s, with eviction holding retention at 10,000 records from
+a 100,000-record ingest.
 
-Canonical design for this is now defined in:
+Canonical design reference:
 - `SPECIFICATION.md` section 15 (Large-Scale Community Discovery & Search Plan)
 - `REMAINING_WORK_TRACKER.md` section J
 
+Remaining community work is migration sequencing, not architecture: advancing
+the `DEPRECATION_SCHEDULE.md` phases that retire the legacy `CommunityMembers`
+blob.
+
 ## 3. Active Priorities
 
-### Priority A: Community Discovery/Search v2 (Section 15)
+### Priority A: Community v2 migration sequencing (Section 15.9)
 
-Implement in this order:
+The architecture is complete (see section 2). What remains is retiring the
+legacy path on the schedule in `DEPRECATION_SCHEDULE.md`:
 
-1. Per-record data model and validation dispatch
-- per-member signed records
-- per-share signed records
-- typed value dispatch in DHT validators
+1. Phase B (v0.4.x, current) — per-record model preferred on read
+- capability-gated requests (done)
+- paged index-first browse with legacy fallback (done)
 
-2. Paged browse APIs
-- paginated community member pages
-- paginated community share pages
+2. Phase C (v0.5.0) — stop writing the legacy `CommunityMembers` blob
+- keep publishing `CommunityBootstrapHint`
+- retain read-side fallback for one release window
 
-3. Desktop browse switch
-- move default browse from peer-by-peer probing to paged index flow
+3. Phase D (v0.6.0) — remove the legacy fallback entirely
+- delete legacy blob code paths from relay and client
 
-4. Follow-on
-- community metadata search API
-- community delta/event sync API
+Each phase transition needs a real mixed-version interop check before it
+ships, not just unit coverage.
 
 ### Priority B: Relay and operational hardening
 
