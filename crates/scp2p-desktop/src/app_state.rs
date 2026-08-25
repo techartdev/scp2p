@@ -688,7 +688,17 @@ impl DesktopAppState {
             .into_iter()
             .find(|community| community.share_id == share_id)
             .ok_or_else(|| anyhow::anyhow!("community is not joined"))?;
-        let peers = self.sync_peer_targets(&node).await?;
+        // Participant discovery must still reach every peer, but peers that
+        // advertise paged browse (§15.6.1) are tried first so the indexed path
+        // is preferred over the legacy per-peer fallback.
+        let peers = Self::prefer_capable_peers(
+            &node,
+            self.sync_peer_targets(&node).await?,
+            |caps| caps.community_paged_browse,
+            // Legacy per-peer fallback still serves these peers.
+            false,
+        )
+        .await;
 
         let connector = self.build_connector().await;
         let transport = RelayAwareTransport::new(&connector);
@@ -924,7 +934,15 @@ impl DesktopAppState {
             .into_iter()
             .find(|c| c.share_id == share_id)
             .ok_or_else(|| anyhow::anyhow!("community is not joined"))?;
-        let peers = self.sync_peer_targets(&node).await?;
+        // §15.9.2: only query peers that advertise community search support.
+        let peers = Self::prefer_capable_peers(
+            &node,
+            self.sync_peer_targets(&node).await?,
+            |caps| caps.community_search,
+            // No legacy fallback exists for search.
+            true,
+        )
+        .await;
         if peers.is_empty() {
             return Ok(CommunitySearchView {
                 community_share_id_hex: hex::encode(community.share_id),
@@ -1025,7 +1043,15 @@ impl DesktopAppState {
         // last persisted one for automatic incremental sync.
         let effective_cursor = since_cursor.or(community.last_event_cursor);
 
-        let peers = self.sync_peer_targets(&node).await?;
+        // §15.9.2: only poll peers that advertise delta-sync support.
+        let peers = Self::prefer_capable_peers(
+            &node,
+            self.sync_peer_targets(&node).await?,
+            |caps| caps.community_delta_sync,
+            // No legacy fallback exists for delta sync.
+            true,
+        )
+        .await;
         if peers.is_empty() {
             return Ok(CommunityEventsView {
                 community_share_id_hex: hex::encode(community.share_id),
@@ -1224,6 +1250,50 @@ impl DesktopAppState {
             TransportProtocol::Quic => 1,
         });
         Ok(peers)
+    }
+
+    /// Order `peers` so that those advertising `capability` come first
+    /// (§15.9.2 capability gating).
+    ///
+    /// Peers with fresh capability data satisfying the predicate are tried
+    /// first; peers with unknown capabilities follow, because capability data
+    /// is only observed after a successful handshake and a peer we have never
+    /// talked to may still support the feature.  Peers *known* to lack the
+    /// capability are dropped entirely — querying them is guaranteed to return
+    /// an unknown-message-type error.
+    /// When `drop_incapable` is true, peers known to lack the capability are
+    /// removed (correct for requests with no legacy fallback, such as search
+    /// and delta sync).  When false they are merely sorted last, which keeps
+    /// mixed-version browse working via the legacy `ListCommunityPublicShares`
+    /// path required through deprecation Phase C.
+    async fn prefer_capable_peers(
+        node: &NodeHandle,
+        peers: Vec<PeerAddr>,
+        predicate: impl Fn(&scp2p_core::Capabilities) -> bool + Copy,
+        drop_incapable: bool,
+    ) -> Vec<PeerAddr> {
+        let capable = node.filter_peers_by_capability(&peers, predicate).await;
+        let known_incapable = node
+            .filter_peers_by_capability(&peers, move |caps| !predicate(caps))
+            .await;
+        let mut ordered = capable;
+        let mut trailing = Vec::new();
+        for peer in peers {
+            if ordered.contains(&peer) {
+                continue;
+            }
+            if known_incapable.contains(&peer) {
+                if !drop_incapable {
+                    trailing.push(peer);
+                }
+                continue;
+            }
+            // Unknown capabilities: a peer we have not handshaked with may
+            // still support the feature, so keep it as a candidate.
+            ordered.push(peer);
+        }
+        ordered.extend(trailing);
+        ordered
     }
 
     /// Resolve this node's own advertise address for self-seeding.

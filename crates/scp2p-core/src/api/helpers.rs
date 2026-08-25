@@ -28,14 +28,13 @@ use crate::{
     },
     search::IndexedItem,
     wire::{
-        CommunityEventsResp, CommunityMembersPageResponse,
-        CommunityPublicShareList, CommunitySearchResultsResp, CommunitySharesPageResponse,
-        CommunityStatus, Envelope, FLAG_RESPONSE, FindNode, FindNodeResult, FindValue,
-        FindValueResult, GetCommunityStatus, ListCommunityEventsReq, ListCommunityMembersPage,
-        ListCommunityPublicShares, ListCommunitySharesPage, ListPublicShares, MsgType, Providers,
-        PublicShareList, RelayListRequest, RelayListResponse,
-        RelayPayloadKind as WireRelayPayloadKind, SearchCommunitySharesReq, Store as WireStore,
-        WirePayload,
+        CommunityEventsResp, CommunityMembersPageResponse, CommunityPublicShareList,
+        CommunitySearchResultsResp, CommunitySharesPageResponse, CommunityStatus, Envelope,
+        FLAG_RESPONSE, FindNode, FindNodeResult, FindValue, FindValueResult, GetCommunityStatus,
+        ListCommunityEventsReq, ListCommunityMembersPage, ListCommunityPublicShares,
+        ListCommunitySharesPage, ListPublicShares, MsgType, Providers, PublicShareList,
+        RelayListRequest, RelayListResponse, RelayPayloadKind as WireRelayPayloadKind,
+        SearchCommunitySharesReq, Store as WireStore, WirePayload,
     },
 };
 

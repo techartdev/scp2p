@@ -85,13 +85,7 @@ fn systemd_quote(arg: &str) -> String {
     }
     // If there's nothing that needs escaping we can emit bare.
     let needs_quoting = arg.bytes().any(|b| {
-        b == b' '
-            || b == b'\t'
-            || b == b'"'
-            || b == b'\\'
-            || b == b'\''
-            || b == b'\n'
-            || b == b';'
+        b == b' ' || b == b'\t' || b == b'"' || b == b'\\' || b == b'\'' || b == b'\n' || b == b';'
     });
     if !needs_quoting {
         return arg.to_string();
@@ -271,8 +265,7 @@ fn install_windows_service(bin: &Path, relay_args: &[&str]) -> anyhow::Result<()
     let bin_path = if relay_args.is_empty() {
         format!("\"{}\"", bin_str)
     } else {
-        let quoted_args: Vec<String> =
-            relay_args.iter().map(|a| windows_arg_quote(a)).collect();
+        let quoted_args: Vec<String> = relay_args.iter().map(|a| windows_arg_quote(a)).collect();
         format!("\"{}\" {}", bin_str, quoted_args.join(" "))
     };
 
@@ -319,12 +312,18 @@ mod tests {
 
     #[test]
     fn systemd_quote_bare() {
-        assert_eq!(systemd_quote("--bind-tcp=0.0.0.0:7001"), "--bind-tcp=0.0.0.0:7001");
+        assert_eq!(
+            systemd_quote("--bind-tcp=0.0.0.0:7001"),
+            "--bind-tcp=0.0.0.0:7001"
+        );
     }
 
     #[test]
     fn systemd_quote_with_spaces() {
-        assert_eq!(systemd_quote("--data-dir=/my path"), r#""--data-dir=/my path""#);
+        assert_eq!(
+            systemd_quote("--data-dir=/my path"),
+            r#""--data-dir=/my path""#
+        );
     }
 
     #[test]
@@ -339,17 +338,26 @@ mod tests {
 
     #[test]
     fn xml_escape_special_chars() {
-        assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape("a&b<c>d\"e'f"),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
     }
 
     #[test]
     fn xml_escape_plain() {
-        assert_eq!(xml_escape("--bind-tcp=0.0.0.0:7001"), "--bind-tcp=0.0.0.0:7001");
+        assert_eq!(
+            xml_escape("--bind-tcp=0.0.0.0:7001"),
+            "--bind-tcp=0.0.0.0:7001"
+        );
     }
 
     #[test]
     fn windows_arg_quote_bare() {
-        assert_eq!(windows_arg_quote("--bind-tcp=0.0.0.0:7001"), "--bind-tcp=0.0.0.0:7001");
+        assert_eq!(
+            windows_arg_quote("--bind-tcp=0.0.0.0:7001"),
+            "--bind-tcp=0.0.0.0:7001"
+        );
     }
 
     #[test]

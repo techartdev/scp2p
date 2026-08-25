@@ -101,27 +101,65 @@ impl PeerDb {
         );
     }
 
+    /// Return `true` when `record` has fresh capability data satisfying
+    /// `predicate`.
+    ///
+    /// Capability data older than [`CAPABILITY_FRESHNESS_WINDOW_SECS`], or
+    /// absent entirely, is treated as "not supported".  This is deliberately
+    /// conservative: a peer whose capabilities we have never observed is not
+    /// assumed to support optional protocol extensions.
+    fn has_fresh_capability(
+        record: &PeerRecord,
+        now_unix: u64,
+        predicate: impl Fn(&Capabilities) -> bool,
+    ) -> bool {
+        let Some(ref caps) = record.capabilities else {
+            return false;
+        };
+        if !predicate(caps) {
+            return false;
+        }
+        match record.capabilities_seen_at {
+            Some(seen_at) => now_unix.saturating_sub(seen_at) <= CAPABILITY_FRESHNESS_WINDOW_SECS,
+            None => false,
+        }
+    }
+
     /// Return all peers whose capabilities include `relay = true` and
     /// whose capability data is still fresh.
     pub fn relay_capable_peers(&self, now_unix: u64) -> Vec<&PeerRecord> {
+        self.peers_with_capability(now_unix, |caps| caps.relay)
+    }
+
+    /// Return all peers whose freshly-observed capabilities satisfy
+    /// `predicate`.
+    ///
+    /// This is the general form behind [`Self::relay_capable_peers`] and the
+    /// community capability selectors.  Callers use it to gate optional
+    /// protocol requests (§15.9.2) so that requests are only sent to peers
+    /// that advertise support for them.
+    pub fn peers_with_capability(
+        &self,
+        now_unix: u64,
+        predicate: impl Fn(&Capabilities) -> bool,
+    ) -> Vec<&PeerRecord> {
         self.records
             .values()
-            .filter(|record| {
-                if let Some(ref caps) = record.capabilities {
-                    if !caps.relay {
-                        return false;
-                    }
-                    // Check freshness
-                    if let Some(seen_at) = record.capabilities_seen_at {
-                        now_unix.saturating_sub(seen_at) <= CAPABILITY_FRESHNESS_WINDOW_SECS
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            })
+            .filter(|record| Self::has_fresh_capability(record, now_unix, &predicate))
             .collect()
+    }
+
+    /// Return `true` when `addr` is known to support the capability selected
+    /// by `predicate`, based on fresh handshake-observed capability data.
+    pub fn peer_supports(
+        &self,
+        addr: &PeerAddr,
+        now_unix: u64,
+        predicate: impl Fn(&Capabilities) -> bool,
+    ) -> bool {
+        self.records
+            .get(&peer_key(addr))
+            .is_some_and(|record| Self::has_fresh_capability(record, now_unix, predicate))
     }
 
     pub fn total_known_peers(&self) -> usize {
@@ -333,6 +371,44 @@ mod tests {
         // One failure → -2; net = 0
         db.note_outcome(&p("10.0.0.1", 7000), false);
         assert_eq!(db.reputation_score(&p("10.0.0.1", 7000)), 0);
+    }
+
+    #[test]
+    fn peer_supports_requires_fresh_capability_data() {
+        let mut db = PeerDb::default();
+        let caps = Capabilities {
+            community_search: true,
+            ..Default::default()
+        };
+        db.upsert_seen_with_capabilities(p("10.0.0.1", 7000), 1_000, caps);
+
+        // Fresh data → supported.
+        assert!(db.peer_supports(&p("10.0.0.1", 7000), 1_100, |c| c.community_search));
+        // Capability not advertised → unsupported.
+        assert!(!db.peer_supports(&p("10.0.0.1", 7000), 1_100, |c| c.community_delta_sync));
+        // Stale capability data → treated as unsupported.
+        let stale = 1_000 + CAPABILITY_FRESHNESS_WINDOW_SECS + 1;
+        assert!(!db.peer_supports(&p("10.0.0.1", 7000), stale, |c| c.community_search));
+        // Never-seen peer → unsupported (conservative default).
+        assert!(!db.peer_supports(&p("10.9.9.9", 7000), 1_100, |c| c.community_search));
+    }
+
+    #[test]
+    fn peers_with_capability_selects_only_advertising_peers() {
+        let mut db = PeerDb::default();
+        let paged = Capabilities {
+            community_paged_browse: true,
+            ..Default::default()
+        };
+        let legacy = Capabilities::default();
+        db.upsert_seen_with_capabilities(p("10.0.0.1", 7000), 1_000, paged);
+        db.upsert_seen_with_capabilities(p("10.0.0.2", 7000), 1_000, legacy);
+        // Peer with no capability data at all.
+        db.upsert_seen(p("10.0.0.3", 7000), 1_000);
+
+        let capable = db.peers_with_capability(1_100, |c| c.community_paged_browse);
+        assert_eq!(capable.len(), 1);
+        assert_eq!(capable[0].addr.ip.to_string(), "10.0.0.1");
     }
 
     #[test]

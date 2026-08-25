@@ -1414,6 +1414,51 @@ impl NodeHandle {
         persist_state(self).await
     }
 
+    /// Filter `peers` down to those known to support a community protocol
+    /// extension (§15.9.2).
+    ///
+    /// Capability data is observed during handshake and persisted in the peer
+    /// database with a freshness window.  Peers with no fresh capability
+    /// record are excluded, because sending an optional request to a peer that
+    /// does not implement it wastes a round-trip and returns an
+    /// unknown-message-type error.
+    pub async fn filter_peers_by_capability(
+        &self,
+        peers: &[PeerAddr],
+        predicate: impl Fn(&crate::Capabilities) -> bool + Copy,
+    ) -> Vec<PeerAddr> {
+        let Ok(now) = now_unix_secs() else {
+            return Vec::new();
+        };
+        let state = self.state.read().await;
+        peers
+            .iter()
+            .filter(|addr| state.peer_db.peer_supports(addr, now, predicate))
+            .cloned()
+            .collect()
+    }
+
+    /// Peers that advertise paginated community browse support (§15.6.1).
+    pub async fn peers_supporting_community_paged_browse(
+        &self,
+        peers: &[PeerAddr],
+    ) -> Vec<PeerAddr> {
+        self.filter_peers_by_capability(peers, |caps| caps.community_paged_browse)
+            .await
+    }
+
+    /// Peers that advertise community metadata search support (§15.6.2).
+    pub async fn peers_supporting_community_search(&self, peers: &[PeerAddr]) -> Vec<PeerAddr> {
+        self.filter_peers_by_capability(peers, |caps| caps.community_search)
+            .await
+    }
+
+    /// Peers that advertise community delta/event sync support (§15.6.3).
+    pub async fn peers_supporting_community_delta_sync(&self, peers: &[PeerAddr]) -> Vec<PeerAddr> {
+        self.filter_peers_by_capability(peers, |caps| caps.community_delta_sync)
+            .await
+    }
+
     pub async fn apply_pex_offer(&self, offer: PexOffer) -> anyhow::Result<usize> {
         let count = {
             let mut state = self.state.write().await;

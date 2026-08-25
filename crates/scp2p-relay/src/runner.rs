@@ -303,13 +303,10 @@ fn parse_peer_addr(s: &str) -> anyhow::Result<PeerAddr> {
 
     // Optional @pubkey suffix — fail closed on malformed hint (RA-06).
     let (addr_part, pubkey_hint) = if let Some((addr, key_hex)) = rest.split_once('@') {
-        let bytes = hex::decode(key_hex)
-            .with_context(|| format!("invalid pubkey hex in \"{s}\""))?;
+        let bytes =
+            hex::decode(key_hex).with_context(|| format!("invalid pubkey hex in \"{s}\""))?;
         let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
-            anyhow::anyhow!(
-                "pubkey hint must be 32 bytes (got {}) in \"{s}\"",
-                v.len()
-            )
+            anyhow::anyhow!("pubkey hint must be 32 bytes (got {}) in \"{s}\"", v.len())
         })?;
         (addr, Some(arr))
     } else {

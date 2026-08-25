@@ -13,8 +13,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{InquireError, Select, Text};
 use rand::rngs::OsRng;
 use scp2p_core::{
-    BoxedStream, FetchPolicy, Node, NodeConfig, NodeId, OwnedRelayAwareTransport,
-    PeerAddr, PeerConnector, PeerRecord, PersistedCommunity, RelayAwareTransport, RequestTransport,
+    BoxedStream, FetchPolicy, Node, NodeConfig, NodeId, OwnedRelayAwareTransport, PeerAddr,
+    PeerConnector, PeerRecord, PersistedCommunity, RelayAwareTransport, RequestTransport,
     SearchQuery, ShareId, ShareVisibility, SqliteStore, Store, TransportProtocol,
     build_tls_server_handle, full_node_capabilities, quic_connect_bi_session_insecure,
     start_quic_server, tls_connect_session_insecure,
@@ -816,8 +816,7 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                     } else {
                         println!("  {} share(s):", all_shares.len());
                         for s in &all_shares {
-                            let title =
-                                s.title.as_deref().unwrap_or("(untitled)");
+                            let title = s.title.as_deref().unwrap_or("(untitled)");
                             println!(
                                 "    {}  seq={}  share={}…",
                                 title,
@@ -837,9 +836,7 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                     continue;
                 }
                 if ctx.bootstrap_peers.is_empty() {
-                    println!(
-                        "\n  No bootstrap peers configured — unable to search without peers."
-                    );
+                    println!("\n  No bootstrap peers configured — unable to search without peers.");
                     continue;
                 }
 
@@ -848,7 +845,7 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                     .map(|c| format!("{}...", hex::encode(&c.share_id[..8])))
                     .collect();
                 let pick = match opt(
-                    Select::new("Pick a community to search:", choices.clone()).prompt(),
+                    Select::new("Pick a community to search:", choices.clone()).prompt()
                 )? {
                     Some(p) => p,
                     None => continue,
@@ -933,9 +930,7 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                     .iter()
                     .map(|c| format!("{}...", hex::encode(&c.share_id[..8])))
                     .collect();
-                let pick = match opt(
-                    Select::new("Pick a community:", choices.clone()).prompt(),
-                )? {
+                let pick = match opt(Select::new("Pick a community:", choices.clone()).prompt())? {
                     Some(p) => p,
                     None => continue,
                 };
@@ -948,13 +943,7 @@ async fn cmd_communities(ctx: &Ctx) -> anyhow::Result<()> {
                 for peer in &ctx.bootstrap_peers {
                     match ctx
                         .node
-                        .fetch_community_events(
-                            &transport,
-                            peer,
-                            community.share_id,
-                            None,
-                            100,
-                        )
+                        .fetch_community_events(&transport, peer, community.share_id, None, 100)
                         .await
                     {
                         Ok(resp) => {
