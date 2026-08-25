@@ -70,7 +70,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # Rust toolchain — pin to stable, add the target we need.
       - name: Install Rust
@@ -115,7 +115,7 @@ jobs:
 
       # Upload the binary as a workflow artifact so the release job can grab it.
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}
@@ -128,11 +128,11 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout (for install scripts)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # Download all five binaries into the current directory.
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           merge-multiple: true   # flatten into cwd
 
