@@ -41,3 +41,6 @@ Desktop.ini
 # ── Logs ─────────────────────────────────────────────────────────────────
 *.log
 npm-debug.log*
+
+# Local build accelerator config (sccache is developer-local, not CI)
+.cargo/config.toml
