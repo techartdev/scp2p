@@ -742,6 +742,170 @@ Recommended delivery sequence:
 
 ---
 
+## 16. Key Rotation & Revocation
+
+Addresses advisory §4.10. Long-lived Ed25519 identities (node keys and share
+publisher keys) currently have no defined way to be retired. If a private key
+leaks, the only recourse is abandoning the identity — subscribers keep trusting
+manifests signed by the compromised key, because a valid signature is the sole
+trust criterion.
+
+### 16.1 Threat model and goals
+
+Goals:
+- **Rotation**: migrate an identity to a new keypair while preserving continuity,
+  so existing subscribers follow the identity across the change.
+- **Revocation**: mark a key permanently untrusted, so records signed by it are
+  rejected even though the signature verifies.
+
+Non-goals (deliberately out of scope):
+- Recovering an identity whose key leaked *and* whose holder lost the key. Without
+  a pre-registered recovery key this is impossible; §16.7 covers the recommended
+  offline-successor practice.
+- Revoking individual manifests. Revocation is key-scoped; retract content by
+  publishing a superseding manifest.
+
+Adversary assumption: an attacker holding a compromised private key can forge any
+record that key signs, **including a rotation record**. §16.4 addresses this
+directly — it is the central difficulty of the design.
+
+### 16.2 Record types
+
+Both records are Ed25519-signed, CBOR-encoded, and stored in the DHT with the
+typed tag-byte dispatch used by §15.4.0.
+
+#### 16.2.1 `KeyRotationRecord` (tag `0x36`)
+
+```
+KeyRotationRecord {
+  subject_kind:      u8,        // 0 = node identity, 1 = share publisher
+  old_pubkey:        bytes32,
+  new_pubkey:        bytes32,
+  rotation_seq:      u64,       // monotonic per identity
+  issued_at:         u64,
+  old_key_signature: bytes64,   // by old_pubkey
+  new_key_signature: bytes64,   // by new_pubkey
+}
+```
+
+**Dual signature is required.** The old key signs to prove authorization; the new
+key signs to prove possession. A single signature is insufficient: signing only
+with the old key would let an attacker rotate an identity to a key they do not
+control (denial of service), and signing only with the new key would let anyone
+claim any identity.
+
+Both signatures cover the same payload: `(subject_kind, old_pubkey, new_pubkey,
+rotation_seq, issued_at)`.
+
+Storage key: `SHA-256("identity:rotation:" || old_pubkey)`.
+
+#### 16.2.2 `KeyRevocationRecord` (tag `0x37`)
+
+```
+KeyRevocationRecord {
+  subject_kind: u8,
+  pubkey:       bytes32,        // the key being revoked
+  reason:       u8,             // 0 = unspecified, 1 = compromised,
+                                // 2 = superseded, 3 = retired
+  issued_at:    u64,
+  signature:    bytes64,        // by pubkey (self-revocation)
+}
+```
+
+Self-signed: only the keyholder may revoke their own key. This is intentional —
+allowing third-party revocation would create a censorship vector far worse than
+the problem being solved.
+
+Storage key: `SHA-256("identity:revocation:" || pubkey)`.
+
+**Revocation has no TTL and is never rescinded.** A key, once revoked, stays
+revoked forever. There is no un-revoke record; publishing one would let an
+attacker who steals a key undo the legitimate holder's revocation.
+
+### 16.3 Validation rules
+
+A `KeyRotationRecord` is accepted only when all hold:
+- stored at `identity:rotation:<old_pubkey>`
+- `old_pubkey != new_pubkey`
+- both signatures verify over the shared signable payload
+- `rotation_seq` strictly greater than any known record for `old_pubkey`
+- `issued_at` not more than `MAX_CLOCK_SKEW_SECS` (300) in the future
+
+A `KeyRevocationRecord` is accepted only when all hold:
+- stored at `identity:revocation:<pubkey>`
+- signature verifies under `pubkey`
+- `issued_at` not more than `MAX_CLOCK_SKEW_SECS` in the future
+
+Note the deliberate asymmetry: revocation records have **no monotonic counter**.
+The earliest valid revocation wins, and later ones are redundant rather than
+conflicting.
+
+### 16.4 Revocation beats rotation
+
+The hard case: an attacker steals a key and publishes a rotation to a key they
+control, racing the legitimate holder's revocation.
+
+The resolution rule is: **revocation dominates rotation, regardless of arrival
+order or timestamps.** If a key is revoked, every rotation record originating
+from it is void, including rotations already applied.
+
+This is why revocation cannot be undone and why rotation chains are re-validated
+against the revocation set rather than being cached as settled. It costs the
+legitimate holder their identity — but denies it to the attacker too, which is
+strictly better than the attacker silently inheriting the subscriber base. It
+means an attacker who steals a key can always destroy the identity; that is
+accepted, because a stolen key already means the identity is lost. The property
+worth preserving is that the attacker cannot *keep* it.
+
+### 16.5 Chain resolution
+
+Rotations form a chain: `K0 → K1 → K2`. Resolution walks from a starting key to
+the current active key:
+
+- walk while a valid unrevoked rotation exists for the current key
+- stop at the first key with no successor — that key is current
+- if any key in the chain is revoked, the **whole chain is void** and the
+  identity is untrusted
+- cap traversal at `MAX_ROTATION_CHAIN_DEPTH = 16` to bound work and reject
+  cycles; exceeding the cap voids the chain
+
+The depth cap is a hard rejection, not a truncation. Truncating would let an
+attacker hide a revocation past the cap.
+
+### 16.6 Enforcement
+
+Once a revocation is known locally, verification MUST reject:
+- manifests whose `share_pubkey` is revoked
+- share heads signed by a revoked key
+- community member/share records signed by a revoked key
+- handshakes from a revoked node identity
+
+Enforcement is **local and eventually consistent**: a node enforces what it knows.
+There is no global consensus on revocation, and a partitioned node may keep
+trusting a revoked key until it learns otherwise. Nodes SHOULD query the
+revocation keyspace for publisher keys on subscription refresh, and MUST cache
+results, since an attacker could otherwise force a DHT round-trip per verification.
+
+### 16.7 Operational guidance
+
+- Generate a successor keypair offline in advance; store it separately from the
+  active key. Rotation is only useful if the new key is uncompromised.
+- Rotate proactively on a schedule, not just in emergencies — an identity that has
+  never rotated has no established rotation record for subscribers to follow.
+- On suspected compromise: **revoke first, then establish a new identity**. Do not
+  rotate from a key you believe is compromised; the attacker may rotate it too,
+  and §16.4 means the revocation voids your rotation as well.
+
+### 16.8 Protocol version
+
+These records add new wire types and a new validated keyspace, so
+`PROTOCOL_VERSION` is bumped from `1` to `2`. Pre-1.0 policy (see
+`DEPRECATION_SCHEDULE.md`) requires an exact version match, so v0.5.0 nodes will
+not interoperate with v0.4.x nodes. This is a deliberate hard break, consistent
+with the stated pre-1.0 policy.
+
+---
+
 # Implementation milestones (agent-friendly)
 
 ### Milestone 1: Identity + transport [done]
@@ -804,3 +968,11 @@ Recommended delivery sequence:
   `ListCommunityPublicShares` retained as fallback through Phase C)
 - delta sync and metadata search integration (done)
 - §15.10 release gate verified end-to-end over TLS (see §15.10 note)
+
+### Milestone 11: Key rotation & revocation (Section 16) [done]
+- signed rotation records with dual old-key/new-key signatures
+- self-signed, permanent revocation records
+- `identity:rotation:` / `identity:revocation:` DHT keyspaces with typed tag dispatch
+- rotation chain resolution with revocation dominance, cycle detection, depth cap
+- enforcement in subscription manifest verification
+- `PROTOCOL_VERSION` bumped 1 → 2

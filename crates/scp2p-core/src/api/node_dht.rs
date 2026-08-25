@@ -28,7 +28,10 @@ use crate::{
         ALPHA, DEFAULT_TTL_SECS, DhtInsertResult, DhtNodeRecord, DhtValue, K, MAX_TTL_SECS,
         MAX_VALUE_SIZE,
     },
-    dht_keys::{community_info_key, community_member_key, community_share_key, share_head_key},
+    dht_keys::{
+        community_info_key, community_member_key, community_share_key, identity_revocation_key,
+        identity_rotation_key, share_head_key,
+    },
     ids::{NodeId, ShareId},
     manifest::ShareHead,
     net_fetch::RequestTransport,
@@ -1289,6 +1292,39 @@ async fn ingest_into_community_index_if_applicable(key: [u8; 32], value: &[u8], 
                 if expected == key {
                     let mut state = node.state.write().await;
                     state.community_index.ingest_share_record(&rec);
+                }
+            }
+        }
+        // §16: identity rotation/revocation records learned from peers.
+        // The keyspace validator has already verified signatures, key
+        // derivation, and clock skew before we reach this point.
+        community_tags::KEY_ROTATION => {
+            if let Ok(rec) = crate::wire::KeyRotationRecord::decode_tagged(value)
+                && identity_rotation_key(&rec.old_pubkey) == key
+            {
+                let mut state = node.state.write().await;
+                if state.identity_registry.ingest_rotation(&rec) {
+                    debug!(
+                        old = %hex::encode(&rec.old_pubkey[..8]),
+                        new = %hex::encode(&rec.new_pubkey[..8]),
+                        seq = rec.rotation_seq,
+                        "ingested key rotation record"
+                    );
+                }
+            }
+        }
+        community_tags::KEY_REVOCATION => {
+            if let Ok(rec) = crate::wire::KeyRevocationRecord::decode_tagged(value)
+                && identity_revocation_key(&rec.pubkey) == key
+            {
+                let mut state = node.state.write().await;
+                if state.identity_registry.ingest_revocation(&rec) {
+                    // Revocation is a security-relevant event: log at info.
+                    info!(
+                        pubkey = %hex::encode(&rec.pubkey[..8]),
+                        reason = ?rec.reason,
+                        "ingested key revocation record — identity now untrusted"
+                    );
                 }
             }
         }

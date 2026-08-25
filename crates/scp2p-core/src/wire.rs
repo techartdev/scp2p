@@ -805,6 +805,270 @@ pub mod community_tags {
     pub const MEMBERS_PAGE: u8 = 0x34;
     /// Materialized shares page (§15.5, relay-derived).
     pub const SHARES_PAGE: u8 = 0x35;
+    /// Key rotation record (§16.2.1).
+    pub const KEY_ROTATION: u8 = 0x36;
+    /// Key revocation record (§16.2.2).
+    pub const KEY_REVOCATION: u8 = 0x37;
+}
+
+// ── §16 Key Rotation & Revocation ───────────────────────────────────
+
+/// Maximum accepted clock skew for identity records (§16.3).
+pub const MAX_CLOCK_SKEW_SECS: u64 = 300;
+
+/// Maximum rotation chain traversal depth (§16.5).
+///
+/// Exceeding this voids the chain rather than truncating it — truncation
+/// would let an attacker hide a revocation beyond the cap.
+pub const MAX_ROTATION_CHAIN_DEPTH: usize = 16;
+
+/// What kind of identity a rotation/revocation record refers to (§16.2).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum IdentitySubjectKind {
+    /// A node identity key.
+    Node,
+    /// A share publisher key.
+    SharePublisher,
+}
+
+/// Why a key was revoked (§16.2.2).
+///
+/// Advisory only — every reason produces identical enforcement. It exists
+/// so operators can distinguish a routine retirement from a compromise
+/// when auditing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RevocationReason {
+    Unspecified,
+    Compromised,
+    Superseded,
+    Retired,
+}
+
+/// Signable payload shared by both rotation signatures (§16.2.1).
+///
+/// Both the old and new key sign these exact bytes.
+#[derive(Serialize)]
+struct KeyRotationSignable<'a>(
+    &'a IdentitySubjectKind,
+    [u8; 32], // old_pubkey
+    [u8; 32], // new_pubkey
+    u64,      // rotation_seq
+    u64,      // issued_at
+);
+
+/// Announces that an identity has moved to a new keypair (§16.2.1).
+///
+/// Carries two signatures: the old key authorizes the move, the new key
+/// proves possession. See §16.2.1 for why one signature is insufficient.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyRotationRecord {
+    pub subject_kind: IdentitySubjectKind,
+    pub old_pubkey: [u8; 32],
+    pub new_pubkey: [u8; 32],
+    pub rotation_seq: u64,
+    pub issued_at: u64,
+    #[serde(with = "serde_bytes")]
+    pub old_key_signature: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    pub new_key_signature: Vec<u8>,
+}
+
+impl KeyRotationRecord {
+    /// Build and dual-sign a rotation record.
+    ///
+    /// Requires both private keys, which is the point: it proves the caller
+    /// controls the identity being moved *and* its destination.
+    pub fn new_signed(
+        subject_kind: IdentitySubjectKind,
+        old_key: &ed25519_dalek::SigningKey,
+        new_key: &ed25519_dalek::SigningKey,
+        rotation_seq: u64,
+        issued_at: u64,
+    ) -> anyhow::Result<Self> {
+        use ed25519_dalek::Signer;
+        let old_pubkey = old_key.verifying_key().to_bytes();
+        let new_pubkey = new_key.verifying_key().to_bytes();
+        if old_pubkey == new_pubkey {
+            anyhow::bail!("rotation old_pubkey and new_pubkey must differ");
+        }
+        let signable = KeyRotationSignable(
+            &subject_kind,
+            old_pubkey,
+            new_pubkey,
+            rotation_seq,
+            issued_at,
+        );
+        let bytes = crate::cbor::to_vec(&signable)?;
+        Ok(Self {
+            subject_kind,
+            old_pubkey,
+            new_pubkey,
+            rotation_seq,
+            issued_at,
+            old_key_signature: old_key.sign(&bytes).to_bytes().to_vec(),
+            new_key_signature: new_key.sign(&bytes).to_bytes().to_vec(),
+        })
+    }
+
+    /// Verify structure and both signatures (§16.3).
+    pub fn verify(&self) -> anyhow::Result<()> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        if self.old_pubkey == self.new_pubkey {
+            anyhow::bail!("rotation old_pubkey and new_pubkey must differ");
+        }
+        let signable = KeyRotationSignable(
+            &self.subject_kind,
+            self.old_pubkey,
+            self.new_pubkey,
+            self.rotation_seq,
+            self.issued_at,
+        );
+        let bytes = crate::cbor::to_vec(&signable)?;
+
+        let old_sig: [u8; 64] = self
+            .old_key_signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("old_key_signature must be 64 bytes"))?;
+        let new_sig: [u8; 64] = self
+            .new_key_signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("new_key_signature must be 64 bytes"))?;
+
+        VerifyingKey::from_bytes(&self.old_pubkey)?
+            .verify_strict(&bytes, &Signature::from_bytes(&old_sig))
+            .map_err(|_| anyhow::anyhow!("rotation old-key signature invalid"))?;
+        VerifyingKey::from_bytes(&self.new_pubkey)?
+            .verify_strict(&bytes, &Signature::from_bytes(&new_sig))
+            .map_err(|_| anyhow::anyhow!("rotation new-key signature invalid"))?;
+        Ok(())
+    }
+
+    /// Verify signatures and reject records dated too far in the future.
+    pub fn verify_at(&self, now_unix: u64) -> anyhow::Result<()> {
+        if self.issued_at > now_unix.saturating_add(MAX_CLOCK_SKEW_SECS) {
+            anyhow::bail!("rotation record issued too far in the future");
+        }
+        self.verify()
+    }
+
+    /// Encode with the §16 tag prefix for DHT storage.
+    pub fn encode_tagged(&self) -> anyhow::Result<Vec<u8>> {
+        let cbor = crate::cbor::to_vec(self)?;
+        let mut out = Vec::with_capacity(1 + cbor.len());
+        out.push(community_tags::KEY_ROTATION);
+        out.extend_from_slice(&cbor);
+        Ok(out)
+    }
+
+    /// Decode from a tagged value payload.
+    pub fn decode_tagged(data: &[u8]) -> anyhow::Result<Self> {
+        if data.is_empty() {
+            anyhow::bail!("empty tagged key rotation record");
+        }
+        if data[0] != community_tags::KEY_ROTATION {
+            anyhow::bail!("wrong tag for key rotation record: 0x{:02x}", data[0]);
+        }
+        Ok(crate::cbor::from_slice(&data[1..])?)
+    }
+}
+
+/// Signable payload for a revocation record (§16.2.2).
+#[derive(Serialize)]
+struct KeyRevocationSignable<'a>(
+    &'a IdentitySubjectKind,
+    [u8; 32], // pubkey
+    &'a RevocationReason,
+    u64, // issued_at
+);
+
+/// Permanently marks a key untrusted (§16.2.2).
+///
+/// Self-signed: only the keyholder may revoke their own key. Third-party
+/// revocation would be a censorship vector worse than the problem solved.
+/// Once published, a revocation is never rescinded (§16.2.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyRevocationRecord {
+    pub subject_kind: IdentitySubjectKind,
+    pub pubkey: [u8; 32],
+    pub reason: RevocationReason,
+    pub issued_at: u64,
+    #[serde(with = "serde_bytes")]
+    pub signature: Vec<u8>,
+}
+
+impl KeyRevocationRecord {
+    /// Build and self-sign a revocation record.
+    pub fn new_signed(
+        subject_kind: IdentitySubjectKind,
+        key: &ed25519_dalek::SigningKey,
+        reason: RevocationReason,
+        issued_at: u64,
+    ) -> anyhow::Result<Self> {
+        use ed25519_dalek::Signer;
+        let pubkey = key.verifying_key().to_bytes();
+        let signable = KeyRevocationSignable(&subject_kind, pubkey, &reason, issued_at);
+        let bytes = crate::cbor::to_vec(&signable)?;
+        Ok(Self {
+            subject_kind,
+            pubkey,
+            reason,
+            issued_at,
+            signature: key.sign(&bytes).to_bytes().to_vec(),
+        })
+    }
+
+    /// Verify the self-signature (§16.3).
+    pub fn verify(&self) -> anyhow::Result<()> {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        let signable = KeyRevocationSignable(
+            &self.subject_kind,
+            self.pubkey,
+            &self.reason,
+            self.issued_at,
+        );
+        let bytes = crate::cbor::to_vec(&signable)?;
+        let sig: [u8; 64] = self
+            .signature
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("revocation signature must be 64 bytes"))?;
+        VerifyingKey::from_bytes(&self.pubkey)?
+            .verify_strict(&bytes, &Signature::from_bytes(&sig))
+            .map_err(|_| anyhow::anyhow!("revocation signature invalid"))?;
+        Ok(())
+    }
+
+    /// Verify and reject records dated too far in the future.
+    pub fn verify_at(&self, now_unix: u64) -> anyhow::Result<()> {
+        if self.issued_at > now_unix.saturating_add(MAX_CLOCK_SKEW_SECS) {
+            anyhow::bail!("revocation record issued too far in the future");
+        }
+        self.verify()
+    }
+
+    /// Encode with the §16 tag prefix for DHT storage.
+    pub fn encode_tagged(&self) -> anyhow::Result<Vec<u8>> {
+        let cbor = crate::cbor::to_vec(self)?;
+        let mut out = Vec::with_capacity(1 + cbor.len());
+        out.push(community_tags::KEY_REVOCATION);
+        out.extend_from_slice(&cbor);
+        Ok(out)
+    }
+
+    /// Decode from a tagged value payload.
+    pub fn decode_tagged(data: &[u8]) -> anyhow::Result<Self> {
+        if data.is_empty() {
+            anyhow::bail!("empty tagged key revocation record");
+        }
+        if data[0] != community_tags::KEY_REVOCATION {
+            anyhow::bail!("wrong tag for key revocation record: 0x{:02x}", data[0]);
+        }
+        Ok(crate::cbor::from_slice(&data[1..])?)
+    }
 }
 
 /// Per-member community record stored in the DHT (§15.4.1).
@@ -2380,5 +2644,206 @@ mod tests {
         let mut tagged = page.encode_tagged().expect("encode");
         tagged[0] = community_tags::MEMBERS_PAGE; // wrong tag
         assert!(MaterializedSharesPage::decode_tagged(&tagged).is_err());
+    }
+
+    // ── §16 Key rotation & revocation ────────────────────────────────
+
+    fn test_key(seed: u64) -> ed25519_dalek::SigningKey {
+        use rand::{SeedableRng, rngs::StdRng};
+        ed25519_dalek::SigningKey::generate(&mut StdRng::seed_from_u64(seed))
+    }
+
+    #[test]
+    fn key_rotation_record_sign_verify_roundtrip() {
+        let (old, new) = (test_key(1), test_key(2));
+        let rec = KeyRotationRecord::new_signed(
+            IdentitySubjectKind::SharePublisher,
+            &old,
+            &new,
+            7,
+            1_700_000_000,
+        )
+        .expect("sign rotation");
+
+        assert_eq!(rec.old_pubkey, old.verifying_key().to_bytes());
+        assert_eq!(rec.new_pubkey, new.verifying_key().to_bytes());
+        assert_eq!(rec.rotation_seq, 7);
+        rec.verify().expect("both signatures verify");
+
+        let tagged = rec.encode_tagged().expect("encode");
+        assert_eq!(tagged[0], community_tags::KEY_ROTATION);
+        let decoded = KeyRotationRecord::decode_tagged(&tagged).expect("decode");
+        assert_eq!(decoded, rec);
+        decoded.verify().expect("decoded verifies");
+    }
+
+    #[test]
+    fn key_rotation_requires_both_signatures_valid() {
+        let (old, new, other) = (test_key(1), test_key(2), test_key(3));
+        let good =
+            KeyRotationRecord::new_signed(IdentitySubjectKind::Node, &old, &new, 1, 1_700_000_000)
+                .expect("sign");
+
+        // Tamper with the new-key signature: an attacker who holds only the
+        // old key cannot rotate to a key they do not control.
+        let forged = KeyRotationRecord::new_signed(
+            IdentitySubjectKind::Node,
+            &old,
+            &other,
+            1,
+            1_700_000_000,
+        )
+        .expect("sign");
+        let mut mixed = good.clone();
+        mixed.new_pubkey = forged.new_pubkey;
+        assert!(
+            mixed.verify().is_err(),
+            "swapping new_pubkey must invalidate the signatures"
+        );
+
+        // Corrupt the old-key signature.
+        let mut bad_old = good.clone();
+        bad_old.old_key_signature[0] ^= 0xFF;
+        assert!(bad_old.verify().is_err());
+
+        // Corrupt the new-key signature.
+        let mut bad_new = good;
+        bad_new.new_key_signature[0] ^= 0xFF;
+        assert!(bad_new.verify().is_err());
+    }
+
+    #[test]
+    fn key_rotation_rejects_same_old_and_new_key() {
+        let k = test_key(1);
+        assert!(
+            KeyRotationRecord::new_signed(IdentitySubjectKind::Node, &k, &k, 1, 1_700_000_000)
+                .is_err(),
+            "rotating a key to itself is meaningless and must be rejected"
+        );
+    }
+
+    #[test]
+    fn key_rotation_rejects_far_future_timestamp() {
+        let (old, new) = (test_key(1), test_key(2));
+        let now = 1_700_000_000u64;
+        let rec = KeyRotationRecord::new_signed(
+            IdentitySubjectKind::Node,
+            &old,
+            &new,
+            1,
+            now + MAX_CLOCK_SKEW_SECS + 60,
+        )
+        .expect("sign");
+        assert!(rec.verify_at(now).is_err());
+        // Within tolerance is accepted.
+        let ok = KeyRotationRecord::new_signed(
+            IdentitySubjectKind::Node,
+            &old,
+            &new,
+            1,
+            now + MAX_CLOCK_SKEW_SECS - 1,
+        )
+        .expect("sign");
+        assert!(ok.verify_at(now).is_ok());
+    }
+
+    #[test]
+    fn key_rotation_wrong_tag_rejected() {
+        let (old, new) = (test_key(1), test_key(2));
+        let rec =
+            KeyRotationRecord::new_signed(IdentitySubjectKind::Node, &old, &new, 1, 1_700_000_000)
+                .expect("sign");
+        let mut tagged = rec.encode_tagged().expect("encode");
+        tagged[0] = community_tags::KEY_REVOCATION;
+        assert!(KeyRotationRecord::decode_tagged(&tagged).is_err());
+    }
+
+    #[test]
+    fn key_revocation_record_sign_verify_roundtrip() {
+        let k = test_key(9);
+        let rec = KeyRevocationRecord::new_signed(
+            IdentitySubjectKind::SharePublisher,
+            &k,
+            RevocationReason::Compromised,
+            1_700_000_000,
+        )
+        .expect("sign revocation");
+
+        assert_eq!(rec.pubkey, k.verifying_key().to_bytes());
+        assert_eq!(rec.reason, RevocationReason::Compromised);
+        rec.verify().expect("signature verifies");
+
+        let tagged = rec.encode_tagged().expect("encode");
+        assert_eq!(tagged[0], community_tags::KEY_REVOCATION);
+        let decoded = KeyRevocationRecord::decode_tagged(&tagged).expect("decode");
+        assert_eq!(decoded, rec);
+        decoded.verify().expect("decoded verifies");
+    }
+
+    #[test]
+    fn key_revocation_rejects_foreign_signature() {
+        // Only the keyholder may revoke their own key (§16.2.2).
+        let (victim, attacker) = (test_key(1), test_key(2));
+        let mut rec = KeyRevocationRecord::new_signed(
+            IdentitySubjectKind::Node,
+            &attacker,
+            RevocationReason::Compromised,
+            1_700_000_000,
+        )
+        .expect("sign");
+        // Attacker rewrites the subject to the victim's key but cannot
+        // produce a matching signature.
+        rec.pubkey = victim.verifying_key().to_bytes();
+        assert!(
+            rec.verify().is_err(),
+            "third-party revocation must be rejected"
+        );
+    }
+
+    #[test]
+    fn key_revocation_reason_is_covered_by_signature() {
+        let k = test_key(4);
+        let mut rec = KeyRevocationRecord::new_signed(
+            IdentitySubjectKind::Node,
+            &k,
+            RevocationReason::Retired,
+            1_700_000_000,
+        )
+        .expect("sign");
+        rec.reason = RevocationReason::Compromised;
+        assert!(rec.verify().is_err(), "reason must be signed");
+    }
+
+    #[test]
+    fn key_revocation_wrong_tag_rejected() {
+        let k = test_key(5);
+        let rec = KeyRevocationRecord::new_signed(
+            IdentitySubjectKind::Node,
+            &k,
+            RevocationReason::Unspecified,
+            1_700_000_000,
+        )
+        .expect("sign");
+        let mut tagged = rec.encode_tagged().expect("encode");
+        tagged[0] = community_tags::KEY_ROTATION;
+        assert!(KeyRevocationRecord::decode_tagged(&tagged).is_err());
+    }
+
+    #[test]
+    fn identity_record_tags_are_distinct_from_community_tags() {
+        // Guards against a future edit silently colliding tag bytes.
+        let tags = [
+            community_tags::MEMBER_RECORD,
+            community_tags::SHARE_RECORD,
+            community_tags::BOOTSTRAP_HINT,
+            community_tags::MEMBERS_PAGE,
+            community_tags::SHARES_PAGE,
+            community_tags::KEY_ROTATION,
+            community_tags::KEY_REVOCATION,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for t in tags {
+            assert!(seen.insert(t), "duplicate tag byte 0x{t:02x}");
+        }
     }
 }

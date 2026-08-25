@@ -31,7 +31,8 @@ use crate::{
     config::NodeConfig,
     content::ChunkedContent,
     dht::{DEFAULT_TTL_SECS, Dht},
-    dht_keys::share_head_key,
+    dht_keys::{identity_revocation_key, identity_rotation_key, share_head_key},
+    identity_registry::{ChainResolution, IdentityRegistry},
     ids::{ContentId, ShareId},
     manifest::{ManifestV1, PublicShareSummary, ShareHead, ShareKeypair, ShareVisibility},
     net_fetch::RequestTransport,
@@ -345,6 +346,12 @@ struct NodeState {
     /// [`CommunityShareRecord`] values from the DHT.  Serves paged browse,
     /// search, and delta-sync wire requests.
     community_index: CommunityIndex,
+    /// Key rotation and revocation state (§16).
+    ///
+    /// Consulted when verifying manifests, share heads, and community
+    /// records so that records signed by a revoked key are rejected even
+    /// though their signature is cryptographically valid.
+    identity_registry: IdentityRegistry,
 }
 
 /// Tracks an active relay registration for a firewalled node.
@@ -608,6 +615,7 @@ impl NodeState {
             store,
             dirty: DirtyFlags::default(),
             community_index: CommunityIndex::default(),
+            identity_registry: IdentityRegistry::default(),
         })
     }
 
@@ -1457,6 +1465,155 @@ impl NodeHandle {
     pub async fn peers_supporting_community_delta_sync(&self, peers: &[PeerAddr]) -> Vec<PeerAddr> {
         self.filter_peers_by_capability(peers, |caps| caps.community_delta_sync)
             .await
+    }
+
+    // ── §16 Key rotation & revocation ──────────────────────────────
+
+    /// Publish a signed key rotation record to the DHT (§16.2.1).
+    ///
+    /// Requires both private keys: the old key authorizes the move and the
+    /// new key proves possession. The record is stored at
+    /// `identity:rotation:<old_pubkey>` so holders of the old key can
+    /// discover the successor.
+    pub async fn publish_key_rotation(
+        &self,
+        subject_kind: crate::wire::IdentitySubjectKind,
+        old_key: &SigningKey,
+        new_key: &SigningKey,
+        rotation_seq: u64,
+    ) -> anyhow::Result<()> {
+        let now = now_unix_secs()?;
+        let record = crate::wire::KeyRotationRecord::new_signed(
+            subject_kind,
+            old_key,
+            new_key,
+            rotation_seq,
+            now,
+        )?;
+        record.verify_at(now)?;
+        {
+            let mut state = self.state.write().await;
+            state.identity_registry.ingest_rotation(&record);
+        }
+        self.dht_store(crate::wire::Store {
+            key: identity_rotation_key(&record.old_pubkey),
+            value: record.encode_tagged()?,
+            ttl_secs: crate::dht::DEFAULT_TTL_SECS,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Publish a signed key revocation record to the DHT (§16.2.2).
+    ///
+    /// **This is irreversible.** A revoked key is permanently untrusted;
+    /// there is no un-revoke record, by design (§16.2.2). Every rotation
+    /// originating from the key is voided, so the identity cannot be
+    /// recovered — establish a new one instead.
+    pub async fn publish_key_revocation(
+        &self,
+        subject_kind: crate::wire::IdentitySubjectKind,
+        key_to_revoke: &SigningKey,
+        reason: crate::wire::RevocationReason,
+    ) -> anyhow::Result<()> {
+        let now = now_unix_secs()?;
+        let record =
+            crate::wire::KeyRevocationRecord::new_signed(subject_kind, key_to_revoke, reason, now)?;
+        record.verify_at(now)?;
+        {
+            let mut state = self.state.write().await;
+            state.identity_registry.ingest_revocation(&record);
+        }
+        self.dht_store(crate::wire::Store {
+            key: identity_revocation_key(&record.pubkey),
+            value: record.encode_tagged()?,
+            ttl_secs: crate::dht::MAX_TTL_SECS,
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Whether `pubkey` is known-revoked locally (§16.6).
+    ///
+    /// Enforcement is eventually consistent: this reflects only what this
+    /// node has learned, not global network state.
+    pub async fn is_key_revoked(&self, pubkey: &[u8; 32]) -> bool {
+        self.state.read().await.identity_registry.is_revoked(pubkey)
+    }
+
+    /// Resolve an identity key to its current active key (§16.5).
+    pub async fn resolve_identity_key(&self, start: [u8; 32]) -> ChainResolution {
+        self.state
+            .read()
+            .await
+            .identity_registry
+            .resolve_current_key(start)
+    }
+
+    /// Whether an identity is trusted — not revoked anywhere along its
+    /// rotation chain, and the chain is well-formed (§16.6).
+    pub async fn is_identity_trusted(&self, pubkey: &[u8; 32]) -> bool {
+        self.state.read().await.identity_registry.is_trusted(pubkey)
+    }
+
+    /// Look up rotation and revocation records for `pubkey` in the DHT and
+    /// ingest any valid ones (§16.6).
+    ///
+    /// Nodes SHOULD call this when refreshing a subscription so that a
+    /// publisher's revocation is noticed. Results are cached in the local
+    /// registry; callers should not invoke this per-verification.
+    ///
+    /// Returns `true` when the local registry changed.
+    pub async fn refresh_identity_status(&self, pubkey: [u8; 32]) -> anyhow::Result<bool> {
+        let now = now_unix_secs()?;
+        let mut changed = false;
+
+        // Revocation first — it dominates rotation (§16.4), so learning it
+        // is strictly more important than learning a successor key.
+        if let Some(value) = self
+            .dht_find_value(identity_revocation_key(&pubkey))
+            .await?
+            && let Ok(record) = crate::wire::KeyRevocationRecord::decode_tagged(&value.value)
+            && record.pubkey == pubkey
+            && record.verify_at(now).is_ok()
+        {
+            let mut state = self.state.write().await;
+            changed |= state.identity_registry.ingest_revocation(&record);
+        }
+
+        if let Some(value) = self.dht_find_value(identity_rotation_key(&pubkey)).await?
+            && let Ok(record) = crate::wire::KeyRotationRecord::decode_tagged(&value.value)
+            && record.old_pubkey == pubkey
+            && record.verify_at(now).is_ok()
+        {
+            let mut state = self.state.write().await;
+            changed |= state.identity_registry.ingest_rotation(&record);
+        }
+
+        Ok(changed)
+    }
+
+    /// Ingest a verified revocation record directly (§16.6).
+    ///
+    /// Used by the DHT store path, which has already run the keyspace
+    /// validator. Returns `true` when the registry changed.
+    pub async fn ingest_key_revocation(
+        &self,
+        record: &crate::wire::KeyRevocationRecord,
+    ) -> anyhow::Result<bool> {
+        record.verify_at(now_unix_secs()?)?;
+        let mut state = self.state.write().await;
+        Ok(state.identity_registry.ingest_revocation(record))
+    }
+
+    /// Ingest a verified rotation record directly (§16.6).
+    pub async fn ingest_key_rotation(
+        &self,
+        record: &crate::wire::KeyRotationRecord,
+    ) -> anyhow::Result<bool> {
+        record.verify_at(now_unix_secs()?)?;
+        let mut state = self.state.write().await;
+        Ok(state.identity_registry.ingest_rotation(record))
     }
 
     pub async fn apply_pex_offer(&self, offer: PexOffer) -> anyhow::Result<usize> {

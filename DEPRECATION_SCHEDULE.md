@@ -112,6 +112,8 @@ capability data is only learned after a successful handshake.
 | `0x33` | `CommunityBootstrapHint` | **Stable** | Lightweight; retained indefinitely |
 | `0x34` | `MaterializedMembersPage` | **Stable** | Relay-derived; keyed by 1-hour time bucket |
 | `0x35` | `MaterializedSharesPage` | **Stable** | Same |
+| `0x36` | `KeyRotationRecord` | **Stable** | §16; added v0.5.0 (protocol v2) |
+| `0x37` | `KeyRevocationRecord` | **Stable** | §16; added v0.5.0 (protocol v2) |
 | Legacy `CommunityMembers` | (untagged CBOR) | **Deprecated** | Removed in v0.6.0 |
 
 ---
@@ -139,11 +141,21 @@ capability data is only learned after a successful handshake.
 
 ## Protocol version policy
 
-- **Pre-1.0 (`v0.x`)**: Exact protocol version match required between peers
-  (`PROTOCOL_VERSION = 1`). Peers on different versions will reject handshake.
+- **Pre-1.0 (`v0.x`)**: Exact protocol version match required between peers.
+  Peers on different versions will reject the handshake.
+
+  | `PROTOCOL_VERSION` | Shipped in | Change |
+  |---|---|---|
+  | 1 | v0.1.0 – v0.4.x | Initial protocol. |
+  | 2 | v0.5.0+ | §16 key rotation & revocation: DHT value tags `0x36`/`0x37`, `identity:rotation:` / `identity:revocation:` keyspaces. |
+
+  **v0.5.0 is a hard break: it will not interoperate with v0.4.x.** Because
+  revocation is a security mechanism, there is no compatibility shim — a node
+  that cannot parse revocation records must not silently keep trusting a
+  revoked key. Upgrade relays first, then clients.
 - **Post-1.0**: Range-based negotiation will be introduced, allowing
   backward-compatible version ranges.
 
-Any change to serialized wire structures (`0x31`–`0x35`, message types 410–417)
+Any change to serialized wire structures (`0x31`–`0x37`, message types 410–417)
 requires bumping `PROTOCOL_VERSION` and adding a migration note. Additive
 fields with `#[serde(default)]` are permitted without a version bump.

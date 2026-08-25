@@ -90,6 +90,23 @@ pub fn community_shares_page_key(community_id: &[u8; 32], bucket: u64, page_no: 
     out
 }
 
+/// Key rotation record key (§16.2.1).
+///
+/// `SHA-256("identity:rotation:" || old_pubkey)`
+///
+/// Keyed by the *old* key so that a holder of an old key can always
+/// discover its successor without knowing the new key in advance.
+pub fn identity_rotation_key(old_pubkey: &[u8; 32]) -> [u8; 32] {
+    prefixed_hash(b"identity:rotation:", old_pubkey)
+}
+
+/// Key revocation record key (§16.2.2).
+///
+/// `SHA-256("identity:revocation:" || pubkey)`
+pub fn identity_revocation_key(pubkey: &[u8; 32]) -> [u8; 32] {
+    prefixed_hash(b"identity:revocation:", pubkey)
+}
+
 fn prefixed_hash(prefix: &[u8], id: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(prefix);
@@ -197,5 +214,27 @@ mod tests {
         assert_eq!(materialized_bucket(3600), 1);
         assert_eq!(materialized_bucket(7200), 2);
         assert_eq!(materialized_bucket(0), 0);
+    }
+
+    #[test]
+    fn identity_rotation_key_is_deterministic() {
+        let pk = [11u8; 32];
+        assert_eq!(identity_rotation_key(&pk), identity_rotation_key(&pk));
+    }
+
+    #[test]
+    fn identity_rotation_and_revocation_keys_differ_for_same_pubkey() {
+        // Critical: a key must not be able to shadow its own revocation
+        // entry by publishing a rotation at the same slot.
+        let pk = [11u8; 32];
+        assert_ne!(identity_rotation_key(&pk), identity_revocation_key(&pk));
+    }
+
+    #[test]
+    fn identity_keys_distinct_from_other_keyspaces() {
+        let pk = [11u8; 32];
+        let sid = ShareId(pk);
+        assert_ne!(identity_revocation_key(&pk), share_head_key(&sid));
+        assert_ne!(identity_rotation_key(&pk), content_provider_key(&pk));
     }
 }

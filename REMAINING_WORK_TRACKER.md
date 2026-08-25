@@ -63,7 +63,17 @@ All 7 production sites previously used deprecated plain-TCP functions. TLS and Q
   - `select_relay_peers` (`node_relay.rs`) now merges announcement-cache addresses with PeerDb relay-capable peers before selection.
   - 8 new tests (179 core tests total): `relay_manager_ingest_and_known_announcements`, `relay_manager_ingest_deduplicates_by_pubkey`, `relay_manager_ingest_rejects_expired`, `relay_manager_ingest_rejects_invalid_signature`, `relay_manager_prune_removes_stale`, `relay_list_request_served_by_node`, `node_publish_relay_announcement_self_ingest`, `node_discover_relays_via_peers_ingests_announcements`, `dht_validator_accepts_relay_announcement_at_rendezvous_key`, `dht_validator_rejects_relay_announcement_at_wrong_key`.
   - Wire format unchanged (RelayListRequest/Response at msg types 460/461 were already registered).
-- [ ] **§4.10 Key Rotation & Revocation** — *Deferred*: requires new wire message types for rotation announcements, a DHT storage convention for revocation entries, and a protocol version bump. No code changes in this pass.
+- [x] **§4.10 Key Rotation & Revocation** — *Implemented v0.5.0.* Canonical design: `SPECIFICATION.md` §16.
+  - **Wire types** (`wire.rs`): `KeyRotationRecord` (tag `0x36`) and `KeyRevocationRecord` (tag `0x37`), plus `IdentitySubjectKind` and `RevocationReason`.
+  - **Rotation is dual-signed** — the old key authorizes the move, the new key proves possession. One signature is insufficient: old-only would let an attacker rotate an identity to a key they do not control; new-only would let anyone claim any identity.
+  - **Revocation is self-signed and permanent.** Third-party revocation was rejected as a censorship vector worse than the problem being solved; there is deliberately no un-revoke record, so a thief cannot undo the owner's revocation.
+  - **Keyspaces** (`dht_keys.rs`): `identity_rotation_key` = `SHA-256("identity:rotation:" || old_pubkey)`, `identity_revocation_key` = `SHA-256("identity:revocation:" || pubkey)`. Rotation is keyed by the *old* key so holders of a stale key can discover the successor.
+  - **`IdentityRegistry`** (`identity_registry.rs`): chain resolution with revocation dominance (§16.4), cycle detection, and `MAX_ROTATION_CHAIN_DEPTH = 16` enforced as a hard rejection (truncating would let an attacker hide a revocation past the cap).
+  - **Enforcement**: `node_net.rs` subscription sync now rejects manifests whose `share_pubkey` is revoked — a valid signature is no longer sufficient. Ingestion is wired into `dht_store` so records learned from peers populate the registry.
+  - **API**: `publish_key_rotation`, `publish_key_revocation`, `is_key_revoked`, `resolve_identity_key`, `is_identity_trusted`, `refresh_identity_status`.
+  - **`PROTOCOL_VERSION` 1 → 2.** Pre-1.0 policy requires an exact match, so v0.5.0 will not handshake with v0.4.x. Deliberate hard break, documented in §16.8.
+  - **31 tests**: 13 registry (incl. the §16.4 attacker-rotation scenario, cycles, replay, depth cap), 9 wire (dual-signature tampering, foreign revocation, signed reason, wrong tag), 5 integration (DHT round-trip, wrong-key rejection, end-to-end attacker defeat), 4 keyspace.
+  - **Not solved** (explicitly): an attacker holding a stolen key can always *destroy* the identity by revoking it. Accepted — a stolen key already means the identity is lost; the property preserved is that the attacker cannot silently *keep* it. Recovery requires a pre-registered offline successor (§16.7).
 - [x] **§4.11 Automated Blocklist Updates** — `apply_blocklist_updates_from_subscriptions<T>(transport, seed_peers)`: reads `enabled_blocklist_shares`, fetches the "blocklist" content item from each subscribed manifest via `download_swarm_over_network`, decodes as `BlocklistRules`, and calls `set_blocklist_rules` automatically. `start_blocklist_auto_sync_loop(transport, seed_peers, interval) → JoinHandle<()>`: runs `sync_subscriptions_over_dht` + `apply_blocklist_updates_from_subscriptions` on a configurable periodic schedule.
 - [ ] **§4.12 Mobile Node Seeder Incentives** — *Deferred*: requires platform APIs (battery/Wi-Fi state detection) that are not available in the `scp2p-core` library layer; deferred to a platform-specific integration layer.
 - [x] **§4.14 Documentation & Specification Drift** — Updated `DOCS.md` and `PLAN.md` to reflect:
@@ -433,5 +443,15 @@ Canonical design reference: see `SPECIFICATION.md` §15, **Large-Scale Community
 
 | Priority | Items | Notes |
 |----------|-------|-------|
-| **1 — Done** | A (all), B, C.§2.10, D.§4.14, E (all), F, G.1, G.2, G.3, H.1, H.2, H.3, **I.1, I.2, I.3**, **D.§4.9**, **C.§2.7, C.§2.8, C.§2.9**, **D.§4.8, D.§4.11**, **J-1A, J-1B, J-1C, J-2A, J-2B, J-2C, J-3A, J-3B, J-4A, J-4B, J-4C, J-5A, J-5B, J-5C, J-6A, J-6B, J-6C, J-7A, J-7B, J-7C**, **H.4 RA-01..RA-06** | 288 tests passing (264 core + 15 desktop + 9 relay), 4 ignored simulation tests, clippy clean. All J-items and H.4 relay security audit complete. |
-| **2 — Deferred** | D.§4.10, D.§4.12 | Key rotation requires protocol version bump + new wire types. Mobile incentives require platform APIs outside library layer. |
+| **1 — Done** | A (all), B, C.§2.10, D.§4.14, E (all), F, G.1, G.2, G.3, H.1, H.2, H.3, **I.1, I.2, I.3**, **D.§4.9**, **C.§2.7, C.§2.8, C.§2.9**, **D.§4.8, D.§4.10, D.§4.11**, **J-1A…J-7C (all)**, **H.4 RA-01..RA-06** | 321 tests passing (297 core + 15 desktop + 9 relay), 6 ignored (4 simulations + 2 release-gate benchmarks), clippy clean. |
+| **2 — Deferred** | D.§4.12, J-3C | Mobile incentives require platform APIs outside the library layer. Multi-relay partitioning deferred until relay federation is needed. |
+
+### Test-suite maintenance
+
+- [x] **`large_catalog_benchmark_smoke` wall-clock flakiness** — the test asserted absolute
+  index/query timings in an unoptimized debug build. It passed at 266 tests but failed at 297
+  purely from added CPU contention (confirmed: passed with `RUST_TEST_THREADS=1`, failed in
+  parallel), so the suite could break by *adding unrelated tests* — a false signal.
+  Timing budgets are now advisory and print a diagnostic when exceeded; set
+  `SCP2P_SEARCH_BENCH_STRICT=1` to enforce them. The correctness assertions (result count,
+  `SEARCH_RESULT_HARD_CAP` behaviour) still run unconditionally.

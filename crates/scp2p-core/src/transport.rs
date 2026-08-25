@@ -32,7 +32,16 @@ pub const HANDSHAKE_MAX_BYTES: usize = 64 * 1024;
 pub const HANDSHAKE_MAX_CLOCK_SKEW_SECS: u64 = 5 * 60;
 
 /// Current wire-protocol version.  Bump when breaking changes land.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// | Version | Introduced | Change |
+/// |---------|-----------|--------|
+/// | 1       | v0.1.0    | Initial protocol. |
+/// | 2       | v0.5.0    | §16 key rotation & revocation: new DHT value tags `0x36`/`0x37` and the `identity:rotation:` / `identity:revocation:` keyspaces. |
+///
+/// Pre-1.0 policy requires an exact match between peers (see
+/// `DEPRECATION_SCHEDULE.md`), so v0.5.0 nodes will not complete a
+/// handshake with v0.4.x nodes.  This is a deliberate hard break.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Generate a 32-byte handshake nonce from a CSPRNG.
 ///

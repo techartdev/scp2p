@@ -205,6 +205,12 @@ pub(super) fn validate_dht_value_for_known_keyspaces(
             crate::wire::community_tags::SHARES_PAGE => {
                 return validate_materialized_shares_page(key, value);
             }
+            crate::wire::community_tags::KEY_ROTATION => {
+                return validate_key_rotation_record(key, value);
+            }
+            crate::wire::community_tags::KEY_REVOCATION => {
+                return validate_key_revocation_record(key, value);
+            }
             _ => {}
         }
     }
@@ -276,6 +282,37 @@ fn validate_community_member_record(key: [u8; 32], value: &[u8]) -> anyhow::Resu
             anyhow::bail!("auth token member_node_pubkey does not match record");
         }
     }
+    Ok(())
+}
+
+/// Validate a tagged `KeyRotationRecord` (§16.3).
+fn validate_key_rotation_record(key: [u8; 32], value: &[u8]) -> anyhow::Result<()> {
+    use crate::dht_keys::identity_rotation_key;
+    use crate::wire::KeyRotationRecord;
+    let record = KeyRotationRecord::decode_tagged(value)?;
+    // Rotation records are keyed by the OLD pubkey so that a holder of the
+    // old key can discover its successor without knowing it in advance.
+    let expected = identity_rotation_key(&record.old_pubkey);
+    if expected != key {
+        anyhow::bail!("key rotation record key mismatch");
+    }
+    // Verifies both signatures and rejects far-future timestamps.
+    let now = crate::transport::now_unix_secs()?;
+    record.verify_at(now)?;
+    Ok(())
+}
+
+/// Validate a tagged `KeyRevocationRecord` (§16.3).
+fn validate_key_revocation_record(key: [u8; 32], value: &[u8]) -> anyhow::Result<()> {
+    use crate::dht_keys::identity_revocation_key;
+    use crate::wire::KeyRevocationRecord;
+    let record = KeyRevocationRecord::decode_tagged(value)?;
+    let expected = identity_revocation_key(&record.pubkey);
+    if expected != key {
+        anyhow::bail!("key revocation record key mismatch");
+    }
+    let now = crate::transport::now_unix_secs()?;
+    record.verify_at(now)?;
     Ok(())
 }
 

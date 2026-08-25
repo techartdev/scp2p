@@ -5214,6 +5214,227 @@ async fn publish_materialized_community_pages() {
 }
 
 // ══════════════════════════════════════════════════════════════════
+// §16 Key rotation & revocation
+// ══════════════════════════════════════════════════════════════════
+
+/// A rotation record round-trips through `dht_store` and populates the
+/// registry, so the chain resolves to the new key.
+#[tokio::test]
+async fn key_rotation_stored_in_dht_updates_registry() {
+    use crate::dht_keys::identity_rotation_key;
+    use crate::wire::{IdentitySubjectKind, KeyRotationRecord};
+
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let mut rng = OsRng;
+    let (old, new) = (
+        SigningKey::generate(&mut rng),
+        SigningKey::generate(&mut rng),
+    );
+    let old_pk = old.verifying_key().to_bytes();
+    let new_pk = new.verifying_key().to_bytes();
+
+    let now = crate::transport::now_unix_secs().expect("now");
+    let rec =
+        KeyRotationRecord::new_signed(IdentitySubjectKind::SharePublisher, &old, &new, 1, now)
+            .expect("sign");
+
+    handle
+        .dht_store(WireStore {
+            key: identity_rotation_key(&old_pk),
+            value: rec.encode_tagged().expect("encode"),
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("store rotation");
+
+    assert_eq!(
+        handle.resolve_identity_key(old_pk).await,
+        crate::identity_registry::ChainResolution::Active(new_pk)
+    );
+    assert!(handle.is_identity_trusted(&old_pk).await);
+}
+
+/// A revocation record stored in the DHT marks the key untrusted.
+#[tokio::test]
+async fn key_revocation_stored_in_dht_marks_key_untrusted() {
+    use crate::dht_keys::identity_revocation_key;
+    use crate::wire::{IdentitySubjectKind, KeyRevocationRecord, RevocationReason};
+
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let key = SigningKey::generate(&mut OsRng);
+    let pk = key.verifying_key().to_bytes();
+    let now = crate::transport::now_unix_secs().expect("now");
+
+    assert!(handle.is_identity_trusted(&pk).await, "trusted before");
+
+    let rec = KeyRevocationRecord::new_signed(
+        IdentitySubjectKind::SharePublisher,
+        &key,
+        RevocationReason::Compromised,
+        now,
+    )
+    .expect("sign");
+
+    handle
+        .dht_store(WireStore {
+            key: identity_revocation_key(&pk),
+            value: rec.encode_tagged().expect("encode"),
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("store revocation");
+
+    assert!(handle.is_key_revoked(&pk).await);
+    assert!(!handle.is_identity_trusted(&pk).await, "untrusted after");
+}
+
+/// The DHT validator must reject an identity record stored at the wrong key,
+/// otherwise an attacker could shadow another identity's slot.
+#[tokio::test]
+async fn identity_records_rejected_at_wrong_dht_key() {
+    use crate::dht_keys::{identity_revocation_key, identity_rotation_key};
+    use crate::wire::{
+        IdentitySubjectKind, KeyRevocationRecord, KeyRotationRecord, RevocationReason,
+    };
+
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let mut rng = OsRng;
+    let (old, new, victim) = (
+        SigningKey::generate(&mut rng),
+        SigningKey::generate(&mut rng),
+        SigningKey::generate(&mut rng),
+    );
+    let victim_pk = victim.verifying_key().to_bytes();
+    let now = crate::transport::now_unix_secs().expect("now");
+
+    // Rotation record stored under the victim's slot instead of its own.
+    let rot =
+        KeyRotationRecord::new_signed(IdentitySubjectKind::Node, &old, &new, 1, now).expect("sign");
+    assert!(
+        handle
+            .dht_store(WireStore {
+                key: identity_rotation_key(&victim_pk),
+                value: rot.encode_tagged().expect("encode"),
+                ttl_secs: 3600,
+            })
+            .await
+            .is_err(),
+        "rotation at a foreign key slot must be rejected"
+    );
+
+    // Revocation record stored under a different key's slot.
+    let rev = KeyRevocationRecord::new_signed(
+        IdentitySubjectKind::Node,
+        &old,
+        RevocationReason::Compromised,
+        now,
+    )
+    .expect("sign");
+    assert!(
+        handle
+            .dht_store(WireStore {
+                key: identity_revocation_key(&victim_pk),
+                value: rev.encode_tagged().expect("encode"),
+                ttl_secs: 3600,
+            })
+            .await
+            .is_err(),
+        "revocation at a foreign key slot must be rejected"
+    );
+
+    // The victim identity is untouched.
+    assert!(handle.is_identity_trusted(&victim_pk).await);
+}
+
+/// §16.4: revocation dominates rotation. An attacker holding a stolen key
+/// cannot recover the identity by publishing a rotation afterwards.
+#[tokio::test]
+async fn revocation_defeats_attacker_rotation_end_to_end() {
+    use crate::dht_keys::{identity_revocation_key, identity_rotation_key};
+    use crate::wire::{
+        IdentitySubjectKind, KeyRevocationRecord, KeyRotationRecord, RevocationReason,
+    };
+
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let mut rng = OsRng;
+    let stolen = SigningKey::generate(&mut rng);
+    let attacker = SigningKey::generate(&mut rng);
+    let stolen_pk = stolen.verifying_key().to_bytes();
+    let now = crate::transport::now_unix_secs().expect("now");
+
+    // Legitimate holder revokes the compromised key.
+    let rev = KeyRevocationRecord::new_signed(
+        IdentitySubjectKind::SharePublisher,
+        &stolen,
+        RevocationReason::Compromised,
+        now,
+    )
+    .expect("sign");
+    handle
+        .dht_store(WireStore {
+            key: identity_revocation_key(&stolen_pk),
+            value: rev.encode_tagged().expect("encode"),
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("store revocation");
+
+    // Attacker, holding the stolen key, publishes a valid rotation to a key
+    // they control.  The record itself is cryptographically valid, so the
+    // DHT accepts it — but it must not restore trust.
+    let rot = KeyRotationRecord::new_signed(
+        IdentitySubjectKind::SharePublisher,
+        &stolen,
+        &attacker,
+        99,
+        now,
+    )
+    .expect("sign");
+    handle
+        .dht_store(WireStore {
+            key: identity_rotation_key(&stolen_pk),
+            value: rot.encode_tagged().expect("encode"),
+            ttl_secs: 3600,
+        })
+        .await
+        .expect("attacker rotation is structurally valid");
+
+    // Trust is NOT restored: the identity remains dead.
+    assert!(!handle.is_identity_trusted(&stolen_pk).await);
+    assert!(matches!(
+        handle.resolve_identity_key(stolen_pk).await,
+        crate::identity_registry::ChainResolution::Revoked { .. }
+    ));
+}
+
+/// `publish_key_revocation` writes to the DHT and updates local state.
+#[tokio::test]
+async fn publish_key_revocation_is_self_consistent() {
+    use crate::wire::{IdentitySubjectKind, RevocationReason};
+
+    let handle = Node::start(NodeConfig::default()).await.expect("start");
+    let key = SigningKey::generate(&mut OsRng);
+    let pk = key.verifying_key().to_bytes();
+
+    handle
+        .publish_key_revocation(
+            IdentitySubjectKind::SharePublisher,
+            &key,
+            RevocationReason::Compromised,
+        )
+        .await
+        .expect("publish revocation");
+
+    assert!(handle.is_key_revoked(&pk).await);
+    // The record is retrievable from the DHT at its canonical key.
+    let found = handle
+        .dht_find_value(crate::dht_keys::identity_revocation_key(&pk))
+        .await
+        .expect("find");
+    assert!(found.is_some(), "revocation should be stored in the DHT");
+}
+
+// ══════════════════════════════════════════════════════════════════
 // §15.10 release-gate benchmarks (end-to-end over real TLS)
 // ══════════════════════════════════════════════════════════════════
 //

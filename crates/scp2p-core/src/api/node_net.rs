@@ -328,6 +328,20 @@ impl NodeHandle {
             anyhow::bail!("manifest share_id mismatch while syncing subscription");
         }
 
+        // §16.6: a cryptographically valid signature is not sufficient — the
+        // signing key must not be revoked.  This is the whole point of
+        // revocation: the attacker holding a leaked key can still produce
+        // valid signatures, so trust must be withdrawn out-of-band.
+        {
+            let state = self.state.read().await;
+            if !state.identity_registry.is_trusted(&manifest.share_pubkey) {
+                anyhow::bail!(
+                    "manifest signed by revoked or untrusted publisher key {}",
+                    hex::encode(&manifest.share_pubkey[..8])
+                );
+            }
+        }
+
         Ok(Some((share_id, manifest_id, manifest, head.latest_seq)))
     }
 

@@ -13,6 +13,7 @@ pub mod config;
 pub mod content;
 pub mod dht;
 pub mod dht_keys;
+pub mod identity_registry;
 pub mod ids;
 pub mod manifest;
 pub mod net_fetch;
@@ -43,8 +44,9 @@ pub use dht::{
 };
 pub use dht_keys::{
     community_info_key, community_member_key, community_share_key, content_provider_key,
-    manifest_loc_key, share_head_key,
+    identity_revocation_key, identity_rotation_key, manifest_loc_key, share_head_key,
 };
+pub use identity_registry::{ChainResolution, IdentityRegistry};
 pub use ids::{ContentId, ManifestId, NodeId, ShareId};
 pub use manifest::{
     ItemV1, ManifestV1, PublicShareSummary, ShareHead, ShareKeypair, ShareVisibility,

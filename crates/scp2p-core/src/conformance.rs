@@ -29,6 +29,11 @@ mod tests {
         "d57dc906e20d3fd326ffaa85535500486f46a0979f5a323f028dcabfd381fd4a";
     const CHUNK1_HASH_HEX: &str =
         "16c73b1fdd38762790888bfc3a0d47db8fe7ef558df79d91d6b22b63ed289542";
+    // §16 identity keyspaces, derived from PUBKEY_HEX.
+    const IDENTITY_ROTATION_KEY_HEX: &str =
+        "6376e7279b62fcc2338bf27eff9e3f8a47c74fc0da50e202fe31de790c6f2f96";
+    const IDENTITY_REVOCATION_KEY_HEX: &str =
+        "929c4f5bb699ae3bf3cab78990c04b5c4374a5448e16da3656c727339332c241";
 
     #[test]
     fn id_derivation_vectors_match_sha256() {
@@ -115,6 +120,86 @@ mod tests {
         let signable = head.signable_bytes().expect("share head signable");
         assert_eq!(hex::encode(&signable), SHARE_HEAD_SIGNABLE_HEX);
         assert_eq!(hex::encode(&head.sig), SHARE_HEAD_SIGNATURE_HEX);
+    }
+
+    /// §16 conformance vectors.
+    ///
+    /// Custom clients must derive identical DHT keys and produce identical
+    /// signable bytes for identity records, otherwise rotation and revocation
+    /// silently fail to interoperate — and a missed revocation means trusting
+    /// a compromised key.
+    #[test]
+    fn identity_record_key_derivation_vectors() {
+        use crate::dht_keys::{identity_revocation_key, identity_rotation_key};
+
+        let pubkey: [u8; 32] = hex::decode(PUBKEY_HEX)
+            .expect("pubkey hex")
+            .try_into()
+            .expect("pubkey bytes");
+
+        // SHA-256("identity:rotation:" || pubkey)
+        assert_eq!(
+            hex::encode(identity_rotation_key(&pubkey)),
+            IDENTITY_ROTATION_KEY_HEX
+        );
+        // SHA-256("identity:revocation:" || pubkey)
+        assert_eq!(
+            hex::encode(identity_revocation_key(&pubkey)),
+            IDENTITY_REVOCATION_KEY_HEX
+        );
+        // The two keyspaces must never collide for the same pubkey.
+        assert_ne!(
+            identity_rotation_key(&pubkey),
+            identity_revocation_key(&pubkey)
+        );
+    }
+
+    /// Tag bytes are part of the wire contract: a client that mislabels a
+    /// record will have it rejected by the keyspace validator.
+    #[test]
+    fn identity_record_tag_byte_vectors() {
+        use crate::wire::{
+            IdentitySubjectKind, KeyRevocationRecord, KeyRotationRecord, RevocationReason,
+            community_tags,
+        };
+
+        assert_eq!(community_tags::KEY_ROTATION, 0x36);
+        assert_eq!(community_tags::KEY_REVOCATION, 0x37);
+
+        let old = SigningKey::from_bytes(
+            &hex::decode("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+                .expect("seed hex")
+                .try_into()
+                .expect("seed bytes"),
+        );
+        let new = SigningKey::from_bytes(
+            &hex::decode("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f")
+                .expect("seed hex")
+                .try_into()
+                .expect("seed bytes"),
+        );
+
+        let rot =
+            KeyRotationRecord::new_signed(IdentitySubjectKind::Node, &old, &new, 1, 1_700_000_000)
+                .expect("sign rotation");
+        assert_eq!(
+            rot.encode_tagged().expect("encode")[0],
+            community_tags::KEY_ROTATION
+        );
+        rot.verify().expect("rotation verifies");
+
+        let rev = KeyRevocationRecord::new_signed(
+            IdentitySubjectKind::SharePublisher,
+            &old,
+            RevocationReason::Compromised,
+            1_700_000_000,
+        )
+        .expect("sign revocation");
+        assert_eq!(
+            rev.encode_tagged().expect("encode")[0],
+            community_tags::KEY_REVOCATION
+        );
+        rev.verify().expect("revocation verifies");
     }
 
     #[test]
