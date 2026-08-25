@@ -1,7 +1,7 @@
 # SCP2P — Community Subsystem Deprecation Schedule
 
 > **Applies to:** §15 Large-Scale Community Discovery & Search migration
-> **Current version:** 0.6.0-dev (protocol version 2)
+> **Current version:** 0.6.0 (protocol version 2)
 > **Current phase:** Phase D — legacy client path removed (migration complete)
 > **Last updated:** 2026-03-06
 
